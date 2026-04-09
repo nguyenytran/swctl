@@ -1,3 +1,8 @@
+# Runtime mode: "orbstack" or "traefik". Auto-detected if not set.
+# OrbStack mode uses *.orb.local domains (no Traefik needed).
+# Traefik mode uses Traefik reverse proxy with custom domain suffix.
+# SW_RUNTIME="orbstack"
+
 # Project identity and base branch used for diff analysis.
 SW_PROJECT="sw66"
 SW_BASE_BRANCH="trunk"
