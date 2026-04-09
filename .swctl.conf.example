@@ -33,6 +33,10 @@ SW_ENV_FILE_NAME=".env.local"
 # Override if your compose template lives outside the repository root.
 # SW_COMPOSE_TEMPLATE="/absolute/path/to/docker-compose.swctl.yml"
 
+# Composer root version for monorepo setups (e.g. shopware/platform).
+# This is passed as COMPOSER_ROOT_VERSION to the container.
+# SW_COMPOSER_ROOT_VERSION="6.7.9999999-dev"
+
 # Default Shopware install flags for dedicated databases.
 # Adjust these if your project requires extra setup options.
 SW_INSTALL_ARGS="--basic-setup --force --no-interaction"

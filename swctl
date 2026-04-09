@@ -3,7 +3,17 @@ set -euo pipefail
 
 SWCTL_VERSION="0.2.0"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+_swctl_resolve_script() {
+    local src="${BASH_SOURCE[0]}"
+    while [ -L "$src" ]; do
+        local dir
+        dir="$(cd "$(dirname "$src")" && pwd -P)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd "$(dirname "$src")" && pwd -P
+}
+SCRIPT_DIR="$(_swctl_resolve_script)"
 SWCTL_TEMPLATE_DIR="${SWCTL_TEMPLATE_DIR:-$SCRIPT_DIR}"
 SWCTL_STATE_DIR="${SWCTL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/swctl}"
 SWCTL_REGISTRY_DIR="$SWCTL_STATE_DIR/instances"
@@ -237,6 +247,7 @@ load_project_config() {
     SW_UID="${SW_UID:-$(id -u 2>/dev/null || printf '1000')}"
     SW_GID="${SW_GID:-$(id -g 2>/dev/null || printf '1000')}"
     SW_ENV_FILE_NAME="${SW_ENV_FILE_NAME:-.env.local}"
+    SW_COMPOSER_ROOT_VERSION="${SW_COMPOSER_ROOT_VERSION:-}"
     SW_COMPOSE_TEMPLATE="$(detect_template_path)" || die "Could not find docker-compose.swctl.yml. Put it in the project root or export SWCTL_TEMPLATE_DIR."
 }
 
@@ -526,6 +537,18 @@ create_worktree() {
         git -C "$PROJECT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "$BASE_REF"
         ok "Created worktree '$WORKTREE_PATH' from '$BASE_REF'."
     fi
+
+    sync_gitignored_files
+}
+
+sync_gitignored_files() {
+    local file=""
+    for file in composer.lock pnpm-lock.yaml yarn.lock package-lock.json; do
+        if [ -f "$PROJECT_ROOT/$file" ] && [ ! -f "$WORKTREE_PATH/$file" ]; then
+            cp "$PROJECT_ROOT/$file" "$WORKTREE_PATH/$file"
+            ok "Copied gitignored '$file' into worktree."
+        fi
+    done
 }
 
 count_changes() {
@@ -612,6 +635,7 @@ SW_NODE_MODULES_VOLUME=${NODE_MODULES_VOLUME}
 SW_UID=${SW_UID}
 SW_GID=${SW_GID}
 SW_DOCKER_PLATFORM=${SW_DOCKER_PLATFORM}
+SW_COMPOSER_ROOT_VERSION=${SW_COMPOSER_ROOT_VERSION}
 EOF
 }
 
@@ -668,9 +692,20 @@ run_app_command() {
     exec_in_container "$container_id" "$command_string"
 }
 
+fix_volume_ownership() {
+    local compose_project="$1"
+    local container_id
+    container_id="$(app_container_id "$compose_project")"
+    [ -n "$container_id" ] || return 0
+    docker exec -u root "$container_id" bash -c \
+        "chown ${SW_UID}:${SW_GID} /var/www/html/vendor /var/www/html/node_modules 2>/dev/null" || true
+}
+
 bootstrap_dependencies() {
     local compose_project="$1"
     local package_install_cmd=""
+
+    fix_volume_ownership "$compose_project"
 
     if run_app_command "$compose_project" "test -f composer.json && test ! -f vendor/autoload.php" >/dev/null 2>&1; then
         info "Composer dependencies are missing in the worktree volume. Running composer install."
@@ -736,7 +771,7 @@ provision_database_and_app() {
         create_database "$DB_NAME"
         write_env_file
         write_compose_env_file
-        compose -f "$SW_COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait_for_app_container "$COMPOSE_PROJECT"
         bootstrap_dependencies "$COMPOSE_PROJECT"
         run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
@@ -750,7 +785,7 @@ provision_database_and_app() {
     ensure_database_exists "$DB_NAME"
     write_env_file
     write_compose_env_file
-    compose -f "$SW_COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+    compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     wait_for_app_container "$COMPOSE_PROJECT"
     bootstrap_dependencies "$COMPOSE_PROJECT"
 
@@ -914,10 +949,27 @@ select_from_list() {
 acquire_shared_db_lock() {
     local lockfile="$SWCTL_TMP_DIR/shared-db.lock"
     local attempt=0
+    local stale_pid=""
+
+    # Clean stale lock from a dead process
+    if [ -f "$lockfile" ]; then
+        stale_pid="$(cat "$lockfile" 2>/dev/null || true)"
+        if [ -n "$stale_pid" ] && ! kill -0 "$stale_pid" 2>/dev/null; then
+            rm -f "$lockfile"
+        fi
+    fi
+
     while ! ( set -o noclobber; printf '%s' $$ > "$lockfile" ) 2>/dev/null; do
         attempt=$((attempt + 1))
         if [ "$attempt" -ge 120 ]; then
             die "Timed out waiting for shared-db lock."
+        fi
+        # Re-check for stale lock every 10 attempts
+        if [ $((attempt % 10)) -eq 0 ] && [ -f "$lockfile" ]; then
+            stale_pid="$(cat "$lockfile" 2>/dev/null || true)"
+            if [ -n "$stale_pid" ] && ! kill -0 "$stale_pid" 2>/dev/null; then
+                rm -f "$lockfile"
+            fi
         fi
         sleep 1
     done
@@ -1182,7 +1234,7 @@ cmd_restart() {
     load_instance_metadata "$meta_file"
 
     if [ -f "$COMPOSE_ENV_FILE" ] && [ -f "$COMPOSE_TEMPLATE" ]; then
-        compose -f "$COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" restart
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" restart
     else
         local container_id
         container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
@@ -1240,7 +1292,7 @@ cmd_clean() {
     load_instance_metadata "$meta_file"
 
     if [ -f "$COMPOSE_ENV_FILE" ] && [ -f "$COMPOSE_TEMPLATE" ]; then
-        compose -f "$COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" down --remove-orphans >/dev/null || true
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" down --remove-orphans >/dev/null || true
         ok "Stopped compose project '$COMPOSE_PROJECT'."
     else
         local container_id
