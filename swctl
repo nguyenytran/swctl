@@ -599,10 +599,42 @@ create_worktree() {
 
 sync_gitignored_files() {
     local file=""
+    local dir=""
     for file in composer.lock pnpm-lock.yaml yarn.lock package-lock.json; do
         if [ -f "$PROJECT_ROOT/$file" ] && [ ! -f "$WORKTREE_PATH/$file" ]; then
             cp "$PROJECT_ROOT/$file" "$WORKTREE_PATH/$file"
             ok "Copied gitignored '$file' into worktree."
+        fi
+    done
+
+    # Sync gitignored build artifacts from project root (node_modules, storefront vendor, etc.)
+    # These directories may exist as empty stubs (with .gitkeep) from the checkout,
+    # so we check for actual content beyond .gitkeep.
+    for dir in \
+        src/Storefront/Resources/app/storefront/vendor \
+        src/Storefront/Resources/app/storefront/node_modules \
+        src/Storefront/Resources/app/storefront/dist \
+        src/Administration/Resources/app/administration/node_modules \
+        public/theme \
+        public/bundles \
+        var \
+    ; do
+        local src_dir="$PROJECT_ROOT/$dir"
+        local dst_dir="$WORKTREE_PATH/$dir"
+        # Only sync if source has real content and destination is empty/missing
+        if [ -d "$src_dir" ]; then
+            local src_count
+            src_count="$(find "$src_dir" -mindepth 1 -maxdepth 1 -not -name '.gitkeep' 2>/dev/null | wc -l | tr -d ' ')"
+            if [ "$src_count" -gt 0 ]; then
+                mkdir -p "$dst_dir"
+                # Use rsync if available for speed, fallback to cp
+                if command -v rsync >/dev/null 2>&1; then
+                    rsync -a --ignore-existing "$src_dir/" "$dst_dir/" 2>/dev/null || true
+                else
+                    cp -Rn "$src_dir"/* "$dst_dir"/ 2>/dev/null || true
+                fi
+                ok "Synced gitignored content from '$dir/'."
+            fi
         fi
     done
 }
@@ -618,6 +650,19 @@ count_changes() {
     BACKEND_CHANGES="$(printf '%s\n' "$diff_files" | grep -E '\.php$' | grep -Evc '(^|/)Migrations?/|/Entity/' || true)"
     # Backward compat: FRONTEND_CHANGES = ADMIN + STOREFRONT
     FRONTEND_CHANGES="$((ADMIN_CHANGES + STOREFRONT_CHANGES))"
+}
+
+sync_worktree_deps() {
+    # For monorepo setups: symlink vendor/ from project root when no composer changes.
+    # This avoids the expensive composer install per worktree.
+    if [ -d "$PROJECT_ROOT/vendor" ] && [ ! -e "$WORKTREE_PATH/vendor" ]; then
+        if [ "$((MIGRATION_CHANGES + ENTITY_CHANGES + COMPOSER_CHANGES))" -gt 0 ]; then
+            info "Dependency changes detected. Vendor will be installed fresh inside container."
+        else
+            ln -s "$PROJECT_ROOT/vendor" "$WORKTREE_PATH/vendor"
+            ok "Symlinked vendor/ from project root (no composer changes)."
+        fi
+    fi
 }
 
 resolve_vendor_volume() {
@@ -726,6 +771,7 @@ SW_UID=${SW_UID}
 SW_GID=${SW_GID}
 SW_DOCKER_PLATFORM=${SW_DOCKER_PLATFORM}
 SW_COMPOSER_ROOT_VERSION=${SW_COMPOSER_ROOT_VERSION}
+SW_APP_ENV=dev
 EOF
 }
 
@@ -974,7 +1020,18 @@ run_frontend_build_if_needed() {
     fi
 
     if [ "$needs_bundle_dump" -eq 0 ]; then
-        info "No frontend changes detected. Skipping theme/admin builds."
+        # Even without frontend changes, ensure theme/admin assets exist in this worktree.
+        # The shared DB may have been installed by another worktree, but compiled assets
+        # live on the bind mount and must exist per-worktree.
+        if ! run_app_command "$compose_project" "test -d public/theme || test -d public/bundles" >/dev/null 2>&1; then
+            info "Theme/admin assets missing. Running initial asset build."
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" || warn "bundle:dump failed."
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" || warn "assets:install failed."
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:change --all Storefront --no-compile" 2>/dev/null || true
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:compile --active-only" || warn "theme:compile failed."
+        else
+            info "Theme/admin assets already present (synced from project root). Skipping builds."
+        fi
     fi
 
     # Clear cache for any code change on shared DB
@@ -1056,7 +1113,7 @@ cmd_create() {
 
     if [ "$SW_RUNTIME" = "orbstack" ]; then
         DOMAIN="${SW_SERVICE_NAME}.${COMPOSE_PROJECT}.orb.local"
-        APP_URL="http://${DOMAIN}:${SW_APP_HTTP_PORT}"
+        APP_URL="http://${DOMAIN}"
     else
         DOMAIN="${SW_PROJECT_SLUG}-${ISSUE_ID}.${SW_DOMAIN_SUFFIX}"
         APP_URL="http://${DOMAIN}"
@@ -1073,7 +1130,8 @@ cmd_create() {
     DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
     count_changes "$DIFF_FILES"
 
-    # Resolve volumes AFTER diff analysis — shared base when deps unchanged
+    # Resolve dependencies AFTER diff analysis
+    sync_worktree_deps
     VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
     NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
 

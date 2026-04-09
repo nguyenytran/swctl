@@ -2,15 +2,14 @@ services:
   web:
     image: ${SW_PHP_IMAGE}
     working_dir: /var/www/html
-    user: "${SW_UID}:${SW_GID}"
-    command: >
-      bash -lc "php -S 0.0.0.0:${SW_APP_HTTP_PORT} -t public"
     environment:
       APP_URL: ${SW_APP_URL}
+      APP_ENV: ${SW_APP_ENV:-dev}
       DATABASE_URL: mysql://${SW_DB_ROOT_USER}:${SW_DB_ROOT_PASSWORD}@${SW_DB_HOST}:${SW_DB_PORT}/${SW_DB_NAME}
       REDIS_URL: ${SW_REDIS_URL}
       MAILER_DSN: ${SW_MAILER_DSN}
       COMPOSER_ROOT_VERSION: ${SW_COMPOSER_ROOT_VERSION}
+      HOST: "0.0.0.0"
       WORKTREE_ID: ${SW_WORKTREE_ID}
       SWCTL_PROJECT: ${SW_PROJECT}
       SWCTL_ISSUE: ${SW_ISSUE}
@@ -18,16 +17,8 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ${SW_WORKTREE_PATH}:/var/www/html:cached
-      - vendor:/var/www/html/vendor:cached
-      - node_modules:/var/www/html/node_modules:cached
     labels:
       - "swctl.managed=true"
       - "swctl.project=${SW_PROJECT_SLUG}"
       - "swctl.issue=${SW_ISSUE}"
       - "dev.orbstack.domains=${SW_APP_DOMAIN}"
-
-volumes:
-  vendor:
-    name: ${SW_VENDOR_VOLUME}
-  node_modules:
-    name: ${SW_NODE_MODULES_VOLUME}
