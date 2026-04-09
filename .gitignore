@@ -1,5 +1,6 @@
 dist/
 .idea/
+.claude/
 *.tar.gz
 .swctl.conf
 .DS_Store
