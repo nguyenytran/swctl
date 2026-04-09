@@ -36,16 +36,8 @@ services:
 volumes:
   vendor:
     name: ${SW_VENDOR_VOLUME}
-    labels:
-      swctl.managed: "true"
-      swctl.project: ${SW_PROJECT_SLUG}
-      swctl.issue: ${SW_ISSUE}
   node_modules:
     name: ${SW_NODE_MODULES_VOLUME}
-    labels:
-      swctl.managed: "true"
-      swctl.project: ${SW_PROJECT_SLUG}
-      swctl.issue: ${SW_ISSUE}
 
 networks:
   proxy:

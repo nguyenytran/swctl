@@ -343,10 +343,16 @@ write_metadata() {
         printf 'COMPOSE_PROJECT=%q\n' "$COMPOSE_PROJECT"
         printf 'COMPOSE_ENV_FILE=%q\n' "$COMPOSE_ENV_FILE"
         printf 'COMPOSE_TEMPLATE=%q\n' "$SW_COMPOSE_TEMPLATE"
+        printf 'COMPOSE_VOLUME_OVERRIDE=%q\n' "${COMPOSE_VOLUME_OVERRIDE:-}"
         printf 'VENDOR_VOLUME=%q\n' "$VENDOR_VOLUME"
         printf 'NODE_MODULES_VOLUME=%q\n' "$NODE_MODULES_VOLUME"
         printf 'MIGRATION_CHANGES=%q\n' "$MIGRATION_CHANGES"
         printf 'ENTITY_CHANGES=%q\n' "$ENTITY_CHANGES"
+        printf 'ADMIN_CHANGES=%q\n' "${ADMIN_CHANGES:-0}"
+        printf 'STOREFRONT_CHANGES=%q\n' "${STOREFRONT_CHANGES:-0}"
+        printf 'COMPOSER_CHANGES=%q\n' "${COMPOSER_CHANGES:-0}"
+        printf 'PACKAGE_CHANGES=%q\n' "${PACKAGE_CHANGES:-0}"
+        printf 'BACKEND_CHANGES=%q\n' "${BACKEND_CHANGES:-0}"
         printf 'FRONTEND_CHANGES=%q\n' "$FRONTEND_CHANGES"
         printf 'CREATED_AT=%q\n' "$(timestamp_utc)"
     } >"$meta_file"
@@ -603,9 +609,33 @@ sync_gitignored_files() {
 
 count_changes() {
     local diff_files="$1"
-    MIGRATION_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)(Migration|Migrations)/' || true)"
+    MIGRATION_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)Migrations?/' || true)"
     ENTITY_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)Entity/' || true)"
-    FRONTEND_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '\.(js|vue|scss|ts|twig)$' || true)"
+    ADMIN_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec 'Resources/app/administration/.*\.(js|ts|vue|scss)$' || true)"
+    STOREFRONT_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(Resources/app/storefront/.*\.(js|ts|vue|scss)$|\.twig$)' || true)"
+    COMPOSER_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)composer\.(json|lock)$' || true)"
+    PACKAGE_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$' || true)"
+    BACKEND_CHANGES="$(printf '%s\n' "$diff_files" | grep -E '\.php$' | grep -Evc '(^|/)Migrations?/|/Entity/' || true)"
+    # Backward compat: FRONTEND_CHANGES = ADMIN + STOREFRONT
+    FRONTEND_CHANGES="$((ADMIN_CHANGES + STOREFRONT_CHANGES))"
+}
+
+resolve_vendor_volume() {
+    local issue_id="$1"
+    if [ "$((MIGRATION_CHANGES + ENTITY_CHANGES + COMPOSER_CHANGES))" -gt 0 ]; then
+        printf '%s' "vendor-${issue_id}"
+    else
+        printf '%s' "vendor-base-${SW_PROJECT_SLUG}"
+    fi
+}
+
+resolve_node_modules_volume() {
+    local issue_id="$1"
+    if [ "$((MIGRATION_CHANGES + ENTITY_CHANGES + PACKAGE_CHANGES))" -gt 0 ]; then
+        printf '%s' "node_modules-${issue_id}"
+    else
+        printf '%s' "node_modules-base-${SW_PROJECT_SLUG}"
+    fi
 }
 
 detect_package_install_command() {
@@ -699,6 +729,49 @@ SW_COMPOSER_ROOT_VERSION=${SW_COMPOSER_ROOT_VERSION}
 EOF
 }
 
+write_compose_volume_override() {
+    COMPOSE_VOLUME_OVERRIDE="$WORKTREE_PATH/.swctl.volumes.override.yml"
+    local vendor_is_shared=0
+    local node_is_shared=0
+
+    case "$VENDOR_VOLUME" in vendor-base-*) vendor_is_shared=1 ;; esac
+    case "$NODE_MODULES_VOLUME" in node_modules-base-*) node_is_shared=1 ;; esac
+
+    # Ensure shared base volumes exist before marking them external
+    if [ "$vendor_is_shared" -eq 1 ]; then
+        docker volume inspect "$VENDOR_VOLUME" >/dev/null 2>&1 || \
+            docker volume create "$VENDOR_VOLUME" >/dev/null
+    fi
+    if [ "$node_is_shared" -eq 1 ]; then
+        docker volume inspect "$NODE_MODULES_VOLUME" >/dev/null 2>&1 || \
+            docker volume create "$NODE_MODULES_VOLUME" >/dev/null
+    fi
+
+    {
+        printf 'volumes:\n'
+        printf '  vendor:\n'
+        printf '    name: %s\n' "$VENDOR_VOLUME"
+        if [ "$vendor_is_shared" -eq 1 ]; then
+            printf '    external: true\n'
+        else
+            printf '    labels:\n'
+            printf '      swctl.managed: "true"\n'
+            printf '      swctl.project: %s\n' "$SW_PROJECT_SLUG"
+            printf '      swctl.issue: %s\n' "$ISSUE_ID"
+        fi
+        printf '  node_modules:\n'
+        printf '    name: %s\n' "$NODE_MODULES_VOLUME"
+        if [ "$node_is_shared" -eq 1 ]; then
+            printf '    external: true\n'
+        else
+            printf '    labels:\n'
+            printf '      swctl.managed: "true"\n'
+            printf '      swctl.project: %s\n' "$SW_PROJECT_SLUG"
+            printf '      swctl.issue: %s\n' "$ISSUE_ID"
+        fi
+    } > "$COMPOSE_VOLUME_OVERRIDE"
+}
+
 app_container_id() {
     local compose_project="$1"
     local service="${SW_SERVICE_NAME:-app}"
@@ -785,18 +858,48 @@ fix_volume_ownership() {
 bootstrap_dependencies() {
     local compose_project="$1"
     local package_install_cmd=""
+    local vendor_needs_install=0
+    local node_needs_install=0
 
     fix_volume_ownership "$compose_project"
 
-    if run_app_command "$compose_project" "test -f composer.json && test ! -f vendor/autoload.php" >/dev/null 2>&1; then
-        info "Composer dependencies are missing in the worktree volume. Running composer install."
-        run_app_command "$compose_project" "composer install --no-interaction" || warn "composer install failed. Continue after fixing the image or composer setup."
+    # --- Composer / vendor ---
+    if [ "$((MIGRATION_CHANGES + ENTITY_CHANGES + COMPOSER_CHANGES))" -gt 0 ]; then
+        # Dedicated vendor volume — always install
+        vendor_needs_install=1
+        info "Dependency changes detected. Will run composer install."
+    elif run_app_command "$compose_project" "test -f composer.json && test ! -f vendor/autoload.php" >/dev/null 2>&1; then
+        # Shared base volume is empty (first-time populate)
+        vendor_needs_install=1
+        info "Shared vendor volume is empty. Will populate with composer install."
+    else
+        info "Reusing existing vendor volume. Skipping composer install."
     fi
 
+    if [ "$vendor_needs_install" -eq 1 ]; then
+        run_app_command "$compose_project" "composer install --no-interaction" \
+            || warn "composer install failed. Continue after fixing the image or composer setup."
+    fi
+
+    # --- Node modules ---
     package_install_cmd="$(detect_package_install_command "$WORKTREE_PATH" || true)"
-    if [ -n "$package_install_cmd" ] && run_app_command "$compose_project" "test -f package.json && test ! -d node_modules" >/dev/null 2>&1; then
-        info "Node dependencies are missing in the worktree volume. Running: $package_install_cmd"
-        run_app_command "$compose_project" "$package_install_cmd" || warn "Frontend dependency install failed. Continue after fixing the node toolchain inside the image."
+    if [ -n "$package_install_cmd" ]; then
+        if [ "$((MIGRATION_CHANGES + ENTITY_CHANGES + PACKAGE_CHANGES))" -gt 0 ]; then
+            # Dedicated node_modules volume — always install
+            node_needs_install=1
+            info "Package changes detected. Will run: $package_install_cmd"
+        elif run_app_command "$compose_project" "test ! -d node_modules/.package-lock.json && test ! -d node_modules/.modules.yaml" >/dev/null 2>&1; then
+            # Shared base volume is empty (first-time populate)
+            node_needs_install=1
+            info "Shared node_modules volume is empty. Will populate."
+        else
+            info "Reusing existing node_modules volume. Skipping npm/pnpm install."
+        fi
+
+        if [ "$node_needs_install" -eq 1 ]; then
+            run_app_command "$compose_project" "$package_install_cmd" \
+                || warn "Frontend dependency install failed."
+        fi
     fi
 
     ensure_jwt_keys "$compose_project"
@@ -849,13 +952,34 @@ refresh_shared_db() {
 
 run_frontend_build_if_needed() {
     local compose_project="$1"
+    local needs_bundle_dump=0
 
-    if [ "${FRONTEND_CHANGES:-0}" -gt 0 ]; then
-        info "Frontend diff detected. Running bundle dump and theme compile."
+    if [ "${ADMIN_CHANGES:-0}" -gt 0 ] || [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
+        needs_bundle_dump=1
+    fi
+
+    if [ "$needs_bundle_dump" -eq 1 ]; then
+        info "Frontend changes detected. Running bundle:dump."
         run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" || warn "bundle:dump failed."
+    fi
+
+    if [ "${ADMIN_CHANGES:-0}" -gt 0 ]; then
+        info "Admin changes detected. Running assets:install."
+        run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" || warn "assets:install failed."
+    fi
+
+    if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
+        info "Storefront changes detected. Running theme:compile."
         run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:compile --active-only" || warn "theme:compile failed."
-    else
-        info "No frontend diff detected. Skipping theme build."
+    fi
+
+    if [ "$needs_bundle_dump" -eq 0 ]; then
+        info "No frontend changes detected. Skipping theme/admin builds."
+    fi
+
+    # Clear cache for any code change on shared DB
+    if [ "$((BACKEND_CHANGES + ADMIN_CHANGES + STOREFRONT_CHANGES + COMPOSER_CHANGES + PACKAGE_CHANGES))" -gt 0 ] && [ "${DB_STATE:-}" != "dedicated" ]; then
+        run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
     fi
 }
 
@@ -881,7 +1005,8 @@ provision_database_and_app() {
         create_database "$DB_NAME"
         write_env_file
         write_compose_env_file
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+        write_compose_volume_override
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait_for_app_container "$COMPOSE_PROJECT"
         bootstrap_dependencies "$COMPOSE_PROJECT"
         run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
@@ -896,7 +1021,8 @@ provision_database_and_app() {
     ensure_database_exists "$DB_NAME"
     write_env_file
     write_compose_env_file
-    compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+    write_compose_volume_override
+    compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     wait_for_app_container "$COMPOSE_PROJECT"
     bootstrap_dependencies "$COMPOSE_PROJECT"
 
@@ -936,21 +1062,23 @@ cmd_create() {
         APP_URL="http://${DOMAIN}"
     fi
 
-    VENDOR_VOLUME="vendor-${ISSUE_ID}"
-    NODE_MODULES_VOLUME="node_modules-${ISSUE_ID}"
     TRAEFIK_ROUTER="$(sanitize_router_id "${SW_PROJECT_SLUG}_${ISSUE_ID}")"
     TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
     WORKTREE_PATH="${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}"
 
     create_worktree
 
-    # Git diff analysis is intentionally coarse and safe:
-    # any Migration/ or Entity/ change implies isolated schema work,
-    # frontend extensions imply bundle dump + theme compile.
+    # Diff analysis drives the provisioning decision matrix:
+    # what changed determines DB strategy, volume sharing, and build steps.
     DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
     count_changes "$DIFF_FILES"
 
-    info "Diff summary against '${BASE_REF}': migrations=${MIGRATION_CHANGES}, entity=${ENTITY_CHANGES}, frontend=${FRONTEND_CHANGES}"
+    # Resolve volumes AFTER diff analysis — shared base when deps unchanged
+    VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
+    NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
+
+    info "Diff: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
+    info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
 
     provision_database_and_app "$COMPOSE_PROJECT"
     run_frontend_build_if_needed "$COMPOSE_PROJECT"
@@ -1353,7 +1481,7 @@ cmd_restart() {
     load_instance_metadata "$meta_file"
 
     if [ -f "$COMPOSE_ENV_FILE" ] && [ -f "$COMPOSE_TEMPLATE" ]; then
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" restart
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" ${COMPOSE_VOLUME_OVERRIDE:+-f "$COMPOSE_VOLUME_OVERRIDE"} --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" restart
     else
         local container_id
         container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
@@ -1411,7 +1539,7 @@ cmd_clean() {
     load_instance_metadata "$meta_file"
 
     if [ -f "$COMPOSE_ENV_FILE" ] && [ -f "$COMPOSE_TEMPLATE" ]; then
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" down --remove-orphans >/dev/null || true
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" ${COMPOSE_VOLUME_OVERRIDE:+-f "$COMPOSE_VOLUME_OVERRIDE"} --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" down --remove-orphans >/dev/null || true
         ok "Stopped compose project '$COMPOSE_PROJECT'."
     else
         local container_id
@@ -1792,6 +1920,86 @@ cmd_dashboard() {
     printf '\n'
 }
 
+cmd_build_base() {
+    load_project_config
+    ensure_docker
+    ensure_infra_ready
+
+    local vendor_base="vendor-base-${SW_PROJECT_SLUG}"
+    local node_base="node_modules-base-${SW_PROJECT_SLUG}"
+    local tmp_project="swctl-base-build-$$"
+    local tmp_env="$SWCTL_TMP_DIR/base-build.env"
+
+    info "Building base volumes for project '${SW_PROJECT_SLUG}'."
+
+    # Create volumes if they don't exist
+    docker volume inspect "$vendor_base" >/dev/null 2>&1 || docker volume create "$vendor_base" >/dev/null
+    docker volume inspect "$node_base" >/dev/null 2>&1 || docker volume create "$node_base" >/dev/null
+
+    # Write minimal compose env for base build
+    cat >"$tmp_env" <<ENVEOF
+SW_PHP_IMAGE=${SW_PHP_IMAGE}
+SW_WORKTREE_PATH=${PROJECT_ROOT}
+SW_WORKTREE_ID=base
+SW_PROJECT=${SW_PROJECT}
+SW_ISSUE=base
+SW_PROJECT_SLUG=${SW_PROJECT_SLUG}
+SW_APP_DOMAIN=localhost
+SW_APP_URL=http://localhost
+SW_APP_HTTP_PORT=${SW_APP_HTTP_PORT}
+SW_TRAEFIK_NETWORK=${SW_TRAEFIK_NETWORK}
+SW_TRAEFIK_ROUTER=swctl_base
+SW_TRAEFIK_SERVICE=swctl_base
+SW_DB_HOST=${SW_DB_HOST}
+SW_DB_PORT=${SW_DB_PORT}
+SW_DB_NAME=swctl_base_tmp
+SW_DB_ROOT_USER=${SW_DB_ROOT_USER}
+SW_DB_ROOT_PASSWORD=${SW_DB_ROOT_PASSWORD}
+SW_REDIS_URL=${SW_REDIS_URL}
+SW_MAILER_DSN=${SW_MAILER_DSN}
+SW_VENDOR_VOLUME=${vendor_base}
+SW_NODE_MODULES_VOLUME=${node_base}
+SW_UID=${SW_UID}
+SW_GID=${SW_GID}
+SW_DOCKER_PLATFORM=${SW_DOCKER_PLATFORM}
+SW_COMPOSER_ROOT_VERSION=${SW_COMPOSER_ROOT_VERSION}
+ENVEOF
+
+    # Start temporary container with base volumes
+    compose --project-directory "$SWCTL_TMP_DIR" \
+        -f "$SW_COMPOSE_TEMPLATE" --env-file "$tmp_env" \
+        -p "$tmp_project" up -d
+
+    wait_for_app_container "$tmp_project"
+    fix_volume_ownership "$tmp_project"
+
+    info "Running composer install into base vendor volume."
+    run_app_command "$tmp_project" "composer install --no-interaction" || warn "composer install failed."
+
+    local pkg_cmd
+    pkg_cmd="$(detect_package_install_command "$PROJECT_ROOT" || true)"
+    if [ -n "$pkg_cmd" ]; then
+        info "Running $pkg_cmd into base node_modules volume."
+        run_app_command "$tmp_project" "$pkg_cmd" || warn "Node install failed."
+    fi
+
+    # Tear down temporary container
+    compose --project-directory "$SWCTL_TMP_DIR" \
+        -f "$SW_COMPOSE_TEMPLATE" --env-file "$tmp_env" \
+        -p "$tmp_project" down --remove-orphans >/dev/null || true
+
+    rm -f "$tmp_env"
+    ok "Base volumes populated: $vendor_base, $node_base"
+}
+
+cmd_clean_base() {
+    load_project_config
+    local vendor_base="vendor-base-${SW_PROJECT_SLUG}"
+    local node_base="node_modules-base-${SW_PROJECT_SLUG}"
+    docker volume rm "$vendor_base" 2>/dev/null && ok "Removed $vendor_base" || info "$vendor_base not found."
+    docker volume rm "$node_base" 2>/dev/null && ok "Removed $node_base" || info "$node_base not found."
+}
+
 show_help() {
     cat <<EOF
 swctl ${SWCTL_VERSION}
@@ -1823,6 +2031,8 @@ Commands:
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
   tui         Open the interactive ANSI dashboard.
   dashboard   Open the live monitoring dashboard.
+  build-base  Pre-populate shared vendor and node_modules base volumes from the project root.
+  clean-base  Remove shared base volumes for the current project.
 
 Environment:
   swctl auto-detects .swctl.conf in the current directory or a parent directory.
@@ -1888,6 +2098,14 @@ main() {
         dashboard)
             ensure_state_dirs
             cmd_dashboard
+            ;;
+        build-base)
+            ensure_state_dirs
+            cmd_build_base
+            ;;
+        clean-base)
+            ensure_state_dirs
+            cmd_clean_base
             ;;
         --version|-v)
             cmd_version
