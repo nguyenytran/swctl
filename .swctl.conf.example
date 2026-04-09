@@ -1,0 +1,43 @@
+# Project identity and base branch used for diff analysis.
+SW_PROJECT="sw66"
+SW_BASE_BRANCH="trunk"
+SW_DOMAIN_SUFFIX="sw66.localhost"
+
+# Worktrees are created under this directory. Relative paths are resolved from the repo root.
+SW_WORKTREE_ROOT="../_worktrees"
+SW_WORKTREE_PREFIX="sw66"
+
+# The container image must provide bash, php, composer, and any frontend toolchain you expect to run.
+SW_PHP_IMAGE="ghcr.io/your-org/shopware-php:8.2-dev"
+SW_DOCKER_PLATFORM=""
+
+# Shared infra defaults. swctl init uses these values when run from the project root.
+SW_TRAEFIK_NETWORK="swctl-proxy"
+SW_INFRA_TRAEFIK_CONTAINER="swctl-traefik"
+SW_INFRA_DB_CONTAINER="swctl-mariadb"
+SW_INFRA_REDIS_CONTAINER="swctl-redis"
+
+# App/runtime defaults injected into .env.local and Docker.
+SW_DB_HOST="host.docker.internal"
+SW_DB_PORT="3306"
+SW_DB_ROOT_USER="root"
+SW_DB_ROOT_PASSWORD="shopware"
+SW_DB_NAME_PREFIX="sw66"
+SW_DB_SHARED_NAME="sw66_shared"
+SW_REDIS_URL="redis://host.docker.internal:6379"
+SW_MAILER_DSN="null://localhost"
+SW_BIN_CONSOLE="bin/console"
+SW_APP_HTTP_PORT="8000"
+SW_ENV_FILE_NAME=".env.local"
+
+# Override if your compose template lives outside the repository root.
+# SW_COMPOSE_TEMPLATE="/absolute/path/to/docker-compose.swctl.yml"
+
+# Default Shopware install flags for dedicated databases.
+# Adjust these if your project requires extra setup options.
+SW_INSTALL_ARGS="--basic-setup --force --no-interaction"
+SW_SHARED_DB_INSTALL_ARGS="--basic-setup --force --no-interaction"
+
+# Optional UID/GID pinning for Linux bind mounts.
+# SW_UID="1000"
+# SW_GID="1000"

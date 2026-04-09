@@ -1,0 +1,52 @@
+services:
+  app:
+    image: ${SW_PHP_IMAGE}
+    working_dir: /var/www/html
+    user: "${SW_UID}:${SW_GID}"
+    command: >
+      bash -lc "php -S 0.0.0.0:${SW_APP_HTTP_PORT} -t public"
+    environment:
+      APP_URL: ${SW_APP_URL}
+      DATABASE_URL: mysql://${SW_DB_ROOT_USER}:${SW_DB_ROOT_PASSWORD}@${SW_DB_HOST}:${SW_DB_PORT}/${SW_DB_NAME}
+      REDIS_URL: ${SW_REDIS_URL}
+      MAILER_DSN: ${SW_MAILER_DSN}
+      WORKTREE_ID: ${SW_WORKTREE_ID}
+      SWCTL_PROJECT: ${SW_PROJECT}
+      SWCTL_ISSUE: ${SW_ISSUE}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - proxy
+    volumes:
+      - ${SW_WORKTREE_PATH}:/var/www/html:cached
+      - vendor:/var/www/html/vendor:cached
+      - node_modules:/var/www/html/node_modules:cached
+    labels:
+      - "traefik.enable=true"
+      # Traefik routes each worktree to <project>-<issue>.<domain suffix>.
+      - "traefik.http.routers.${SW_TRAEFIK_ROUTER}.entrypoints=web"
+      - "traefik.http.routers.${SW_TRAEFIK_ROUTER}.rule=Host(`${SW_APP_DOMAIN}`)"
+      - "traefik.http.services.${SW_TRAEFIK_SERVICE}.loadbalancer.server.port=${SW_APP_HTTP_PORT}"
+      - "swctl.managed=true"
+      - "swctl.project=${SW_PROJECT_SLUG}"
+      - "swctl.issue=${SW_ISSUE}"
+
+volumes:
+  vendor:
+    name: ${SW_VENDOR_VOLUME}
+    labels:
+      swctl.managed: "true"
+      swctl.project: ${SW_PROJECT_SLUG}
+      swctl.issue: ${SW_ISSUE}
+  node_modules:
+    name: ${SW_NODE_MODULES_VOLUME}
+    labels:
+      swctl.managed: "true"
+      swctl.project: ${SW_PROJECT_SLUG}
+      swctl.issue: ${SW_ISSUE}
+
+networks:
+  proxy:
+    external: true
+    name: ${SW_TRAEFIK_NETWORK}

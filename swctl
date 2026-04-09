@@ -1,0 +1,1320 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SWCTL_VERSION="0.1.0"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SWCTL_TEMPLATE_DIR="${SWCTL_TEMPLATE_DIR:-$SCRIPT_DIR}"
+SWCTL_STATE_DIR="${SWCTL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/swctl}"
+SWCTL_REGISTRY_DIR="$SWCTL_STATE_DIR/instances"
+SWCTL_INFRA_DIR="$SWCTL_STATE_DIR/infra"
+SWCTL_TMP_DIR="${TMPDIR:-/tmp}/swctl"
+
+COLOR_RESET=""
+COLOR_DIM=""
+COLOR_RED=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_BLUE=""
+COLOR_CYAN=""
+COLOR_BOLD=""
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+    colors="$(tput colors 2>/dev/null || printf '0')"
+    if [ "${colors:-0}" -ge 8 ]; then
+        COLOR_RESET="$(tput sgr0)"
+        COLOR_DIM="$(tput dim)"
+        COLOR_RED="$(tput setaf 1)"
+        COLOR_GREEN="$(tput setaf 2)"
+        COLOR_YELLOW="$(tput setaf 3)"
+        COLOR_BLUE="$(tput setaf 4)"
+        COLOR_CYAN="$(tput setaf 6)"
+        COLOR_BOLD="$(tput bold)"
+    fi
+fi
+
+log() {
+    printf '%b[%s]%b %s\n' "$1" "$2" "$COLOR_RESET" "$3"
+}
+
+ok() {
+    log "$COLOR_GREEN" "OK" "$1"
+}
+
+warn() {
+    log "$COLOR_YELLOW" "WARN" "$1"
+}
+
+err() {
+    log "$COLOR_RED" "ERR" "$1" >&2
+}
+
+info() {
+    log "$COLOR_CYAN" "INFO" "$1"
+}
+
+die() {
+    err "$1"
+    exit 1
+}
+
+ensure_state_dirs() {
+    mkdir -p "$SWCTL_REGISTRY_DIR" "$SWCTL_INFRA_DIR" "$SWCTL_TMP_DIR"
+}
+
+require_cmd() {
+    local cmd="$1"
+    command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
+}
+
+compose() {
+    if docker compose version >/dev/null 2>&1; then
+        docker compose "$@"
+        return
+    fi
+
+    if command -v docker-compose >/dev/null 2>&1; then
+        docker-compose "$@"
+        return
+    fi
+
+    die "Docker Compose is required. Install the Docker Compose plugin or docker-compose."
+}
+
+tolower() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+sanitize_slug() {
+    printf '%s' "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-{2,}/-/g'
+}
+
+sanitize_db_identifier() {
+    printf '%s' "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//; s/_{2,}/_/g'
+}
+
+sanitize_router_id() {
+    printf '%s' "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//; s/_{2,}/_/g'
+}
+
+resolve_path() {
+    local base="$1"
+    local target="$2"
+    local dir=""
+    local path_input=""
+    local part=""
+    local output=""
+    local old_ifs="$IFS"
+    local parts=()
+    local stack=()
+    local index=0
+
+    if [[ "$target" = /* ]]; then
+        printf '%s\n' "$target"
+        return
+    fi
+
+    dir="$(cd "$base" && pwd -P)"
+    path_input="${dir}/${target}"
+    IFS='/'
+    read -r -a parts <<< "$path_input"
+    IFS="$old_ifs"
+
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ""|".")
+                continue
+                ;;
+            "..")
+                if [ "$index" -gt 0 ]; then
+                    index=$((index - 1))
+                    unset "stack[$index]"
+                fi
+                ;;
+            *)
+                stack[$index]="$part"
+                index=$((index + 1))
+                ;;
+        esac
+    done
+
+    output="/"
+    index=0
+    while [ "$index" -lt "${#stack[@]}" ]; do
+        output="${output}${stack[$index]}"
+        if [ "$index" -lt $(( ${#stack[@]} - 1 )) ]; then
+            output="${output}/"
+        fi
+        index=$((index + 1))
+    done
+
+    printf '%s\n' "$output"
+}
+
+find_config() {
+    local dir="$PWD"
+
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/.swctl.conf" ]; then
+            printf '%s/.swctl.conf\n' "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+
+    return 1
+}
+
+detect_template_path() {
+    if [ -n "${SW_COMPOSE_TEMPLATE:-}" ]; then
+        if [ -f "$SW_COMPOSE_TEMPLATE" ]; then
+            printf '%s\n' "$SW_COMPOSE_TEMPLATE"
+            return 0
+        fi
+        if [ -f "$PROJECT_ROOT/$SW_COMPOSE_TEMPLATE" ]; then
+            printf '%s\n' "$PROJECT_ROOT/$SW_COMPOSE_TEMPLATE"
+            return 0
+        fi
+    fi
+
+    if [ -f "$PROJECT_ROOT/docker-compose.swctl.yml" ]; then
+        printf '%s/docker-compose.swctl.yml\n' "$PROJECT_ROOT"
+        return 0
+    fi
+
+    if [ -f "$SWCTL_TEMPLATE_DIR/docker-compose.swctl.yml" ]; then
+        printf '%s/docker-compose.swctl.yml\n' "$SWCTL_TEMPLATE_DIR"
+        return 0
+    fi
+
+    return 1
+}
+
+load_project_config() {
+    local config_path="${1:-}"
+
+    if [ -z "$config_path" ]; then
+        config_path="$(find_config)" || die "Could not locate .swctl.conf in the current directory tree."
+    fi
+
+    PROJECT_CONFIG="$config_path"
+    PROJECT_ROOT="$(cd "$(dirname "$config_path")" && pwd -P)"
+
+    # shellcheck disable=SC1090
+    . "$config_path"
+
+    SW_PROJECT="${SW_PROJECT:-$(basename "$PROJECT_ROOT")}"
+    SW_PROJECT_SLUG="$(sanitize_slug "$SW_PROJECT")"
+    SW_BASE_BRANCH="${SW_BASE_BRANCH:-main}"
+    SW_DOMAIN_SUFFIX="${SW_DOMAIN_SUFFIX:-sw.localhost}"
+    SW_WORKTREE_ROOT="${SW_WORKTREE_ROOT:-../_worktrees}"
+    SW_WORKTREE_ROOT="$(resolve_path "$PROJECT_ROOT" "$SW_WORKTREE_ROOT")"
+    SW_PHP_IMAGE="${SW_PHP_IMAGE:-ghcr.io/your-org/shopware-php:8.2-dev}"
+    SW_DB_HOST="${SW_DB_HOST:-host.docker.internal}"
+    SW_DB_PORT="${SW_DB_PORT:-3306}"
+    SW_DB_ROOT_USER="${SW_DB_ROOT_USER:-root}"
+    SW_DB_ROOT_PASSWORD="${SW_DB_ROOT_PASSWORD:-shopware}"
+    SW_DB_NAME_PREFIX="${SW_DB_NAME_PREFIX:-$SW_PROJECT_SLUG}"
+    SW_DB_SHARED_NAME="${SW_DB_SHARED_NAME:-${SW_PROJECT_SLUG}_shared}"
+    SW_REDIS_URL="${SW_REDIS_URL:-redis://host.docker.internal:6379}"
+    SW_MAILER_DSN="${SW_MAILER_DSN:-null://localhost}"
+    SW_BIN_CONSOLE="${SW_BIN_CONSOLE:-bin/console}"
+    SW_APP_HTTP_PORT="${SW_APP_HTTP_PORT:-8000}"
+    SW_TRAEFIK_NETWORK="${SW_TRAEFIK_NETWORK:-swctl-proxy}"
+    SW_INFRA_TRAEFIK_CONTAINER="${SW_INFRA_TRAEFIK_CONTAINER:-swctl-traefik}"
+    SW_INFRA_DB_CONTAINER="${SW_INFRA_DB_CONTAINER:-swctl-mariadb}"
+    SW_INFRA_REDIS_CONTAINER="${SW_INFRA_REDIS_CONTAINER:-swctl-redis}"
+    SW_INSTALL_ARGS="${SW_INSTALL_ARGS:---basic-setup --force --no-interaction}"
+    SW_SHARED_DB_INSTALL_ARGS="${SW_SHARED_DB_INSTALL_ARGS:-$SW_INSTALL_ARGS}"
+    SW_WORKTREE_PREFIX="${SW_WORKTREE_PREFIX:-$SW_PROJECT_SLUG}"
+    SW_DOCKER_PLATFORM="${SW_DOCKER_PLATFORM:-}"
+    SW_UID="${SW_UID:-$(id -u 2>/dev/null || printf '1000')}"
+    SW_GID="${SW_GID:-$(id -g 2>/dev/null || printf '1000')}"
+    SW_ENV_FILE_NAME="${SW_ENV_FILE_NAME:-.env.local}"
+    SW_COMPOSE_TEMPLATE="$(detect_template_path)" || die "Could not find docker-compose.swctl.yml. Put it in the project root or export SWCTL_TEMPLATE_DIR."
+}
+
+maybe_load_project_config() {
+    local config_path=""
+    if config_path="$(find_config 2>/dev/null)"; then
+        load_project_config "$config_path"
+        return 0
+    fi
+    return 1
+}
+
+timestamp_utc() {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+instance_dir() {
+    printf '%s/%s\n' "$SWCTL_REGISTRY_DIR" "$1"
+}
+
+instance_file() {
+    printf '%s/%s/%s.env\n' "$SWCTL_REGISTRY_DIR" "$1" "$2"
+}
+
+list_instance_files() {
+    local scope="${1:-all}"
+
+    if [ "$scope" = "project" ] && [ -n "${SW_PROJECT_SLUG:-}" ]; then
+        find "$(instance_dir "$SW_PROJECT_SLUG")" -type f -name '*.env' 2>/dev/null | sort
+        return
+    fi
+
+    find "$SWCTL_REGISTRY_DIR" -type f -name '*.env' 2>/dev/null | sort
+}
+
+load_instance_metadata() {
+    local file="$1"
+    # shellcheck disable=SC1090
+    . "$file"
+}
+
+write_metadata() {
+    local meta_file="$1"
+
+    mkdir -p "$(dirname "$meta_file")"
+    {
+        printf 'SWCTL_META_VERSION=%q\n' "1"
+        printf 'ISSUE=%q\n' "$ISSUE"
+        printf 'ISSUE_ID=%q\n' "$ISSUE_ID"
+        printf 'PROJECT=%q\n' "$SW_PROJECT"
+        printf 'PROJECT_SLUG=%q\n' "$SW_PROJECT_SLUG"
+        printf 'PROJECT_ROOT=%q\n' "$PROJECT_ROOT"
+        printf 'CONFIG_PATH=%q\n' "$PROJECT_CONFIG"
+        printf 'BRANCH=%q\n' "$BRANCH"
+        printf 'BASE_REF=%q\n' "$BASE_REF"
+        printf 'WORKTREE_PATH=%q\n' "$WORKTREE_PATH"
+        printf 'WORKTREE_ID=%q\n' "$WORKTREE_ID"
+        printf 'DOMAIN=%q\n' "$DOMAIN"
+        printf 'APP_URL=%q\n' "$APP_URL"
+        printf 'DB_NAME=%q\n' "$DB_NAME"
+        printf 'DB_STATE=%q\n' "$DB_STATE"
+        printf 'COMPOSE_PROJECT=%q\n' "$COMPOSE_PROJECT"
+        printf 'COMPOSE_ENV_FILE=%q\n' "$COMPOSE_ENV_FILE"
+        printf 'COMPOSE_TEMPLATE=%q\n' "$SW_COMPOSE_TEMPLATE"
+        printf 'VENDOR_VOLUME=%q\n' "$VENDOR_VOLUME"
+        printf 'NODE_MODULES_VOLUME=%q\n' "$NODE_MODULES_VOLUME"
+        printf 'MIGRATION_CHANGES=%q\n' "$MIGRATION_CHANGES"
+        printf 'ENTITY_CHANGES=%q\n' "$ENTITY_CHANGES"
+        printf 'FRONTEND_CHANGES=%q\n' "$FRONTEND_CHANGES"
+        printf 'CREATED_AT=%q\n' "$(timestamp_utc)"
+    } >"$meta_file"
+}
+
+resolve_instance_file_by_issue() {
+    local issue_input="$1"
+    local issue_id
+    local hits
+    local first_hit
+
+    issue_id="$(sanitize_slug "$issue_input")"
+    hits=""
+
+    while IFS= read -r file; do
+        if [ -n "$hits" ]; then
+            hits="${hits}
+$file"
+        else
+            hits="$file"
+        fi
+    done <<EOF
+$(find "$SWCTL_REGISTRY_DIR" -type f -path "*/${issue_id}.env" 2>/dev/null | sort)
+EOF
+
+    if [ -z "$hits" ]; then
+        return 1
+    fi
+
+    first_hit="$(printf '%s\n' "$hits" | sed -n '1p')"
+    if [ -n "${SW_PROJECT_SLUG:-}" ]; then
+        if [ -f "$(instance_file "$SW_PROJECT_SLUG" "$issue_id")" ]; then
+            printf '%s\n' "$(instance_file "$SW_PROJECT_SLUG" "$issue_id")"
+            return 0
+        fi
+    fi
+
+    if [ "$(printf '%s\n' "$hits" | grep -c '.' || true)" -gt 1 ]; then
+        err "Issue '$issue_input' exists in multiple projects."
+        printf '%s\n' "$hits" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$first_hit"
+    return 0
+}
+
+container_exists() {
+    docker ps -a --format '{{.Names}}' | grep -Fxq "$1"
+}
+
+container_running() {
+    docker ps --format '{{.Names}}' | grep -Fxq "$1"
+}
+
+ensure_docker() {
+    require_cmd docker
+    docker info >/dev/null 2>&1 || die "Docker daemon is not reachable."
+}
+
+ensure_network() {
+    if docker network inspect "$SW_TRAEFIK_NETWORK" >/dev/null 2>&1; then
+        ok "Docker network '$SW_TRAEFIK_NETWORK' already exists."
+    else
+        docker network create "$SW_TRAEFIK_NETWORK" >/dev/null
+        ok "Created Docker network '$SW_TRAEFIK_NETWORK'."
+    fi
+}
+
+start_or_create_container() {
+    local name="$1"
+    shift
+
+    if container_exists "$name"; then
+        if container_running "$name"; then
+            ok "Container '$name' is already running."
+        else
+            docker start "$name" >/dev/null
+            ok "Started container '$name'."
+        fi
+    else
+        docker run -d --name "$name" "$@" >/dev/null
+        ok "Created container '$name'."
+    fi
+}
+
+mysql_exec() {
+    local sql="$1"
+    docker exec -i "$SW_INFRA_DB_CONTAINER" mariadb \
+        -u "$SW_DB_ROOT_USER" \
+        "-p$SW_DB_ROOT_PASSWORD" \
+        -Nse "$sql"
+}
+
+mysql_db_exists() {
+    local db_name="$1"
+    local result
+    result="$(mysql_exec "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${db_name}';" 2>/dev/null || true)"
+    [ "$result" = "$db_name" ]
+}
+
+mysql_db_has_tables() {
+    local db_name="$1"
+    local result
+    result="$(mysql_exec "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='${db_name}';" 2>/dev/null || printf '0')"
+    [ "${result:-0}" -gt 0 ]
+}
+
+wait_for_mysql() {
+    local attempt=0
+    while [ "$attempt" -lt 30 ]; do
+        if mysql_exec 'SELECT 1;' >/dev/null 2>&1; then
+            ok "MariaDB is reachable on ${SW_DB_HOST}:${SW_DB_PORT}."
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+
+    die "MariaDB did not become ready in time."
+}
+
+init_infra() {
+    ensure_docker
+    maybe_load_project_config >/dev/null 2>&1 || true
+
+    SW_TRAEFIK_NETWORK="${SW_TRAEFIK_NETWORK:-swctl-proxy}"
+    SW_INFRA_TRAEFIK_CONTAINER="${SW_INFRA_TRAEFIK_CONTAINER:-swctl-traefik}"
+    SW_INFRA_DB_CONTAINER="${SW_INFRA_DB_CONTAINER:-swctl-mariadb}"
+    SW_INFRA_REDIS_CONTAINER="${SW_INFRA_REDIS_CONTAINER:-swctl-redis}"
+    SW_DB_ROOT_USER="${SW_DB_ROOT_USER:-root}"
+    SW_DB_ROOT_PASSWORD="${SW_DB_ROOT_PASSWORD:-shopware}"
+    SW_DB_PORT="${SW_DB_PORT:-3306}"
+
+    ensure_network
+
+    start_or_create_container "$SW_INFRA_TRAEFIK_CONTAINER" \
+        --restart unless-stopped \
+        --network "$SW_TRAEFIK_NETWORK" \
+        -p 80:80 \
+        -p 8080:8080 \
+        -v /var/run/docker.sock:/var/run/docker.sock:ro \
+        -v swctl-traefik-data:/data \
+        traefik:v3.1 \
+        --api.dashboard=true \
+        --api.insecure=true \
+        --providers.docker=true \
+        --providers.docker.exposedByDefault=false \
+        --entrypoints.web.address=:80
+
+    start_or_create_container "$SW_INFRA_DB_CONTAINER" \
+        --restart unless-stopped \
+        --network "$SW_TRAEFIK_NETWORK" \
+        -p "${SW_DB_PORT}:3306" \
+        -e "MARIADB_ROOT_PASSWORD=${SW_DB_ROOT_PASSWORD}" \
+        -e "MARIADB_ROOT_HOST=%" \
+        -v swctl-mariadb-data:/var/lib/mysql \
+        mariadb:11
+
+    start_or_create_container "$SW_INFRA_REDIS_CONTAINER" \
+        --restart unless-stopped \
+        --network "$SW_TRAEFIK_NETWORK" \
+        -p 6379:6379 \
+        -v swctl-redis-data:/data \
+        redis:7-alpine \
+        redis-server \
+        --appendonly yes
+
+    wait_for_mysql
+    ok "Shared infrastructure is ready."
+    info "Traefik dashboard: http://localhost:8080"
+}
+
+ensure_infra_ready() {
+    ensure_docker
+    if ! docker network inspect "${SW_TRAEFIK_NETWORK:-swctl-proxy}" >/dev/null 2>&1 || \
+        ! container_running "${SW_INFRA_TRAEFIK_CONTAINER:-swctl-traefik}" || \
+        ! container_running "${SW_INFRA_DB_CONTAINER:-swctl-mariadb}" || \
+        ! container_running "${SW_INFRA_REDIS_CONTAINER:-swctl-redis}"; then
+        warn "Shared infrastructure is missing or stopped. Running 'swctl init'."
+        init_infra
+    fi
+}
+
+git_base_ref() {
+    if git -C "$PROJECT_ROOT" rev-parse --verify "$SW_BASE_BRANCH" >/dev/null 2>&1; then
+        printf '%s\n' "$SW_BASE_BRANCH"
+        return 0
+    fi
+
+    if git -C "$PROJECT_ROOT" rev-parse --verify "origin/$SW_BASE_BRANCH" >/dev/null 2>&1; then
+        printf '%s\n' "origin/$SW_BASE_BRANCH"
+        return 0
+    fi
+
+    die "Base branch '$SW_BASE_BRANCH' was not found locally or under origin/."
+}
+
+worktree_exists() {
+    git -C "$PROJECT_ROOT" worktree list --porcelain | grep -Fxq "worktree $1"
+}
+
+create_worktree() {
+    mkdir -p "$SW_WORKTREE_ROOT"
+
+    if worktree_exists "$WORKTREE_PATH"; then
+        ok "Git worktree already exists at '$WORKTREE_PATH'."
+        return 0
+    fi
+
+    if [ -d "$WORKTREE_PATH" ]; then
+        die "Target worktree path already exists and is not a registered Git worktree: $WORKTREE_PATH"
+    fi
+
+    if git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+        git -C "$PROJECT_ROOT" worktree add "$WORKTREE_PATH" "$BRANCH"
+        ok "Attached existing branch '$BRANCH' at '$WORKTREE_PATH'."
+    else
+        git -C "$PROJECT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "$BASE_REF"
+        ok "Created worktree '$WORKTREE_PATH' from '$BASE_REF'."
+    fi
+}
+
+count_changes() {
+    local diff_files="$1"
+    MIGRATION_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)(Migration|Migrations)/' || true)"
+    ENTITY_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)Entity/' || true)"
+    FRONTEND_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '\.(js|vue|scss|ts|twig)$' || true)"
+}
+
+detect_package_install_command() {
+    local path="$1"
+
+    if [ -f "$path/pnpm-lock.yaml" ]; then
+        printf '%s\n' "pnpm install --frozen-lockfile"
+        return
+    fi
+
+    if [ -f "$path/yarn.lock" ]; then
+        printf '%s\n' "yarn install --frozen-lockfile"
+        return
+    fi
+
+    if [ -f "$path/package-lock.json" ]; then
+        printf '%s\n' "npm ci"
+        return
+    fi
+
+    if [ -f "$path/package.json" ]; then
+        printf '%s\n' "npm install"
+    fi
+}
+
+write_env_file() {
+    local env_file="$WORKTREE_PATH/$SW_ENV_FILE_NAME"
+    local backup_file="$WORKTREE_PATH/${SW_ENV_FILE_NAME}.pre-swctl"
+
+    if [ -f "$env_file" ] && ! grep -Fq "Managed by swctl" "$env_file"; then
+        if [ ! -f "$backup_file" ]; then
+            cp "$env_file" "$backup_file"
+            warn "Backed up existing $SW_ENV_FILE_NAME to $(basename "$backup_file")."
+        fi
+    fi
+
+    cat >"$env_file" <<EOF
+# Managed by swctl. Re-generated on $(timestamp_utc)
+APP_ENV=dev
+APP_URL=${APP_URL}
+DATABASE_URL=mysql://${SW_DB_ROOT_USER}:${SW_DB_ROOT_PASSWORD}@${SW_DB_HOST}:${SW_DB_PORT}/${DB_NAME}
+MAILER_DSN=${SW_MAILER_DSN}
+REDIS_URL=${SW_REDIS_URL}
+WORKTREE_ID=${WORKTREE_ID}
+COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT}
+SWCTL_PROJECT=${SW_PROJECT}
+SWCTL_ISSUE=${ISSUE_ID}
+EOF
+
+    ok "Generated ${SW_ENV_FILE_NAME}."
+}
+
+write_compose_env_file() {
+    COMPOSE_ENV_FILE="$WORKTREE_PATH/.swctl.compose.env"
+    cat >"$COMPOSE_ENV_FILE" <<EOF
+SW_PHP_IMAGE=${SW_PHP_IMAGE}
+SW_WORKTREE_PATH=${WORKTREE_PATH}
+SW_WORKTREE_ID=${WORKTREE_ID}
+SW_PROJECT=${SW_PROJECT}
+SW_ISSUE=${ISSUE_ID}
+SW_PROJECT_SLUG=${SW_PROJECT_SLUG}
+SW_APP_DOMAIN=${DOMAIN}
+SW_APP_URL=${APP_URL}
+SW_APP_HTTP_PORT=${SW_APP_HTTP_PORT}
+SW_TRAEFIK_NETWORK=${SW_TRAEFIK_NETWORK}
+SW_TRAEFIK_ROUTER=${TRAEFIK_ROUTER}
+SW_TRAEFIK_SERVICE=${TRAEFIK_SERVICE}
+SW_DB_HOST=${SW_DB_HOST}
+SW_DB_PORT=${SW_DB_PORT}
+SW_DB_NAME=${DB_NAME}
+SW_DB_ROOT_USER=${SW_DB_ROOT_USER}
+SW_DB_ROOT_PASSWORD=${SW_DB_ROOT_PASSWORD}
+SW_REDIS_URL=${SW_REDIS_URL}
+SW_MAILER_DSN=${SW_MAILER_DSN}
+SW_VENDOR_VOLUME=${VENDOR_VOLUME}
+SW_NODE_MODULES_VOLUME=${NODE_MODULES_VOLUME}
+SW_UID=${SW_UID}
+SW_GID=${SW_GID}
+SW_DOCKER_PLATFORM=${SW_DOCKER_PLATFORM}
+EOF
+}
+
+app_container_id() {
+    local compose_project="$1"
+    docker ps -q \
+        --filter "label=com.docker.compose.project=${compose_project}" \
+        --filter "label=com.docker.compose.service=app" \
+        2>/dev/null \
+        | sed -n '1p'
+}
+
+app_container_exists_any_state() {
+    local compose_project="$1"
+    docker ps -aq \
+        --filter "label=com.docker.compose.project=${compose_project}" \
+        --filter "label=com.docker.compose.service=app" \
+        2>/dev/null \
+        | sed -n '1p'
+}
+
+wait_for_app_container() {
+    local compose_project="$1"
+    local attempt=0
+    while [ "$attempt" -lt 30 ]; do
+        if [ -n "$(app_container_id "$compose_project")" ]; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+
+    die "App container for '$compose_project' did not start in time."
+}
+
+exec_in_container() {
+    local container_id="$1"
+    local command_string="$2"
+
+    if [ -t 0 ] && [ -t 1 ]; then
+        docker exec -it "$container_id" bash -lc "$command_string"
+    else
+        docker exec "$container_id" bash -lc "$command_string"
+    fi
+}
+
+run_app_command() {
+    local compose_project="$1"
+    local command_string="$2"
+    local container_id
+
+    container_id="$(app_container_id "$compose_project")"
+    [ -n "$container_id" ] || die "No running app container found for '$compose_project'."
+    exec_in_container "$container_id" "$command_string"
+}
+
+bootstrap_dependencies() {
+    local compose_project="$1"
+    local package_install_cmd=""
+
+    if run_app_command "$compose_project" "test -f composer.json && test ! -f vendor/autoload.php" >/dev/null 2>&1; then
+        info "Composer dependencies are missing in the worktree volume. Running composer install."
+        run_app_command "$compose_project" "composer install --no-interaction" || warn "composer install failed. Continue after fixing the image or composer setup."
+    fi
+
+    package_install_cmd="$(detect_package_install_command "$WORKTREE_PATH" || true)"
+    if [ -n "$package_install_cmd" ] && run_app_command "$compose_project" "test -f package.json && test ! -d node_modules" >/dev/null 2>&1; then
+        info "Node dependencies are missing in the worktree volume. Running: $package_install_cmd"
+        run_app_command "$compose_project" "$package_install_cmd" || warn "Frontend dependency install failed. Continue after fixing the node toolchain inside the image."
+    fi
+}
+
+run_install_command() {
+    local compose_project="$1"
+    local install_args="$2"
+    local install_cmd
+
+    install_cmd="$SW_BIN_CONSOLE system:install $install_args"
+    info "Running Shopware system install for database '$DB_NAME'."
+    run_app_command "$compose_project" "$install_cmd"
+}
+
+refresh_shared_db() {
+    local compose_project="$1"
+
+    info "Reusing shared database '$DB_NAME' and refreshing runtime state."
+    run_app_command "$compose_project" "$SW_BIN_CONSOLE dal:refresh:index" || warn "dal:refresh:index failed."
+    run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
+}
+
+run_frontend_build_if_needed() {
+    local compose_project="$1"
+
+    if [ "${FRONTEND_CHANGES:-0}" -gt 0 ]; then
+        info "Frontend diff detected. Running bundle dump and theme compile."
+        run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" || warn "bundle:dump failed."
+        run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:compile --active-only" || warn "theme:compile failed."
+    else
+        info "No frontend diff detected. Skipping theme build."
+    fi
+}
+
+create_database() {
+    local db_name="$1"
+    mysql_exec "DROP DATABASE IF EXISTS \`${db_name}\`; CREATE DATABASE \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+}
+
+ensure_database_exists() {
+    local db_name="$1"
+    mysql_exec "CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+}
+
+provision_database_and_app() {
+    local compose_project="$1"
+
+    # Diff analysis drives a simple DB decision matrix:
+    # schema-touching changes get an isolated DB + full install, otherwise we reuse
+    # the shared DB and only refresh indexes/cache to keep create fast.
+    if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
+        DB_STATE="dedicated"
+        DB_NAME="$(sanitize_db_identifier "${SW_DB_NAME_PREFIX}_${ISSUE_ID}")"
+        create_database "$DB_NAME"
+        write_env_file
+        write_compose_env_file
+        compose -f "$SW_COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+        wait_for_app_container "$COMPOSE_PROJECT"
+        bootstrap_dependencies "$COMPOSE_PROJECT"
+        run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
+        return 0
+    fi
+
+    DB_STATE="shared"
+    DB_NAME="$(sanitize_db_identifier "$SW_DB_SHARED_NAME")"
+    ensure_database_exists "$DB_NAME"
+    write_env_file
+    write_compose_env_file
+    compose -f "$SW_COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+    wait_for_app_container "$COMPOSE_PROJECT"
+    bootstrap_dependencies "$COMPOSE_PROJECT"
+
+    if mysql_db_has_tables "$DB_NAME"; then
+        refresh_shared_db "$COMPOSE_PROJECT"
+    else
+        warn "Shared database '$DB_NAME' is empty. Bootstrapping it with system:install."
+        run_install_command "$COMPOSE_PROJECT" "$SW_SHARED_DB_INSTALL_ARGS"
+    fi
+}
+
+cmd_create() {
+    ISSUE="${1:-}"
+    BRANCH="${2:-}"
+    [ -n "$ISSUE" ] || die "Usage: swctl create <issue> <branch>"
+    [ -n "$BRANCH" ] || die "Usage: swctl create <issue> <branch>"
+
+    require_cmd git
+    ensure_docker
+    load_project_config
+    ensure_infra_ready
+
+    git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Project root is not a Git repository: $PROJECT_ROOT"
+
+    ISSUE_ID="$(sanitize_slug "$ISSUE")"
+    WORKTREE_ID="$ISSUE_ID"
+    BASE_REF="$(git_base_ref)"
+    DOMAIN="${SW_PROJECT_SLUG}-${ISSUE_ID}.${SW_DOMAIN_SUFFIX}"
+    APP_URL="http://${DOMAIN}"
+    COMPOSE_PROJECT="$(sanitize_slug "${SW_PROJECT_SLUG}-${ISSUE_ID}")"
+    VENDOR_VOLUME="vendor-${ISSUE_ID}"
+    NODE_MODULES_VOLUME="node_modules-${ISSUE_ID}"
+    TRAEFIK_ROUTER="$(sanitize_router_id "${SW_PROJECT_SLUG}_${ISSUE_ID}")"
+    TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
+    WORKTREE_PATH="${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}"
+
+    create_worktree
+
+    # Git diff analysis is intentionally coarse and safe:
+    # any Migration/ or Entity/ change implies isolated schema work,
+    # frontend extensions imply bundle dump + theme compile.
+    DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
+    count_changes "$DIFF_FILES"
+
+    info "Diff summary against '${BASE_REF}': migrations=${MIGRATION_CHANGES}, entity=${ENTITY_CHANGES}, frontend=${FRONTEND_CHANGES}"
+
+    provision_database_and_app "$COMPOSE_PROJECT"
+    run_frontend_build_if_needed "$COMPOSE_PROJECT"
+    write_metadata "$(instance_file "$SW_PROJECT_SLUG" "$ISSUE_ID")"
+
+    ok "Worktree '${WORKTREE_ID}' is ready."
+    info "URL: ${APP_URL}"
+    info "Worktree: ${WORKTREE_PATH}"
+}
+
+truncate_text() {
+    local max="$1"
+    local value="$2"
+    if [ "${#value}" -le "$max" ]; then
+        printf '%s' "$value"
+        return
+    fi
+    if [ "$max" -le 3 ]; then
+        printf '%s' "${value:0:$max}"
+        return
+    fi
+    printf '%s...' "${value:0:$((max - 3))}"
+}
+
+status_label() {
+    local compose_project="$1"
+    if [ -n "$(app_container_id "$compose_project")" ]; then
+        printf '%b● Running%b' "$COLOR_GREEN" "$COLOR_RESET"
+        return
+    fi
+
+    if [ -n "$(app_container_exists_any_state "$compose_project")" ]; then
+        printf '%b○ Stopped%b' "$COLOR_RED" "$COLOR_RESET"
+        return
+    fi
+
+    printf '%b○ Missing%b' "$COLOR_YELLOW" "$COLOR_RESET"
+}
+
+render_status_table() {
+    local scope="${1:-all}"
+    local file=""
+    local found=0
+
+    printf '%-12s %-12s %-38s %-16s %-12s\n' "Issue" "Project" "Domain" "Container" "DB State"
+    printf '%-12s %-12s %-38s %-16s %-12s\n' "------------" "------------" "--------------------------------------" "----------------" "------------"
+
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        found=1
+        load_instance_metadata "$file"
+        printf '%-12s %-12s %-38s %-16b %-12s\n' \
+            "$(truncate_text 12 "$ISSUE_ID")" \
+            "$(truncate_text 12 "$PROJECT_SLUG")" \
+            "$(truncate_text 38 "$DOMAIN")" \
+            "$(status_label "$COMPOSE_PROJECT")" \
+            "$DB_STATE"
+    done <<EOF
+$(list_instance_files "$scope")
+EOF
+
+    if [ "$found" -eq 0 ]; then
+        printf '%s\n' "No tracked worktrees."
+    fi
+}
+
+cmd_status() {
+    if maybe_load_project_config >/dev/null 2>&1; then
+        render_status_table "project"
+        return
+    fi
+
+    render_status_table "all"
+}
+
+cmd_exec() {
+    local issue_input="${1:-}"
+    local command_string="${2:-}"
+    local meta_file=""
+
+    [ -n "$issue_input" ] || die "Usage: swctl exec <issue> '<cmd>'"
+    [ -n "$command_string" ] || die "Usage: swctl exec <issue> '<cmd>'"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+    run_app_command "$COMPOSE_PROJECT" "$command_string"
+}
+
+remove_labeled_volumes() {
+    local volumes
+    volumes="$(docker volume ls -q --filter "label=swctl.managed=true" --filter "label=swctl.project=${PROJECT_SLUG}" --filter "label=swctl.issue=${ISSUE_ID}" || true)"
+    if [ -n "$volumes" ]; then
+        # shellcheck disable=SC2086
+        docker volume rm $volumes >/dev/null || true
+        ok "Removed worktree volumes for '${ISSUE_ID}'."
+    else
+        info "No labeled worktree volumes found for '${ISSUE_ID}'."
+    fi
+}
+
+cmd_clean() {
+    local issue_input="${1:-}"
+    local meta_file=""
+
+    [ -n "$issue_input" ] || die "Usage: swctl clean <issue>"
+    maybe_load_project_config >/dev/null 2>&1 || true
+
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || {
+        warn "No tracked worktree found for issue '$issue_input'. Nothing to clean."
+        return 0
+    }
+
+    load_instance_metadata "$meta_file"
+
+    if [ -f "$COMPOSE_ENV_FILE" ] && [ -f "$COMPOSE_TEMPLATE" ]; then
+        compose -f "$COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" down --remove-orphans >/dev/null || true
+        ok "Stopped compose project '$COMPOSE_PROJECT'."
+    else
+        local container_id
+        container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
+        if [ -n "$container_id" ]; then
+            docker rm -f "$container_id" >/dev/null || true
+            ok "Removed container '$COMPOSE_PROJECT'."
+        fi
+    fi
+
+    remove_labeled_volumes
+
+    if [ "$DB_STATE" = "dedicated" ]; then
+        mysql_exec "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" >/dev/null 2>&1 || warn "Could not drop database '${DB_NAME}'."
+        ok "Dropped database '${DB_NAME}'."
+    else
+        info "Database '${DB_NAME}' is shared; leaving it in place."
+    fi
+
+    if [ -d "$WORKTREE_PATH" ] && git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" >/dev/null 2>&1 || warn "Could not remove worktree '${WORKTREE_PATH}'."
+        ok "Removed worktree '${WORKTREE_PATH}'."
+    else
+        info "Worktree path '${WORKTREE_PATH}' is already absent."
+    fi
+
+    rm -f "$meta_file"
+    ok "Cleaned issue '${ISSUE_ID}'."
+}
+
+count_registry_entries() {
+    find "$SWCTL_REGISTRY_DIR" -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' '
+}
+
+count_running_swctl_containers() {
+    (docker ps -q --filter label=swctl.managed=true 2>/dev/null || true) | wc -l | tr -d ' '
+}
+
+count_unique_dbs() {
+    local tmp_file="$SWCTL_TMP_DIR/dbs.$$"
+    : >"$tmp_file"
+
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        load_instance_metadata "$file"
+        printf '%s\n' "$DB_NAME" >>"$tmp_file"
+    done <<EOF
+$(list_instance_files "all")
+EOF
+
+    if [ ! -s "$tmp_file" ]; then
+        rm -f "$tmp_file"
+        printf '0\n'
+        return
+    fi
+
+    sort -u "$tmp_file" | wc -l | tr -d ' '
+    rm -f "$tmp_file"
+}
+
+clear_screen() {
+    printf '\033[2J\033[H'
+}
+
+hide_cursor() {
+    command -v tput >/dev/null 2>&1 && tput civis >/dev/null 2>&1 || true
+}
+
+show_cursor() {
+    command -v tput >/dev/null 2>&1 && tput cnorm >/dev/null 2>&1 || true
+}
+
+tui_cleanup() {
+    show_cursor
+    printf '%b' "$COLOR_RESET"
+}
+
+prompt_text() {
+    local prompt="$1"
+    local secret="${2:-0}"
+    local answer=""
+
+    if command -v gum >/dev/null 2>&1; then
+        if [ "$secret" = "1" ]; then
+            answer="$(gum input --password --placeholder "$prompt")"
+        else
+            answer="$(gum input --placeholder "$prompt")"
+        fi
+        printf '%s' "$answer"
+        return
+    fi
+
+    if [ "$secret" = "1" ]; then
+        read -r -s -p "$prompt: " answer
+        printf '\n' >&2
+    else
+        read -r -p "$prompt: " answer
+    fi
+    printf '%s' "$answer"
+}
+
+select_issue_prompt() {
+    local scope="${1:-all}"
+    local choices_file="$SWCTL_TMP_DIR/issues.$$"
+    local selected=""
+    local file=""
+
+    : >"$choices_file"
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        load_instance_metadata "$file"
+        printf '%s\t%s\t%s\n' "$ISSUE_ID" "$PROJECT" "$DOMAIN" >>"$choices_file"
+    done <<EOF
+$(list_instance_files "$scope")
+EOF
+
+    if [ ! -s "$choices_file" ]; then
+        rm -f "$choices_file"
+        return 1
+    fi
+
+    if command -v fzf >/dev/null 2>&1; then
+        selected="$(cut -f1 "$choices_file" | fzf --prompt='Issue> ' --height=40% --reverse || true)"
+    else
+        printf '%s\n' "Available issues:"
+        cut -f1 "$choices_file"
+        selected="$(prompt_text "Enter issue id")"
+    fi
+
+    rm -f "$choices_file"
+    [ -n "$selected" ] || return 1
+    printf '%s\n' "$selected"
+}
+
+pause_for_key() {
+    printf '\n'
+    read -r -n 1 -p "Press any key to continue..." _
+    printf '\n'
+}
+
+render_tui_header() {
+    printf '%b%s%b\n' "$COLOR_BOLD" "swctl TUI Dashboard" "$COLOR_RESET"
+    printf '%s\n' "Date: $(date '+%Y-%m-%d %H:%M:%S')"
+    printf '%s\n' "Worktrees: $(count_registry_entries)  |  Running containers: $(count_running_swctl_containers)  |  Databases: $(count_unique_dbs)"
+    printf '\n'
+}
+
+render_tui_menu() {
+    printf '%s\n' "[1] Init infra    [2] Create worktree    [3] Status"
+    printf '%s\n' "[4] Exec command  [5] Clean worktree     [6] Live dashboard"
+    printf '%s\n' "[r] Refresh       [q] Quit"
+    printf '\n'
+}
+
+tui_create_flow() {
+    local issue_input=""
+    local branch_input=""
+
+    issue_input="$(prompt_text "Issue id")"
+    [ -n "$issue_input" ] || {
+        warn "Issue id cannot be empty."
+        return
+    }
+
+    branch_input="$(prompt_text "Branch name")"
+    [ -n "$branch_input" ] || {
+        warn "Branch name cannot be empty."
+        return
+    }
+
+    cmd_create "$issue_input" "$branch_input"
+}
+
+tui_exec_flow() {
+    local scope="all"
+    local issue_input=""
+    local command_string=""
+
+    if maybe_load_project_config >/dev/null 2>&1; then
+        scope="project"
+    fi
+
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    if [ -z "$issue_input" ]; then
+        warn "No issue selected."
+        return
+    fi
+
+    command_string="$(prompt_text "Command to run inside app")"
+    [ -n "$command_string" ] || {
+        warn "Command cannot be empty."
+        return
+    }
+
+    cmd_exec "$issue_input" "$command_string"
+}
+
+tui_clean_flow() {
+    local scope="all"
+    local issue_input=""
+
+    if maybe_load_project_config >/dev/null 2>&1; then
+        scope="project"
+    fi
+
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    if [ -z "$issue_input" ]; then
+        warn "No issue selected."
+        return
+    fi
+
+    cmd_clean "$issue_input"
+}
+
+cmd_tui() {
+    local choice=""
+
+    trap 'tui_cleanup; exit 0' EXIT INT TERM
+    hide_cursor
+
+    while true; do
+        clear_screen
+        render_tui_header
+        render_status_table "all"
+        printf '\n'
+        render_tui_menu
+        printf '%bChoose an action [1-6, r, q]: %b' "$COLOR_BLUE" "$COLOR_RESET"
+        read -r -n 1 choice
+        printf '\n\n'
+
+        case "$choice" in
+            1) init_infra; pause_for_key ;;
+            2) tui_create_flow; pause_for_key ;;
+            3) cmd_status; pause_for_key ;;
+            4) tui_exec_flow; pause_for_key ;;
+            5) tui_clean_flow; pause_for_key ;;
+            6) cmd_dashboard ;;
+            r|R) ;;
+            q|Q) break ;;
+            *) warn "Unknown option: $choice"; pause_for_key ;;
+        esac
+    done
+
+    tui_cleanup
+    trap - EXIT INT TERM
+}
+
+db_size_mb() {
+    local db_name="$1"
+    mysql_exec "SELECT ROUND(IFNULL(SUM(data_length + index_length), 0) / 1024 / 1024, 1) FROM information_schema.TABLES WHERE table_schema='${db_name}';" 2>/dev/null || printf 'n/a'
+}
+
+render_dashboard_db_sizes() {
+    local file=""
+    local seen_file="$SWCTL_TMP_DIR/seen-dbs.$$"
+    : >"$seen_file"
+
+    printf '%bDatabase Sizes%b\n' "$COLOR_BOLD" "$COLOR_RESET"
+    printf '%-24s %-10s %-10s\n' "Database" "State" "Size(MB)"
+    printf '%-24s %-10s %-10s\n' "------------------------" "----------" "----------"
+
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        load_instance_metadata "$file"
+        if grep -Fxq "$DB_NAME" "$seen_file" 2>/dev/null; then
+            continue
+        fi
+        printf '%s\n' "$DB_NAME" >>"$seen_file"
+        printf '%-24s %-10s %-10s\n' "$DB_NAME" "$DB_STATE" "$(db_size_mb "$DB_NAME")"
+    done <<EOF
+$(list_instance_files "all")
+EOF
+
+    if [ ! -s "$seen_file" ]; then
+        printf '%s\n' "No tracked databases."
+    fi
+
+    rm -f "$seen_file"
+}
+
+render_dashboard_containers() {
+    local container_ids=""
+
+    container_ids="$(docker ps -q --filter label=swctl.managed=true || true)"
+    printf '%bContainer Stats%b\n' "$COLOR_BOLD" "$COLOR_RESET"
+    if [ -z "$container_ids" ]; then
+        printf '%s\n' "No running swctl-managed containers."
+        return
+    fi
+
+    # docker stats powers the live CPU/memory panel without extra dependencies.
+    # shellcheck disable=SC2086
+    docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' $container_ids
+}
+
+render_dashboard_worktrees() {
+    printf '\n%bWorktree Status%b\n' "$COLOR_BOLD" "$COLOR_RESET"
+    render_status_table "all"
+}
+
+cmd_dashboard() {
+    local running=1
+
+    trap 'running=0' INT TERM
+    while [ "$running" -eq 1 ]; do
+        clear_screen
+        printf '%b%s%b\n' "$COLOR_BOLD" "swctl Live Dashboard" "$COLOR_RESET"
+        printf '%s\n\n' "Updated: $(date '+%Y-%m-%d %H:%M:%S')"
+        render_dashboard_containers
+        printf '\n'
+        render_dashboard_db_sizes
+        render_dashboard_worktrees
+        printf '\n%s\n' "Press Ctrl+C to exit."
+
+        local tick=0
+        while [ "$tick" -lt 5 ] && [ "$running" -eq 1 ]; do
+            sleep 1
+            tick=$((tick + 1))
+        done
+    done
+
+    trap - INT TERM
+    printf '\n'
+}
+
+show_help() {
+    cat <<EOF
+swctl ${SWCTL_VERSION}
+
+Usage:
+  swctl init
+  swctl create <issue> <branch>
+  swctl status
+  swctl exec <issue> '<cmd>'
+  swctl clean <issue>
+  swctl tui
+  swctl dashboard
+  swctl --version
+  swctl help
+
+Commands:
+  init        Idempotent setup of Traefik, MariaDB, Redis, and the swctl Docker network.
+  create      Create or attach a Git worktree, provision .env.local, and start the app container.
+  status      Show tracked worktrees, routed domains, container state, and DB mode.
+  exec        Execute a command inside the worktree's app container.
+  clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
+  tui         Open the interactive ANSI dashboard.
+  dashboard   Open the live monitoring dashboard.
+
+Environment:
+  swctl auto-detects .swctl.conf in the current directory or a parent directory.
+  Set SWCTL_TEMPLATE_DIR if docker-compose.swctl.yml lives beside the installed binary.
+EOF
+}
+
+cmd_version() {
+    printf 'swctl %s\n' "$SWCTL_VERSION"
+}
+
+main() {
+    local command="${1:-help}"
+
+    case "$command" in
+        init)
+            ensure_state_dirs
+            init_infra
+            ;;
+        create)
+            ensure_state_dirs
+            shift
+            cmd_create "${1:-}" "${2:-}"
+            ;;
+        status)
+            ensure_state_dirs
+            cmd_status
+            ;;
+        exec)
+            ensure_state_dirs
+            shift
+            cmd_exec "${1:-}" "${2:-}"
+            ;;
+        clean)
+            ensure_state_dirs
+            shift
+            cmd_clean "${1:-}"
+            ;;
+        tui)
+            ensure_state_dirs
+            cmd_tui
+            ;;
+        dashboard)
+            ensure_state_dirs
+            cmd_dashboard
+            ;;
+        --version|-v)
+            cmd_version
+            ;;
+        help|-h|--help)
+            show_help
+            ;;
+        *)
+            die "Unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"
