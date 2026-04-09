@@ -642,10 +642,15 @@ write_env_file() {
         fi
     fi
 
+    # Generate a stable APP_SECRET per worktree (deterministic from project+issue)
+    local app_secret
+    app_secret="$(printf '%s-%s' "$SW_PROJECT_SLUG" "$ISSUE_ID" | openssl dgst -sha256 | sed 's/.*= //')"
+
     cat >"$env_file" <<EOF
 # Managed by swctl. Re-generated on $(timestamp_utc)
 APP_ENV=dev
 APP_URL=${APP_URL}
+APP_SECRET=${app_secret}
 DATABASE_URL=mysql://${SW_DB_ROOT_USER}:${SW_DB_ROOT_PASSWORD}@${SW_DB_HOST}:${SW_DB_PORT}/${DB_NAME}
 MAILER_DSN=${SW_MAILER_DSN}
 REDIS_URL=${SW_REDIS_URL}
@@ -656,6 +661,11 @@ SWCTL_ISSUE=${ISSUE_ID}
 EOF
 
     ok "Generated ${SW_ENV_FILE_NAME}."
+
+    # Symfony Dotenv requires .env to exist for .env.local to be loaded.
+    if [ ! -f "$WORKTREE_PATH/.env" ]; then
+        touch "$WORKTREE_PATH/.env"
+    fi
 }
 
 write_compose_env_file() {
@@ -788,6 +798,33 @@ bootstrap_dependencies() {
         info "Node dependencies are missing in the worktree volume. Running: $package_install_cmd"
         run_app_command "$compose_project" "$package_install_cmd" || warn "Frontend dependency install failed. Continue after fixing the node toolchain inside the image."
     fi
+
+    ensure_jwt_keys "$compose_project"
+}
+
+ensure_install_lock() {
+    local compose_project="$1"
+    run_app_command "$compose_project" "touch install.lock" || true
+}
+
+ensure_jwt_keys() {
+    local compose_project="$1"
+    run_app_command "$compose_project" \
+        "test -f config/jwt/private.pem || (mkdir -p config/jwt && openssl genrsa -out config/jwt/private.pem 2048 2>/dev/null && openssl rsa -in config/jwt/private.pem -outform PEM -pubout -out config/jwt/public.pem 2>/dev/null && echo 'Generated JWT keys')" \
+        || true
+}
+
+update_sales_channel_domain() {
+    local compose_project="$1"
+    local app_url="$2"
+    local db_name="${DB_NAME:-}"
+
+    [ -n "$db_name" ] || return 0
+
+    info "Updating sales channel domains to '$app_url'."
+    mysql_exec "UPDATE \`${db_name}\`.sales_channel_domain SET url = '${app_url}' WHERE url NOT LIKE '%headless%';" \
+        2>/dev/null || warn "Could not update sales channel domain via SQL."
+    run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" 2>/dev/null || true
 }
 
 run_install_command() {
@@ -798,12 +835,14 @@ run_install_command() {
     install_cmd="$SW_BIN_CONSOLE system:install $install_args"
     info "Running Shopware system install for database '$DB_NAME'."
     run_app_command "$compose_project" "$install_cmd"
+    ensure_install_lock "$compose_project"
 }
 
 refresh_shared_db() {
     local compose_project="$1"
 
     info "Reusing shared database '$DB_NAME' and refreshing runtime state."
+    ensure_install_lock "$compose_project"
     run_app_command "$compose_project" "$SW_BIN_CONSOLE dal:refresh:index" || warn "dal:refresh:index failed."
     run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
 }
@@ -846,6 +885,7 @@ provision_database_and_app() {
         wait_for_app_container "$COMPOSE_PROJECT"
         bootstrap_dependencies "$COMPOSE_PROJECT"
         run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
+        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
         return 0
     fi
 
@@ -866,6 +906,7 @@ provision_database_and_app() {
         warn "Shared database '$DB_NAME' is empty. Bootstrapping it with system:install."
         run_install_command "$COMPOSE_PROJECT" "$SW_SHARED_DB_INSTALL_ARGS"
     fi
+    update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
     release_shared_db_lock
 }
 
