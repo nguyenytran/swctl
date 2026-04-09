@@ -6,10 +6,12 @@
 
 - `swctl init` bootstraps shared local infra: `swctl-proxy`, Traefik v3, MariaDB, and Redis.
 - `swctl create <issue> <branch>` creates a Git worktree, inspects the Git diff against your base branch, chooses a DB strategy, writes `.env.local`, and starts the app container with Traefik labels.
+- `swctl batch create` provisions multiple worktrees at once from CLI pairs, a text file, or open GitLab MRs / GitHub PRs. Supports `--parallel` for concurrent creation.
+- `swctl logs`, `restart`, and `open` give quick access to container logs, restarts, and browser opening.
 - `swctl status`, `exec`, and `clean` manage worktrees safely and idempotently.
 - `swctl tui` provides a full-screen menu with live worktree/container/database stats.
 - `swctl dashboard` shows live CPU, memory, DB sizes, and worktree state every 5 seconds.
-- Works with plain Bash on macOS and Linux. `gum` and `fzf` are optional enhancements only.
+- Works with plain Bash on macOS and Linux. `gum`, `fzf`, and `jq` are optional enhancements only.
 
 ## File Layout
 
@@ -136,6 +138,64 @@ Runs a shell command inside the issue's `app` container:
 ./swctl exec 1245 'bin/console plugin:list'
 ```
 
+### `swctl batch create`
+
+Creates multiple worktrees in one command. Three input sources are supported:
+
+**CLI pairs:**
+
+```bash
+./swctl batch create 1245 feature/SW-1245 1300 bugfix/SW-1300
+```
+
+**From a file** (one `ISSUE BRANCH` per line, `#` comments allowed):
+
+```bash
+./swctl batch create --file issues.txt
+```
+
+**From GitLab or GitHub** (requires `jq`):
+
+```bash
+./swctl batch create --gitlab 12345
+./swctl batch create --github your-org/shopware
+```
+
+Set `SWCTL_GITLAB_TOKEN` / `SWCTL_GITHUB_TOKEN` in your environment or `.swctl.conf`. The command presents an interactive selection list when using API sources.
+
+**Parallel mode** creates worktrees concurrently:
+
+```bash
+./swctl batch create --parallel --jobs 4 --file issues.txt
+```
+
+Each parallel job runs in an isolated subshell. A file lock serializes shared-database bootstrapping to prevent race conditions.
+
+### `swctl logs <issue> [--follow|-f]`
+
+Shows the last 100 lines of the app container logs, or follows live output with `--follow`:
+
+```bash
+./swctl logs 1245
+./swctl logs 1245 --follow
+```
+
+### `swctl restart <issue>`
+
+Restarts the app container without tearing down or reprovisioning:
+
+```bash
+./swctl restart 1245
+```
+
+### `swctl open <issue>`
+
+Opens the worktree URL in the default browser:
+
+```bash
+./swctl open 1245
+```
+
 ### `swctl clean <issue>`
 
 Stops the compose project, removes labeled `vendor-*` and `node_modules-*` volumes, drops dedicated databases, and removes the Git worktree. Shared databases are intentionally preserved.
@@ -150,6 +210,9 @@ The TUI menu uses pure ANSI sequences and works in a normal terminal. Menu optio
 - `4` exec inside a container
 - `5` clean a worktree
 - `6` open the live dashboard
+- `7` tail container logs
+- `8` restart a container
+- `9` open worktree URL in browser
 - `r` refresh
 - `q` quit
 
@@ -265,8 +328,21 @@ The formula currently uses a `file://` URL for local testing. To publish, switch
 ```bash
 ./swctl init
 ./swctl create 1245 feature/SW-1245
+./swctl open 1245
+./swctl logs 1245 --follow
 ./swctl exec 1245 'bin/console cache:clear'
+./swctl restart 1245
 ./swctl status
 ./swctl tui
 ./swctl clean 1245
+```
+
+### Batch QA workflow
+
+```bash
+./swctl init
+./swctl batch create --parallel --file qa-issues.txt
+./swctl status
+./swctl batch create --gitlab 12345      # select MRs interactively
+./swctl batch create --github org/repo   # select PRs interactively
 ```

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SWCTL_VERSION="0.1.0"
+SWCTL_VERSION="0.2.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SWCTL_TEMPLATE_DIR="${SWCTL_TEMPLATE_DIR:-$SCRIPT_DIR}"
@@ -745,6 +745,8 @@ provision_database_and_app() {
 
     DB_STATE="shared"
     DB_NAME="$(sanitize_db_identifier "$SW_DB_SHARED_NAME")"
+
+    acquire_shared_db_lock
     ensure_database_exists "$DB_NAME"
     write_env_file
     write_compose_env_file
@@ -758,6 +760,7 @@ provision_database_and_app() {
         warn "Shared database '$DB_NAME' is empty. Bootstrapping it with system:install."
         run_install_command "$COMPOSE_PROJECT" "$SW_SHARED_DB_INSTALL_ARGS"
     fi
+    release_shared_db_lock
 }
 
 cmd_create() {
@@ -802,6 +805,269 @@ cmd_create() {
     ok "Worktree '${WORKTREE_ID}' is ready."
     info "URL: ${APP_URL}"
     info "Worktree: ${WORKTREE_PATH}"
+}
+
+# ---------------------------------------------------------------------------
+# Batch create
+# ---------------------------------------------------------------------------
+
+parse_batch_file() {
+    local file="$1"
+    [ -f "$file" ] || die "Batch file not found: $file"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -n "$line" ] || continue
+        printf '%s\n' "$line"
+    done < "$file"
+}
+
+parse_cli_pairs() {
+    while [ $# -ge 2 ]; do
+        printf '%s %s\n' "$1" "$2"
+        shift 2
+    done
+}
+
+parse_mr_json() {
+    if ! command -v jq >/dev/null 2>&1; then
+        die "jq is required for API-based batch create. Install it with: brew install jq"
+    fi
+    jq -r '.[] | "\(.iid) \(.source_branch)"'
+}
+
+parse_pr_json() {
+    if ! command -v jq >/dev/null 2>&1; then
+        die "jq is required for API-based batch create. Install it with: brew install jq"
+    fi
+    jq -r '.[] | "\(.number) \(.head.ref)"'
+}
+
+fetch_gitlab_mrs() {
+    local project_id="$1"
+    local api_url="${SWCTL_GITLAB_URL:-https://gitlab.com}/api/v4"
+    local token="${SWCTL_GITLAB_TOKEN:-}"
+
+    [ -n "$token" ] || die "SWCTL_GITLAB_TOKEN is not set."
+
+    curl -sSf -H "PRIVATE-TOKEN: $token" \
+        "${api_url}/projects/${project_id}/merge_requests?state=opened&per_page=100" \
+        | parse_mr_json
+}
+
+fetch_github_prs() {
+    local repo="$1"
+    local token="${SWCTL_GITHUB_TOKEN:-}"
+    local auth_header=""
+
+    if [ -n "$token" ]; then
+        auth_header="Authorization: token $token"
+    fi
+
+    curl -sSf ${auth_header:+-H "$auth_header"} \
+        "https://api.github.com/repos/${repo}/pulls?state=open&per_page=100" \
+        | parse_pr_json
+}
+
+select_from_list() {
+    local label="$1"
+    local pairs=()
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        pairs+=("$line")
+    done
+
+    if [ ${#pairs[@]} -eq 0 ]; then
+        warn "No open ${label}s found."
+        return 1
+    fi
+
+    if command -v fzf >/dev/null 2>&1; then
+        printf '%s\n' "${pairs[@]}" | fzf --multi --prompt="Select ${label}s> " --height=40% --reverse
+        return
+    fi
+
+    local i=1
+    for pair in "${pairs[@]}"; do
+        printf '  [%d] %s\n' "$i" "$pair"
+        i=$((i + 1))
+    done
+    local selection
+    selection="$(prompt_text "Enter numbers (comma-separated, or 'all')")"
+    if [ "$selection" = "all" ]; then
+        printf '%s\n' "${pairs[@]}"
+        return
+    fi
+    local old_ifs="$IFS"
+    IFS=',' read -r -a indices <<< "$selection"
+    IFS="$old_ifs"
+    local idx
+    for idx in "${indices[@]}"; do
+        idx="$(printf '%s' "$idx" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        if [ "$idx" -ge 1 ] 2>/dev/null && [ "$idx" -le "${#pairs[@]}" ]; then
+            printf '%s\n' "${pairs[$((idx - 1))]}"
+        fi
+    done
+}
+
+acquire_shared_db_lock() {
+    local lockfile="$SWCTL_TMP_DIR/shared-db.lock"
+    local attempt=0
+    while ! ( set -o noclobber; printf '%s' $$ > "$lockfile" ) 2>/dev/null; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 120 ]; then
+            die "Timed out waiting for shared-db lock."
+        fi
+        sleep 1
+    done
+}
+
+release_shared_db_lock() {
+    rm -f "$SWCTL_TMP_DIR/shared-db.lock"
+}
+
+batch_create_sequential() {
+    local pairs="$1"
+    local job_dir="$2"
+    local issue="" branch=""
+
+    while IFS=' ' read -r issue branch; do
+        [ -n "$issue" ] && [ -n "$branch" ] || continue
+        info "Creating worktree for $issue ($branch)..."
+        if cmd_create "$issue" "$branch" >"$job_dir/${issue}.log" 2>&1; then
+            touch "$job_dir/${issue}.ok"
+            ok "Created $issue"
+        else
+            touch "$job_dir/${issue}.fail"
+            err "Failed $issue"
+        fi
+    done <<< "$pairs"
+}
+
+batch_create_parallel() {
+    local pairs="$1"
+    local job_dir="$2"
+    local max_jobs="${3:-4}"
+    local pids=()
+    local running=0
+    local issue="" branch=""
+
+    while IFS=' ' read -r issue branch; do
+        [ -n "$issue" ] && [ -n "$branch" ] || continue
+
+        while [ "$running" -ge "$max_jobs" ]; do
+            wait -n 2>/dev/null || true
+            running=$((running - 1))
+        done
+
+        (
+            cmd_create "$issue" "$branch" >"$job_dir/${issue}.log" 2>&1 \
+                && touch "$job_dir/${issue}.ok" \
+                || touch "$job_dir/${issue}.fail"
+        ) &
+
+        pids+=($!)
+        running=$((running + 1))
+        info "Started background job for $issue (PID $!)"
+    done <<< "$pairs"
+
+    local pid
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
+cmd_batch_create() {
+    local pairs=""
+    local parallel=0
+    local max_jobs=4
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --file|-f)
+                shift
+                [ -n "${1:-}" ] || die "Missing argument for --file."
+                pairs="$(parse_batch_file "$1")"
+                shift
+                ;;
+            --gitlab)
+                shift
+                [ -n "${1:-}" ] || die "Missing argument for --gitlab."
+                pairs="$(fetch_gitlab_mrs "$1" | select_from_list "MR")"
+                shift
+                ;;
+            --github)
+                shift
+                [ -n "${1:-}" ] || die "Missing argument for --github."
+                pairs="$(fetch_github_prs "$1" | select_from_list "PR")"
+                shift
+                ;;
+            --parallel|-p)
+                parallel=1
+                shift
+                ;;
+            --jobs|-j)
+                shift
+                [ -n "${1:-}" ] || die "Missing argument for --jobs."
+                max_jobs="$1"
+                shift
+                ;;
+            -*)
+                die "Unknown flag: $1"
+                ;;
+            *)
+                pairs="$(parse_cli_pairs "$@")"
+                break
+                ;;
+        esac
+    done
+
+    [ -n "$pairs" ] || die "No issue/branch pairs provided.\nUsage: swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]"
+
+    local total=0
+    local succeeded=0
+    local failed=0
+    local job_dir="$SWCTL_TMP_DIR/batch.$$"
+    mkdir -p "$job_dir"
+    trap 'rm -rf "$job_dir"' EXIT
+
+    total="$(printf '%s\n' "$pairs" | grep -c '.' || true)"
+    info "Batch creating $total worktree(s)$([ "$parallel" -eq 1 ] && printf ' in parallel (max %s jobs)' "$max_jobs")."
+
+    if [ "$parallel" -eq 1 ]; then
+        batch_create_parallel "$pairs" "$job_dir" "$max_jobs"
+    else
+        batch_create_sequential "$pairs" "$job_dir"
+    fi
+
+    succeeded="$(find "$job_dir" -name '*.ok' 2>/dev/null | wc -l | tr -d ' ')"
+    failed="$(find "$job_dir" -name '*.fail' 2>/dev/null | wc -l | tr -d ' ')"
+
+    printf '\n'
+    ok "Batch complete: $succeeded succeeded, $failed failed out of $total."
+
+    local fail_file issue_id
+    for fail_file in "$job_dir"/*.fail; do
+        [ -f "$fail_file" ] || continue
+        issue_id="$(basename "$fail_file" .fail)"
+        err "Failed: $issue_id"
+        cat "$job_dir/${issue_id}.log" >&2
+    done
+
+    rm -rf "$job_dir"
+    trap - EXIT
+    [ "$failed" -eq 0 ]
+}
+
+cmd_batch() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        create) cmd_batch_create "$@" ;;
+        *)      die "Usage: swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]" ;;
+    esac
 }
 
 truncate_text() {
@@ -881,6 +1147,70 @@ cmd_exec() {
     meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
     load_instance_metadata "$meta_file"
     run_app_command "$COMPOSE_PROJECT" "$command_string"
+}
+
+cmd_logs() {
+    local issue_input="${1:-}"
+    local follow="${2:-}"
+    local meta_file=""
+
+    [ -n "$issue_input" ] || die "Usage: swctl logs <issue> [--follow|-f]"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    local container_id
+    container_id="$(app_container_id "$COMPOSE_PROJECT")"
+    [ -n "$container_id" ] || die "No running container for '$COMPOSE_PROJECT'."
+
+    if [ "$follow" = "--follow" ] || [ "$follow" = "-f" ]; then
+        docker logs -f "$container_id"
+    else
+        docker logs --tail 100 "$container_id"
+    fi
+}
+
+cmd_restart() {
+    local issue_input="${1:-}"
+    local meta_file=""
+
+    [ -n "$issue_input" ] || die "Usage: swctl restart <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    if [ -f "$COMPOSE_ENV_FILE" ] && [ -f "$COMPOSE_TEMPLATE" ]; then
+        compose -f "$COMPOSE_TEMPLATE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" restart
+    else
+        local container_id
+        container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
+        [ -n "$container_id" ] || die "No container found for '$COMPOSE_PROJECT'."
+        docker restart "$container_id"
+    fi
+    ok "Restarted '$ISSUE_ID'."
+}
+
+cmd_open() {
+    local issue_input="${1:-}"
+    local meta_file=""
+
+    [ -n "$issue_input" ] || die "Usage: swctl open <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    local url="${APP_URL:-http://$DOMAIN}"
+    info "Opening $url"
+    if command -v open >/dev/null 2>&1; then
+        open "$url"
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url"
+    else
+        warn "No browser opener found. Visit: $url"
+    fi
 }
 
 remove_labeled_volumes() {
@@ -1061,6 +1391,7 @@ render_tui_header() {
 render_tui_menu() {
     printf '%s\n' "[1] Init infra    [2] Create worktree    [3] Status"
     printf '%s\n' "[4] Exec command  [5] Clean worktree     [6] Live dashboard"
+    printf '%s\n' "[7] Logs          [8] Restart            [9] Open in browser"
     printf '%s\n' "[r] Refresh       [q] Quit"
     printf '\n'
 }
@@ -1125,6 +1456,57 @@ tui_clean_flow() {
     cmd_clean "$issue_input"
 }
 
+tui_logs_flow() {
+    local scope="all"
+    local issue_input=""
+
+    if maybe_load_project_config >/dev/null 2>&1; then
+        scope="project"
+    fi
+
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    if [ -z "$issue_input" ]; then
+        warn "No issue selected."
+        return
+    fi
+
+    cmd_logs "$issue_input" "--follow"
+}
+
+tui_restart_flow() {
+    local scope="all"
+    local issue_input=""
+
+    if maybe_load_project_config >/dev/null 2>&1; then
+        scope="project"
+    fi
+
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    if [ -z "$issue_input" ]; then
+        warn "No issue selected."
+        return
+    fi
+
+    cmd_restart "$issue_input"
+}
+
+tui_open_flow() {
+    local scope="all"
+    local issue_input=""
+
+    if maybe_load_project_config >/dev/null 2>&1; then
+        scope="project"
+    fi
+
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    if [ -z "$issue_input" ]; then
+        warn "No issue selected."
+        return
+    fi
+
+    cmd_open "$issue_input"
+}
+
 cmd_tui() {
     local choice=""
 
@@ -1137,7 +1519,7 @@ cmd_tui() {
         render_status_table "all"
         printf '\n'
         render_tui_menu
-        printf '%bChoose an action [1-6, r, q]: %b' "$COLOR_BLUE" "$COLOR_RESET"
+        printf '%bChoose an action [1-9, r, q]: %b' "$COLOR_BLUE" "$COLOR_RESET"
         read -r -n 1 choice
         printf '\n\n'
 
@@ -1148,6 +1530,9 @@ cmd_tui() {
             4) tui_exec_flow; pause_for_key ;;
             5) tui_clean_flow; pause_for_key ;;
             6) cmd_dashboard ;;
+            7) tui_logs_flow; pause_for_key ;;
+            8) tui_restart_flow; pause_for_key ;;
+            9) tui_open_flow; pause_for_key ;;
             r|R) ;;
             q|Q) break ;;
             *) warn "Unknown option: $choice"; pause_for_key ;;
@@ -1243,8 +1628,12 @@ swctl ${SWCTL_VERSION}
 Usage:
   swctl init
   swctl create <issue> <branch>
+  swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]
   swctl status
   swctl exec <issue> '<cmd>'
+  swctl logs <issue> [--follow|-f]
+  swctl restart <issue>
+  swctl open <issue>
   swctl clean <issue>
   swctl tui
   swctl dashboard
@@ -1254,8 +1643,12 @@ Usage:
 Commands:
   init        Idempotent setup of Traefik, MariaDB, Redis, and the swctl Docker network.
   create      Create or attach a Git worktree, provision .env.local, and start the app container.
+  batch       Batch create worktrees from CLI pairs, a file, or GitLab/GitHub MRs.
   status      Show tracked worktrees, routed domains, container state, and DB mode.
   exec        Execute a command inside the worktree's app container.
+  logs        Show or follow container logs for a worktree.
+  restart     Restart the app container for a worktree without full recreate.
+  open        Open the worktree URL in the default browser.
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
   tui         Open the interactive ANSI dashboard.
   dashboard   Open the live monitoring dashboard.
@@ -1283,6 +1676,11 @@ main() {
             shift
             cmd_create "${1:-}" "${2:-}"
             ;;
+        batch)
+            ensure_state_dirs
+            shift
+            cmd_batch "$@"
+            ;;
         status)
             ensure_state_dirs
             cmd_status
@@ -1296,6 +1694,21 @@ main() {
             ensure_state_dirs
             shift
             cmd_clean "${1:-}"
+            ;;
+        logs)
+            ensure_state_dirs
+            shift
+            cmd_logs "${1:-}" "${2:-}"
+            ;;
+        restart)
+            ensure_state_dirs
+            shift
+            cmd_restart "${1:-}"
+            ;;
+        open)
+            ensure_state_dirs
+            shift
+            cmd_open "${1:-}"
             ;;
         tui)
             ensure_state_dirs
@@ -1317,4 +1730,6 @@ main() {
     esac
 }
 
-main "$@"
+if [ "${SWCTL_SOURCED:-0}" != "1" ]; then
+    main "$@"
+fi

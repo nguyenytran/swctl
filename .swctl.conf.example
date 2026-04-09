@@ -41,3 +41,8 @@ SW_SHARED_DB_INSTALL_ARGS="--basic-setup --force --no-interaction"
 # Optional UID/GID pinning for Linux bind mounts.
 # SW_UID="1000"
 # SW_GID="1000"
+
+# API tokens for batch create from MRs/PRs (optional, requires jq).
+# SWCTL_GITLAB_TOKEN=""
+# SWCTL_GITLAB_URL="https://gitlab.com"
+# SWCTL_GITHUB_TOKEN=""
