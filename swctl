@@ -791,6 +791,7 @@ SW_REDIS_URL=${SW_REDIS_URL}
 SW_MAILER_DSN=${SW_MAILER_DSN}
 SW_OPENSEARCH_URL=${SW_OPENSEARCH_URL:-}
 SW_TRUNK_NETWORK=${SW_TRUNK_NETWORK:-trunk_default}
+SW_PROJECT_ROOT=${PROJECT_ROOT}
 SW_VENDOR_VOLUME=${VENDOR_VOLUME}
 SW_NODE_MODULES_VOLUME=${NODE_MODULES_VOLUME}
 SW_UID=${SW_UID}
@@ -1053,13 +1054,13 @@ run_frontend_build_if_needed() {
     fi
 
     if [ "${ADMIN_CHANGES:-0}" -gt 0 ]; then
-        info "Admin changes detected. Running assets:install."
-        run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" || warn "assets:install failed."
+        info "Admin changes detected. Running composer build:js:admin."
+        run_app_command "$compose_project" "composer build:js:admin" || warn "Admin JS build failed."
     fi
 
     if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
-        info "Storefront changes detected. Running theme:compile."
-        run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:compile --active-only" || warn "theme:compile failed."
+        info "Storefront changes detected. Running composer build:js:storefront."
+        run_app_command "$compose_project" "composer build:js:storefront" || warn "Storefront JS build failed."
     fi
 
     if [ "$needs_bundle_dump" -eq 0 ]; then
@@ -1073,7 +1074,12 @@ run_frontend_build_if_needed() {
             run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:change --all Storefront --no-compile" 2>/dev/null || true
             run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:compile --active-only" || warn "theme:compile failed."
         else
-            info "Theme/admin assets already present (synced from project root). Skipping builds."
+            # Run bundle:dump + assets:install to register synced assets properly.
+            # Admin needs composer build:js:admin on first run to align Vite plugin versions.
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" 2>/dev/null || true
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" 2>/dev/null || true
+            run_app_command "$compose_project" "composer build:js:admin" 2>/dev/null || warn "Admin JS build failed. Run 'swctl exec <issue> composer build:js:admin' manually."
+            info "Assets installed. Skipping storefront rebuild (synced from project root)."
         fi
     fi
 

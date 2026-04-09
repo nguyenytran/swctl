@@ -22,6 +22,8 @@ services:
       - trunk
     volumes:
       - ${SW_WORKTREE_PATH}:/var/www/html:cached
+      - ${SW_PROJECT_ROOT}/public/media:/var/www/html/public/media:ro
+      - ${SW_PROJECT_ROOT}/public/thumbnail:/var/www/html/public/thumbnail:ro
     labels:
       - "swctl.managed=true"
       - "swctl.project=${SW_PROJECT_SLUG}"
