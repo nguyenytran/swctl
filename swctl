@@ -993,31 +993,44 @@ ensure_jwt_keys() {
 update_sales_channel_domain() {
     local compose_project="$1"
     local app_url="$2"
-    local db_name="${DB_NAME:-}"
 
-    [ -n "$db_name" ] || return 0
-
-    if [ "$DB_STATE" = "dedicated" ]; then
-        # Dedicated DB: safe to replace all domains
-        info "Updating sales channel domains to '$app_url'."
-        mysql_exec "UPDATE \`${db_name}\`.sales_channel_domain SET url = '${app_url}' WHERE url NOT LIKE '%headless%';" \
-            2>/dev/null || warn "Could not update sales channel domain via SQL."
-    else
-        # Shared/trunk DB: add worktree domain to the default storefront sales channel
-        # without modifying existing domains (to not break trunk).
-        info "Adding worktree domain '$app_url' to Storefront sales channel."
-        run_app_command "$compose_project" \
-            "$SW_BIN_CONSOLE sales-channel:add:domain '$app_url'" \
-            2>/dev/null || {
-            # Fallback: use SQL to insert if command doesn't exist
-            local sc_id
-            sc_id="$(mysql_exec "SELECT LOWER(HEX(sales_channel_id)) FROM \`${db_name}\`.sales_channel_domain WHERE url NOT LIKE '%headless%' LIMIT 1;" 2>/dev/null || true)"
-            if [ -n "$sc_id" ]; then
-                mysql_exec "INSERT IGNORE INTO \`${db_name}\`.sales_channel_domain (id, url, sales_channel_id, language_id, currency_id, snippet_set_id, created_at) SELECT UNHEX(REPLACE(UUID(),'-','')), '${app_url}', sales_channel_id, language_id, currency_id, snippet_set_id, NOW() FROM \`${db_name}\`.sales_channel_domain WHERE LOWER(HEX(sales_channel_id)) = '${sc_id}' AND url NOT LIKE '%headless%' LIMIT 1;" 2>/dev/null || warn "Could not add worktree domain."
-            fi
-        }
-    fi
-    run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" 2>/dev/null || true
+    # Each worktree has its own cloned DB — safe to update all non-headless domains.
+    # Write a tiny PHP helper, execute it inside the container (uses DATABASE_URL
+    # from .env.local), then remove it. This safely updates only the cloned DB.
+    info "Updating sales channel domains to '$app_url'."
+    cat > "$WORKTREE_PATH/.swctl-update-domain.php" <<'PHPEOF'
+<?php
+// Replace the base domain in all non-headless sales channel domains.
+// E.g. http://web.trunk.orb.local/de-de → http://web.sw-123.orb.local/de-de
+$newBase = $argv[1] ?? '';
+$url = getenv('DATABASE_URL') ?: '';
+if (!$url) {
+    $env = file_get_contents(__DIR__ . '/.env.local');
+    preg_match('/DATABASE_URL=(.+)/', $env, $m);
+    $url = trim($m[1] ?? '');
+}
+$p = parse_url($url);
+$pdo = new PDO(
+    sprintf('mysql:host=%s;port=%s;dbname=%s', $p['host'], $p['port'] ?? 3306, ltrim($p['path'] ?? '', '/')),
+    $p['user'] ?? 'root', $p['pass'] ?? ''
+);
+$rows = $pdo->query("SELECT HEX(id) as id, url FROM sales_channel_domain WHERE url NOT LIKE '%headless%'")->fetchAll(PDO::FETCH_ASSOC);
+$count = 0;
+foreach ($rows as $row) {
+    $oldUrl = $row['url'];
+    $oldParts = parse_url($oldUrl);
+    $oldBase = ($oldParts['scheme'] ?? 'http') . '://' . ($oldParts['host'] ?? '') . (isset($oldParts['port']) ? ':' . $oldParts['port'] : '');
+    $newUrl = str_replace($oldBase, $newBase, $oldUrl);
+    if ($newUrl !== $oldUrl) {
+        $pdo->prepare("UPDATE sales_channel_domain SET url = ? WHERE id = UNHEX(?)")->execute([$newUrl, $row['id']]);
+        $count++;
+    }
+}
+echo "Updated $count domain(s)\n";
+PHPEOF
+    run_app_command "$compose_project" "php .swctl-update-domain.php '$app_url'" \
+        || warn "Could not update sales channel domain."
+    rm -f "$WORKTREE_PATH/.swctl-update-domain.php"
 }
 
 run_install_command() {
@@ -1099,29 +1112,40 @@ ensure_database_exists() {
     mysql_exec "CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 }
 
+clone_database() {
+    local source_db="$1"
+    local target_db="$2"
+    local db_container
+    db_container="$(resolve_db_container)"
+
+    info "Cloning database '$source_db' → '$target_db'."
+    docker exec -i "$db_container" bash -c \
+        "mariadb -u '$SW_DB_ROOT_USER' -p'$SW_DB_ROOT_PASSWORD' -e 'DROP DATABASE IF EXISTS \`$target_db\`; CREATE DATABASE \`$target_db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;' && mariadb-dump -u '$SW_DB_ROOT_USER' -p'$SW_DB_ROOT_PASSWORD' --single-transaction --quick '$source_db' | mariadb -u '$SW_DB_ROOT_USER' -p'$SW_DB_ROOT_PASSWORD' '$target_db'" \
+        || die "Database clone failed."
+    ok "Database cloned: $target_db"
+}
+
 provision_database_and_app() {
     local compose_project="$1"
+    local source_db
+    source_db="$(sanitize_db_identifier "$SW_DB_SHARED_NAME")"
 
-    # Diff analysis drives a simple DB decision matrix:
-    # schema-touching changes get an isolated DB + full install, otherwise we reuse
-    # the shared DB and only refresh indexes/cache to keep create fast.
-    if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
+    # Every worktree gets its own cloned database.
+    # Migration/entity changes: clone + run migrations.
+    # No schema changes: clone only (already has all data).
+    DB_NAME="$(sanitize_db_identifier "${SW_DB_NAME_PREFIX}_${ISSUE_ID}")"
+
+    if mysql_db_has_tables "$DB_NAME"; then
+        DB_STATE="cloned"
+        info "Database '$DB_NAME' already exists. Reusing."
+    elif mysql_db_has_tables "$source_db"; then
+        DB_STATE="cloned"
+        clone_database "$source_db" "$DB_NAME"
+    else
         DB_STATE="dedicated"
-        DB_NAME="$(sanitize_db_identifier "${SW_DB_NAME_PREFIX}_${ISSUE_ID}")"
+        info "Source database '$source_db' is empty. Running fresh install."
         create_database "$DB_NAME"
-        write_env_file
-        write_compose_env_file
-        write_compose_volume_override
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
-        wait_for_app_container "$COMPOSE_PROJECT"
-        bootstrap_dependencies "$COMPOSE_PROJECT"
-        run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
-        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-        return 0
     fi
-
-    DB_STATE="shared"
-    DB_NAME="$(sanitize_db_identifier "$SW_DB_SHARED_NAME")"
 
     write_env_file
     write_compose_env_file
@@ -1130,19 +1154,17 @@ provision_database_and_app() {
     wait_for_app_container "$COMPOSE_PROJECT"
     bootstrap_dependencies "$COMPOSE_PROJECT"
 
-    if mysql_db_has_tables "$DB_NAME"; then
-        # Existing DB: just refresh runtime state
-        ensure_install_lock "$COMPOSE_PROJECT"
-        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
-    else
-        # Empty DB: full install needed
-        acquire_shared_db_lock
-        ensure_database_exists "$DB_NAME"
-        run_install_command "$COMPOSE_PROJECT" "$SW_SHARED_DB_INSTALL_ARGS"
-        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-        release_shared_db_lock
+    if [ "$DB_STATE" = "dedicated" ]; then
+        run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
+    elif [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
+        info "Schema changes detected. Running migrations on cloned database."
+        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE database:migrate --all" || warn "Migrations failed."
     fi
+
+    # Safe to update domain — this is the worktree's own database
+    update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
+    ensure_install_lock "$COMPOSE_PROJECT"
+    run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
 }
 
 cmd_create() {
@@ -1662,11 +1684,14 @@ cmd_clean() {
 
     remove_labeled_volumes
 
-    if [ "$DB_STATE" = "dedicated" ]; then
+    # Every worktree gets its own cloned DB — always safe to drop.
+    local source_db
+    source_db="$(sanitize_db_identifier "${SW_DB_SHARED_NAME:-shopware}")"
+    if [ "$DB_NAME" != "$source_db" ]; then
         mysql_exec "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" >/dev/null 2>&1 || warn "Could not drop database '${DB_NAME}'."
         ok "Dropped database '${DB_NAME}'."
     else
-        info "Database '${DB_NAME}' is shared; leaving it in place."
+        info "Database '${DB_NAME}' is the source database; leaving it in place."
     fi
 
     if [ -d "$WORKTREE_PATH" ] && git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
