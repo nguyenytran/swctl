@@ -1,0 +1,5 @@
+dist/
+.idea/
+*.tar.gz
+.swctl.conf
+.DS_Store
