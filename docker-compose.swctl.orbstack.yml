@@ -8,6 +8,8 @@ services:
       DATABASE_URL: mysql://${SW_DB_ROOT_USER}:${SW_DB_ROOT_PASSWORD}@${SW_DB_HOST}:${SW_DB_PORT}/${SW_DB_NAME}
       REDIS_URL: ${SW_REDIS_URL}
       MAILER_DSN: ${SW_MAILER_DSN}
+      OPENSEARCH_URL: ${SW_OPENSEARCH_URL:-}
+      ADMIN_OPENSEARCH_URL: ${SW_OPENSEARCH_URL:-}
       COMPOSER_ROOT_VERSION: ${SW_COMPOSER_ROOT_VERSION}
       HOST: "0.0.0.0"
       WORKTREE_ID: ${SW_WORKTREE_ID}
@@ -15,6 +17,9 @@ services:
       SWCTL_ISSUE: ${SW_ISSUE}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - trunk
     volumes:
       - ${SW_WORKTREE_PATH}:/var/www/html:cached
     labels:
@@ -22,3 +27,8 @@ services:
       - "swctl.project=${SW_PROJECT_SLUG}"
       - "swctl.issue=${SW_ISSUE}"
       - "dev.orbstack.domains=${SW_APP_DOMAIN}"
+
+networks:
+  trunk:
+    external: true
+    name: ${SW_TRUNK_NETWORK:-trunk_default}

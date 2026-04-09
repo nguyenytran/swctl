@@ -260,6 +260,8 @@ load_project_config() {
     SW_DB_SHARED_NAME="${SW_DB_SHARED_NAME:-${SW_PROJECT_SLUG}_shared}"
     SW_REDIS_URL="${SW_REDIS_URL:-redis://host.docker.internal:6379}"
     SW_MAILER_DSN="${SW_MAILER_DSN:-null://localhost}"
+    SW_OPENSEARCH_URL="${SW_OPENSEARCH_URL:-}"
+    SW_TRUNK_NETWORK="${SW_TRUNK_NETWORK:-trunk_default}"
     SW_BIN_CONSOLE="${SW_BIN_CONSOLE:-bin/console}"
     SW_APP_HTTP_PORT="${SW_APP_HTTP_PORT:-8000}"
     SW_TRAEFIK_NETWORK="${SW_TRAEFIK_NETWORK:-swctl-proxy}"
@@ -439,9 +441,27 @@ start_or_create_container() {
     fi
 }
 
+resolve_db_container() {
+    # In OrbStack/trunk mode, find the DB container on the trunk network.
+    if [ -n "${SW_TRUNK_NETWORK:-}" ] && [ "$(detect_runtime)" = "orbstack" ]; then
+        local trunk_db
+        trunk_db="$(docker ps --filter "network=${SW_TRUNK_NETWORK}" --filter "ancestor=mariadb" --format '{{.Names}}' 2>/dev/null | head -1)"
+        if [ -z "$trunk_db" ]; then
+            trunk_db="$(docker ps --filter "network=${SW_TRUNK_NETWORK}" --format '{{.Names}}' 2>/dev/null | grep -i database | head -1)"
+        fi
+        if [ -n "$trunk_db" ]; then
+            printf '%s' "$trunk_db"
+            return
+        fi
+    fi
+    printf '%s' "${SW_INFRA_DB_CONTAINER:-swctl-mariadb}"
+}
+
 mysql_exec() {
     local sql="$1"
-    docker exec -i "$SW_INFRA_DB_CONTAINER" mariadb \
+    local db_container
+    db_container="$(resolve_db_container)"
+    docker exec -i "$db_container" mariadb \
         -u "$SW_DB_ROOT_USER" \
         "-p$SW_DB_ROOT_PASSWORD" \
         -Nse "$sql"
@@ -548,10 +568,12 @@ ensure_infra_ready() {
             init_infra
         fi
     else
-        if ! container_running "${SW_INFRA_DB_CONTAINER:-swctl-mariadb}" || \
-            ! container_running "${SW_INFRA_REDIS_CONTAINER:-swctl-redis}"; then
-            warn "Shared infrastructure is missing or stopped. Running 'swctl init'."
-            init_infra
+        # OrbStack mode: worktrees connect to trunk's network.
+        # Just verify the trunk network exists.
+        if [ -n "${SW_TRUNK_NETWORK:-}" ] && docker network inspect "$SW_TRUNK_NETWORK" >/dev/null 2>&1; then
+            ok "Trunk network '$SW_TRUNK_NETWORK' is available."
+        else
+            warn "Trunk network '${SW_TRUNK_NETWORK:-trunk_default}' not found. Start your trunk project first: cd $PROJECT_ROOT && docker compose up -d"
         fi
     fi
 }
@@ -729,6 +751,8 @@ APP_SECRET=${app_secret}
 DATABASE_URL=mysql://${SW_DB_ROOT_USER}:${SW_DB_ROOT_PASSWORD}@${SW_DB_HOST}:${SW_DB_PORT}/${DB_NAME}
 MAILER_DSN=${SW_MAILER_DSN}
 REDIS_URL=${SW_REDIS_URL}
+OPENSEARCH_URL=${SW_OPENSEARCH_URL:-}
+ADMIN_OPENSEARCH_URL=${SW_OPENSEARCH_URL:-}
 WORKTREE_ID=${WORKTREE_ID}
 COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT}
 SWCTL_PROJECT=${SW_PROJECT}
@@ -765,6 +789,8 @@ SW_DB_ROOT_USER=${SW_DB_ROOT_USER}
 SW_DB_ROOT_PASSWORD=${SW_DB_ROOT_PASSWORD}
 SW_REDIS_URL=${SW_REDIS_URL}
 SW_MAILER_DSN=${SW_MAILER_DSN}
+SW_OPENSEARCH_URL=${SW_OPENSEARCH_URL:-}
+SW_TRUNK_NETWORK=${SW_TRUNK_NETWORK:-trunk_default}
 SW_VENDOR_VOLUME=${VENDOR_VOLUME}
 SW_NODE_MODULES_VOLUME=${NODE_MODULES_VOLUME}
 SW_UID=${SW_UID}
@@ -970,9 +996,26 @@ update_sales_channel_domain() {
 
     [ -n "$db_name" ] || return 0
 
-    info "Updating sales channel domains to '$app_url'."
-    mysql_exec "UPDATE \`${db_name}\`.sales_channel_domain SET url = '${app_url}' WHERE url NOT LIKE '%headless%';" \
-        2>/dev/null || warn "Could not update sales channel domain via SQL."
+    if [ "$DB_STATE" = "dedicated" ]; then
+        # Dedicated DB: safe to replace all domains
+        info "Updating sales channel domains to '$app_url'."
+        mysql_exec "UPDATE \`${db_name}\`.sales_channel_domain SET url = '${app_url}' WHERE url NOT LIKE '%headless%';" \
+            2>/dev/null || warn "Could not update sales channel domain via SQL."
+    else
+        # Shared/trunk DB: add worktree domain to the default storefront sales channel
+        # without modifying existing domains (to not break trunk).
+        info "Adding worktree domain '$app_url' to Storefront sales channel."
+        run_app_command "$compose_project" \
+            "$SW_BIN_CONSOLE sales-channel:add:domain '$app_url'" \
+            2>/dev/null || {
+            # Fallback: use SQL to insert if command doesn't exist
+            local sc_id
+            sc_id="$(mysql_exec "SELECT LOWER(HEX(sales_channel_id)) FROM \`${db_name}\`.sales_channel_domain WHERE url NOT LIKE '%headless%' LIMIT 1;" 2>/dev/null || true)"
+            if [ -n "$sc_id" ]; then
+                mysql_exec "INSERT IGNORE INTO \`${db_name}\`.sales_channel_domain (id, url, sales_channel_id, language_id, currency_id, snippet_set_id, created_at) SELECT UNHEX(REPLACE(UUID(),'-','')), '${app_url}', sales_channel_id, language_id, currency_id, snippet_set_id, NOW() FROM \`${db_name}\`.sales_channel_domain WHERE LOWER(HEX(sales_channel_id)) = '${sc_id}' AND url NOT LIKE '%headless%' LIMIT 1;" 2>/dev/null || warn "Could not add worktree domain."
+            fi
+        }
+    fi
     run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" 2>/dev/null || true
 }
 
@@ -1074,8 +1117,6 @@ provision_database_and_app() {
     DB_STATE="shared"
     DB_NAME="$(sanitize_db_identifier "$SW_DB_SHARED_NAME")"
 
-    acquire_shared_db_lock
-    ensure_database_exists "$DB_NAME"
     write_env_file
     write_compose_env_file
     write_compose_volume_override
@@ -1084,13 +1125,18 @@ provision_database_and_app() {
     bootstrap_dependencies "$COMPOSE_PROJECT"
 
     if mysql_db_has_tables "$DB_NAME"; then
-        refresh_shared_db "$COMPOSE_PROJECT"
+        # Existing DB: just refresh runtime state
+        ensure_install_lock "$COMPOSE_PROJECT"
+        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
+        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
     else
-        warn "Shared database '$DB_NAME' is empty. Bootstrapping it with system:install."
+        # Empty DB: full install needed
+        acquire_shared_db_lock
+        ensure_database_exists "$DB_NAME"
         run_install_command "$COMPOSE_PROJECT" "$SW_SHARED_DB_INSTALL_ARGS"
+        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
+        release_shared_db_lock
     fi
-    update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-    release_shared_db_lock
 }
 
 cmd_create() {
