@@ -1772,6 +1772,90 @@ cmd_code() {
     fi
 }
 
+cmd_switch() {
+    local target_mode=""
+    local issue_input=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --qa)  target_mode="qa"; shift ;;
+            --dev) target_mode="dev"; shift ;;
+            *)     issue_input="$1"; shift ;;
+        esac
+    done
+
+    [ -n "$issue_input" ] || die "Usage: swctl switch <issue> --qa|--dev"
+    [ -n "$target_mode" ] || die "Usage: swctl switch <issue> --qa|--dev"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    local current_mode="${SWCTL_MODE:-dev}"
+    if [ "$current_mode" = "$target_mode" ]; then
+        info "Already in '$target_mode' mode. Nothing to do."
+        return
+    fi
+
+    SWCTL_MODE="$target_mode"
+    info "Switching '$ISSUE_ID' from $current_mode → $target_mode mode."
+
+    # Re-run diff analysis for the worktree
+    local base_ref
+    base_ref="$(git_base_ref)"
+    local diff_files
+    diff_files="$(git -C "$WORKTREE_PATH" diff --name-only "${base_ref}...HEAD" 2>/dev/null || true)"
+    count_changes "$diff_files"
+
+    if [ "$target_mode" = "dev" ]; then
+        # QA → Dev: need writable vendor + run any missing builds
+
+        # Replace vendor symlink/bind-mount with a real writable copy
+        if [ -L "$WORKTREE_PATH/vendor" ] || [ ! -d "$WORKTREE_PATH/vendor/autoload.php" ]; then
+            info "Copying vendor/ for writable dev mode."
+            rm -f "$WORKTREE_PATH/vendor" 2>/dev/null || true
+            if [ -d "$PROJECT_ROOT/vendor" ]; then
+                cp -cR "$PROJECT_ROOT/vendor" "$WORKTREE_PATH/vendor" 2>/dev/null || \
+                    cp -R "$PROJECT_ROOT/vendor" "$WORKTREE_PATH/vendor"
+            fi
+        fi
+
+        # Recreate compose override without QA vendor bind mount
+        write_compose_volume_override
+
+        # Restart container with new volume config
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+        wait_for_app_container "$COMPOSE_PROJECT"
+
+        # Run composer install if deps changed
+        if [ "$((COMPOSER_CHANGES))" -gt 0 ]; then
+            info "Running composer install for dev mode."
+            run_app_command "$COMPOSE_PROJECT" "composer install --no-interaction" || warn "Composer install failed."
+        fi
+
+        # Run builds that QA skipped
+        run_frontend_build_if_needed "$COMPOSE_PROJECT"
+
+    else
+        # Dev → QA: switch to read-only vendor, lighter container
+
+        # Recreate compose override with QA vendor bind mount
+        write_compose_volume_override
+
+        # Restart container with new volume config
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+        wait_for_app_container "$COMPOSE_PROJECT"
+        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" 2>/dev/null || true
+    fi
+
+    # Update metadata with new mode
+    write_metadata "$meta_file"
+
+    ok "Switched '$ISSUE_ID' to $target_mode mode."
+    info "URL: ${APP_URL}"
+}
+
 remove_labeled_volumes() {
     local volumes
     volumes="$(docker volume ls -q --filter "label=swctl.managed=true" --filter "label=swctl.project=${PROJECT_SLUG}" --filter "label=swctl.issue=${ISSUE_ID}" || true)"
@@ -2298,6 +2382,7 @@ Usage:
   swctl refresh <issue>
   swctl open <issue>
   swctl code <issue>
+  swctl switch <issue> --qa|--dev
   swctl clean <issue>
   swctl tui
   swctl dashboard
@@ -2315,6 +2400,7 @@ Commands:
   refresh     Pull latest changes, detect what changed, rebuild only the delta.
   open        Open the worktree URL in the default browser.
   code        Open the worktree in PhpStorm.
+  switch      Switch a worktree between QA and Dev mode (rebuilds only what's needed).
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
   tui         Open the interactive ANSI dashboard.
   dashboard   Open the live monitoring dashboard.
@@ -2387,6 +2473,11 @@ main() {
             ensure_state_dirs
             shift
             cmd_code "${1:-}"
+            ;;
+        switch)
+            ensure_state_dirs
+            shift
+            cmd_switch "$@"
             ;;
         tui)
             ensure_state_dirs
