@@ -1072,13 +1072,7 @@ refresh_shared_db() {
 run_frontend_build_if_needed() {
     local compose_project="$1"
 
-    # ── QA mode: skip ALL builds. Assets are synced from trunk. ──
-    if [ "$SWCTL_MODE" = "qa" ]; then
-        info "QA mode: skipping frontend builds (assets synced from project root)."
-        return
-    fi
-
-    # ── Dev mode: build only what changed. ──
+    # Both QA and Dev: auto-detect what changed and build only that.
     local needs_bundle_dump=0
 
     if [ "${ADMIN_CHANGES:-0}" -gt 0 ] || [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
@@ -1163,17 +1157,9 @@ provision_database_and_app() {
     compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     wait_for_app_container "$COMPOSE_PROJECT"
 
-    if [ "$SWCTL_MODE" = "qa" ]; then
-        # QA mode: minimal setup — no installs, no builds, no migrations.
-        # Vendor is symlinked, assets are synced, DB is cloned.
-        ensure_install_lock "$COMPOSE_PROJECT"
-        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE assets:install" 2>/dev/null || true
-        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
-        return
-    fi
-
-    # Dev mode: full provisioning based on diff analysis.
+    # Both QA and Dev modes: fully automatic provisioning based on diff analysis.
+    # QA skips composer install (vendor bind-mounted from trunk).
+    # Dev runs composer install if dependencies changed.
     bootstrap_dependencies "$COMPOSE_PROJECT"
 
     if [ "$DB_STATE" = "fresh" ]; then
@@ -1656,6 +1642,81 @@ cmd_restart() {
         docker restart "$container_id"
     fi
     ok "Restarted '$ISSUE_ID'."
+}
+
+cmd_refresh() {
+    local issue_input="${1:-}"
+    local meta_file=""
+
+    [ -n "$issue_input" ] || die "Usage: swctl refresh <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    # Remember the old HEAD before pulling
+    local old_head
+    old_head="$(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null)"
+
+    # Pull latest changes
+    info "Pulling latest changes for '$ISSUE_ID' (branch: $BRANCH)."
+    git -C "$WORKTREE_PATH" pull --ff-only origin "$BRANCH" 2>/dev/null \
+        || git -C "$WORKTREE_PATH" fetch origin "$BRANCH" && git -C "$WORKTREE_PATH" reset --hard "origin/$BRANCH" 2>/dev/null \
+        || warn "Could not pull latest changes. Continuing with current state."
+
+    local new_head
+    new_head="$(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null)"
+
+    if [ "$old_head" = "$new_head" ]; then
+        info "No new commits. Nothing to refresh."
+        return
+    fi
+
+    ok "Updated $old_head → $new_head"
+
+    # Diff between old and new HEAD to detect what changed
+    local diff_files
+    diff_files="$(git -C "$WORKTREE_PATH" diff --name-only "$old_head...$new_head" 2>/dev/null || true)"
+    count_changes "$diff_files"
+
+    info "Changes since last build: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
+
+    # Re-sync gitignored files if needed
+    sync_gitignored_files
+
+    local compose_project="$COMPOSE_PROJECT"
+
+    # Run migrations if schema changed
+    if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
+        info "Schema changes detected. Running migrations."
+        run_app_command "$compose_project" "$SW_BIN_CONSOLE database:migrate --all" || warn "Migrations failed."
+    fi
+
+    # Composer install if dependencies changed (dev mode only)
+    if [ "$((COMPOSER_CHANGES))" -gt 0 ] && [ "${SWCTL_MODE:-dev}" = "dev" ]; then
+        info "Composer changes detected. Running composer install."
+        run_app_command "$compose_project" "composer install --no-interaction" || warn "Composer install failed."
+    fi
+
+    # Rebuild frontend if admin/storefront changed
+    if [ "${ADMIN_CHANGES:-0}" -gt 0 ]; then
+        info "Admin changes detected. Running composer build:js:admin."
+        run_app_command "$compose_project" "composer build:js:admin" || warn "Admin JS build failed."
+    fi
+
+    if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
+        info "Storefront changes detected. Running composer build:js:storefront."
+        run_app_command "$compose_project" "composer build:js:storefront" || warn "Storefront JS build failed."
+    fi
+
+    # Always clear cache after any update
+    run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
+
+    # Update metadata with new HEAD
+    write_metadata "$meta_file"
+
+    ok "Refreshed '$ISSUE_ID'. Changes applied."
+    info "URL: ${APP_URL}"
 }
 
 cmd_open() {
@@ -2182,6 +2243,7 @@ Usage:
   swctl exec <issue> '<cmd>'
   swctl logs <issue> [--follow|-f]
   swctl restart <issue>
+  swctl refresh <issue>
   swctl open <issue>
   swctl clean <issue>
   swctl tui
@@ -2191,12 +2253,13 @@ Usage:
 
 Commands:
   init        Idempotent setup of Traefik, MariaDB, Redis, and the swctl Docker network.
-  create      Create a worktree. --qa: fast read-only (clone DB + sync assets ~50s). --dev: full build (default).
+  create      Create a worktree. --qa: auto-build everything needed (vendor from trunk). --dev: writable vendor (default).
   batch       Batch create worktrees from CLI pairs, a file, or GitLab/GitHub MRs.
   status      Show tracked worktrees, routed domains, container state, and DB mode.
   exec        Execute a command inside the worktree's app container.
   logs        Show or follow container logs for a worktree.
   restart     Restart the app container for a worktree without full recreate.
+  refresh     Pull latest changes, detect what changed, rebuild only the delta.
   open        Open the worktree URL in the default browser.
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
   tui         Open the interactive ANSI dashboard.
@@ -2255,6 +2318,11 @@ main() {
             ensure_state_dirs
             shift
             cmd_restart "${1:-}"
+            ;;
+        refresh)
+            ensure_state_dirs
+            shift
+            cmd_refresh "${1:-}"
             ;;
         open)
             ensure_state_dirs
