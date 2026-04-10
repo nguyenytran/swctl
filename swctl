@@ -1730,6 +1730,28 @@ cmd_open() {
     fi
 }
 
+cmd_code() {
+    local issue_input="${1:-}"
+    local meta_file=""
+
+    [ -n "$issue_input" ] || die "Usage: swctl code <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    info "Opening '$WORKTREE_PATH' in PhpStorm."
+    if command -v phpstorm >/dev/null 2>&1; then
+        phpstorm "$WORKTREE_PATH"
+    elif command -v pstorm >/dev/null 2>&1; then
+        pstorm "$WORKTREE_PATH"
+    elif [ -x "$HOME/Library/Application Support/JetBrains/Toolbox/scripts/phpstorm" ]; then
+        "$HOME/Library/Application Support/JetBrains/Toolbox/scripts/phpstorm" "$WORKTREE_PATH"
+    else
+        warn "PhpStorm not found. Open manually: $WORKTREE_PATH"
+    fi
+}
+
 remove_labeled_volumes() {
     local volumes
     volumes="$(docker volume ls -q --filter "label=swctl.managed=true" --filter "label=swctl.project=${PROJECT_SLUG}" --filter "label=swctl.issue=${ISSUE_ID}" || true)"
@@ -2235,6 +2257,7 @@ Usage:
   swctl restart <issue>
   swctl refresh <issue>
   swctl open <issue>
+  swctl code <issue>
   swctl clean <issue>
   swctl tui
   swctl dashboard
@@ -2251,6 +2274,7 @@ Commands:
   restart     Restart the app container for a worktree without full recreate.
   refresh     Pull latest changes, detect what changed, rebuild only the delta.
   open        Open the worktree URL in the default browser.
+  code        Open the worktree in PhpStorm.
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
   tui         Open the interactive ANSI dashboard.
   dashboard   Open the live monitoring dashboard.
@@ -2318,6 +2342,11 @@ main() {
             ensure_state_dirs
             shift
             cmd_open "${1:-}"
+            ;;
+        code)
+            ensure_state_dirs
+            shift
+            cmd_code "${1:-}"
             ;;
         tui)
             ensure_state_dirs
