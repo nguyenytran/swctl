@@ -91,9 +91,6 @@ compose() {
     die "Docker Compose is required. Install the Docker Compose plugin or docker-compose."
 }
 
-tolower() {
-    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
-}
 
 sanitize_slug() {
     printf '%s' "$1" \
@@ -1011,7 +1008,7 @@ bootstrap_dependencies() {
             # Dedicated node_modules volume — always install
             node_needs_install=1
             info "Package changes detected. Will run: $package_install_cmd"
-        elif run_app_command "$compose_project" "test ! -d node_modules/.package-lock.json && test ! -d node_modules/.modules.yaml" >/dev/null 2>&1; then
+        elif run_app_command "$compose_project" "test ! -f node_modules/.package-lock.json && test ! -f node_modules/.modules.yaml" >/dev/null 2>&1; then
             # Shared base volume is empty (first-time populate)
             node_needs_install=1
             info "Shared node_modules volume is empty. Will populate."
@@ -1094,15 +1091,6 @@ run_install_command() {
     ensure_install_lock "$compose_project"
 }
 
-refresh_shared_db() {
-    local compose_project="$1"
-
-    info "Reusing shared database '$DB_NAME' and refreshing runtime state."
-    ensure_install_lock "$compose_project"
-    run_app_command "$compose_project" "$SW_BIN_CONSOLE dal:refresh:index" || warn "dal:refresh:index failed."
-    run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
-}
-
 run_frontend_build_if_needed() {
     local compose_project="$1"
 
@@ -1147,10 +1135,6 @@ create_database() {
     mysql_exec "DROP DATABASE IF EXISTS \`${db_name}\`; CREATE DATABASE \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 }
 
-ensure_database_exists() {
-    local db_name="$1"
-    mysql_exec "CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-}
 
 clone_database() {
     local source_db="$1"
@@ -1378,39 +1362,6 @@ select_from_list() {
     done
 }
 
-acquire_shared_db_lock() {
-    local lockfile="$SWCTL_TMP_DIR/shared-db.lock"
-    local attempt=0
-    local stale_pid=""
-
-    # Clean stale lock from a dead process
-    if [ -f "$lockfile" ]; then
-        stale_pid="$(cat "$lockfile" 2>/dev/null || true)"
-        if [ -n "$stale_pid" ] && ! kill -0 "$stale_pid" 2>/dev/null; then
-            rm -f "$lockfile"
-        fi
-    fi
-
-    while ! ( set -o noclobber; printf '%s' $$ > "$lockfile" ) 2>/dev/null; do
-        attempt=$((attempt + 1))
-        if [ "$attempt" -ge 120 ]; then
-            die "Timed out waiting for shared-db lock."
-        fi
-        # Re-check for stale lock every 10 attempts
-        if [ $((attempt % 10)) -eq 0 ] && [ -f "$lockfile" ]; then
-            stale_pid="$(cat "$lockfile" 2>/dev/null || true)"
-            if [ -n "$stale_pid" ] && ! kill -0 "$stale_pid" 2>/dev/null; then
-                rm -f "$lockfile"
-            fi
-        fi
-        sleep 1
-    done
-}
-
-release_shared_db_lock() {
-    rm -f "$SWCTL_TMP_DIR/shared-db.lock"
-}
-
 batch_create_sequential() {
     local pairs="$1"
     local job_dir="$2"
@@ -1467,6 +1418,7 @@ cmd_batch_create() {
     local parallel=0
     local max_jobs=4
     SWCTL_MODE="${SWCTL_MODE:-dev}"
+    export SWCTL_MODE
 
     while [ $# -gt 0 ]; do
         case "$1" in
