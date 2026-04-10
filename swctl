@@ -1566,18 +1566,17 @@ render_status_table() {
     local file=""
     local found=0
 
-    printf '%-12s %-6s %-12s %-34s %-16s %-10s\n' "Issue" "Mode" "Project" "Domain" "Container" "DB"
-    printf '%-12s %-6s %-12s %-34s %-16s %-10s\n' "------------" "------" "------------" "----------------------------------" "----------------" "----------"
+    printf '%-24s %-4s %-40s %-16s %-8s\n' "Issue" "Mode" "Domain" "Container" "DB"
+    printf '%-24s %-4s %-40s %-16s %-8s\n' "------------------------" "----" "----------------------------------------" "----------------" "--------"
 
     while IFS= read -r file; do
         [ -n "$file" ] || continue
         found=1
         load_instance_metadata "$file"
-        printf '%-12s %-6s %-12s %-34s %-16b %-10s\n' \
-            "$(truncate_text 12 "$ISSUE_ID")" \
+        printf '%-24s %-4s %-40s %-16b %-8s\n' \
+            "$(truncate_text 24 "$ISSUE_ID")" \
             "${SWCTL_MODE:-dev}" \
-            "$(truncate_text 12 "$PROJECT_SLUG")" \
-            "$(truncate_text 34 "$DOMAIN")" \
+            "$(truncate_text 40 "$DOMAIN")" \
             "$(status_label "$COMPOSE_PROJECT")" \
             "$DB_STATE"
     done <<EOF
