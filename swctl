@@ -636,34 +636,38 @@ create_worktree() {
         ok "Created worktree '$WORKTREE_PATH' from '$BASE_REF'."
     fi
 
-    sync_gitignored_files
+    sync_lock_files
 }
 
-sync_gitignored_files() {
+sync_lock_files() {
     local file=""
-    local dir=""
     for file in composer.lock pnpm-lock.yaml yarn.lock package-lock.json; do
         if [ -f "$PROJECT_ROOT/$file" ] && [ ! -f "$WORKTREE_PATH/$file" ]; then
             cp "$PROJECT_ROOT/$file" "$WORKTREE_PATH/$file"
             ok "Copied gitignored '$file' into worktree."
         fi
     done
+}
 
-    # Sync gitignored build artifacts from project root (node_modules, storefront vendor, etc.)
-    # These directories may exist as empty stubs (with .gitkeep) from the checkout,
-    # so we check for actual content beyond .gitkeep.
-    # Only sync what's needed based on diff analysis:
-    # - Always: public/bundles, public/theme, var (small, fast)
-    # - Storefront node_modules/vendor/dist: only if storefront changes detected
-    # - Admin node_modules: only if admin changes detected
-    local sync_dirs="public/theme public/bundles var"
+sync_build_artifacts() {
+    # Called AFTER count_changes so ADMIN_CHANGES/STOREFRONT_CHANGES are set.
+    # Diff-driven: only sync what's needed. Use APFS clones when available.
 
-    if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ] || [ "${FRONTEND_CHANGES:-0}" -eq 0 ]; then
-        # Sync storefront assets if storefront changed OR if no frontend changes at all
-        # (need base assets for the storefront to render)
-        sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/vendor"
-        sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/dist"
-    fi
+    # Instead of syncing all of var/ (719MB, mostly stale cache), copy only the
+    # 2 small JSON files that theme:compile and bundle:dump actually need.
+    mkdir -p "$WORKTREE_PATH/var"
+    for f in var/theme-files.json var/plugins.json; do
+        [ -f "$PROJECT_ROOT/$f" ] && cp "$PROJECT_ROOT/$f" "$WORKTREE_PATH/$f" 2>/dev/null || true
+    done
+
+    # Build sync list based on what changed:
+    # - Always: public/bundles (62MB), public/theme (168MB), storefront vendor/dist (small)
+    # - Only if storefront changes: storefront node_modules (721MB)
+    # - Only if admin changes: admin node_modules (1.1GB)
+    local sync_dirs="public/theme public/bundles"
+    sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/vendor"
+    sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/dist"
+
     if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
         sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/node_modules"
     fi
@@ -675,19 +679,29 @@ sync_gitignored_files() {
     for dir in $sync_dirs; do
         local src_dir="$PROJECT_ROOT/$dir"
         local dst_dir="$WORKTREE_PATH/$dir"
-        # Only sync if source has real content and destination is empty/missing
         if [ -d "$src_dir" ]; then
-            local src_count
+            local src_count dst_count
             src_count="$(find "$src_dir" -mindepth 1 -maxdepth 1 -not -name '.gitkeep' 2>/dev/null | wc -l | tr -d ' ')"
-            if [ "$src_count" -gt 0 ]; then
+            dst_count="$( (find "$dst_dir" -mindepth 1 -maxdepth 1 -not -name '.gitkeep' 2>/dev/null || true) | wc -l | tr -d ' ')"
+            if [ "$src_count" -gt 0 ] && [ "${dst_count:-0}" -lt "$src_count" ]; then
                 mkdir -p "$dst_dir"
-                # Use rsync if available for speed, fallback to cp
-                if command -v rsync >/dev/null 2>&1; then
-                    rsync -a --ignore-existing --exclude='cache' "$src_dir/" "$dst_dir/" 2>/dev/null || true
+                # APFS clone (cp -c): instant copy-on-write. Clone to temp, swap in.
+                local tmp_clone="${dst_dir}.swctl-clone"
+                rm -rf "$tmp_clone"
+                if cp -cR "$src_dir" "$tmp_clone" 2>/dev/null; then
+                    rm -rf "$dst_dir"
+                    mv "$tmp_clone" "$dst_dir"
                 else
-                    cp -Rn "$src_dir"/* "$dst_dir"/ 2>/dev/null || true
+                    rm -rf "$tmp_clone" 2>/dev/null || true
+                    # Fallback: rsync or regular copy
+                    mkdir -p "$dst_dir"
+                    if command -v rsync >/dev/null 2>&1; then
+                        rsync -a "$src_dir/" "$dst_dir/" 2>/dev/null || true
+                    else
+                        cp -R "$src_dir"/* "$dst_dir"/ 2>/dev/null || true
+                    fi
                 fi
-                ok "Synced gitignored content from '$dir/'."
+                ok "Synced '$dir/'."
             fi
         fi
     done
@@ -1117,11 +1131,10 @@ run_frontend_build_if_needed() {
     fi
 
     if [ "$needs_bundle_dump" -eq 0 ]; then
-        # No frontend changes — ensure assets exist (synced from trunk) and register them.
+        # No frontend changes — register synced assets. Skip full JS builds.
         run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" 2>/dev/null || true
         run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" 2>/dev/null || true
-        run_app_command "$compose_project" "composer build:js:admin" 2>/dev/null || warn "Admin JS build failed."
-        info "Assets installed from synced files."
+        info "Assets registered from synced files. No frontend builds needed."
     fi
 
     # Clear cache for any code change
@@ -1157,22 +1170,29 @@ provision_database_and_app() {
     # Every worktree gets its own cloned database (never touches the source).
     DB_NAME="$(sanitize_db_identifier "${SW_DB_NAME_PREFIX}_${ISSUE_ID}")"
 
+    # Write configs first (needed by both DB clone and compose up)
+    write_env_file
+    write_compose_env_file
+    write_compose_volume_override
+
+    # Check DB state and start clone + container in parallel when possible
     if mysql_db_has_tables "$DB_NAME"; then
         DB_STATE="cloned"
         info "Database '$DB_NAME' already exists. Reusing."
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     elif mysql_db_has_tables "$source_db"; then
         DB_STATE="cloned"
-        clone_database "$source_db" "$DB_NAME"
+        # Clone DB in background while container starts
+        clone_database "$source_db" "$DB_NAME" &
+        local clone_pid=$!
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+        wait "$clone_pid" || die "Database clone failed."
     else
         DB_STATE="fresh"
         info "Source database '$source_db' is empty. Will run fresh install."
         create_database "$DB_NAME"
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     fi
-
-    write_env_file
-    write_compose_env_file
-    write_compose_volume_override
-    compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     wait_for_app_container "$COMPOSE_PROJECT"
 
     # Both QA and Dev modes: fully automatic provisioning based on diff analysis.
@@ -1184,7 +1204,7 @@ provision_database_and_app() {
         run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
     elif [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected. Running migrations on cloned database."
-        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE database:migrate --all" || warn "Migrations failed."
+        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE database:migrate --all && $SW_BIN_CONSOLE database:migrate-destructive --all" || warn "Migrations failed."
     fi
 
     update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
@@ -1241,7 +1261,8 @@ cmd_create() {
     DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
     count_changes "$DIFF_FILES"
 
-    # Resolve dependencies AFTER diff analysis
+    # Resolve dependencies and sync assets AFTER diff analysis
+    sync_build_artifacts
     sync_worktree_deps
     VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
     NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
@@ -1672,14 +1693,14 @@ cmd_refresh() {
     info "Changes since last build: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
 
     # Re-sync gitignored files if needed
-    sync_gitignored_files
+    sync_build_artifacts
 
     local compose_project="$COMPOSE_PROJECT"
 
     # Run migrations if schema changed
     if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected. Running migrations."
-        run_app_command "$compose_project" "$SW_BIN_CONSOLE database:migrate --all" || warn "Migrations failed."
+        run_app_command "$compose_project" "$SW_BIN_CONSOLE database:migrate --all && $SW_BIN_CONSOLE database:migrate-destructive --all" || warn "Migrations failed."
     fi
 
     # Composer install if dependencies changed (dev mode only)
