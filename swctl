@@ -593,6 +593,28 @@ git_base_ref() {
     die "Base branch '$SW_BASE_BRANCH' was not found locally or under origin/."
 }
 
+check_branch_staleness() {
+    local merge_base
+    local commits_behind=0
+    local days_behind=0
+
+    merge_base="$(git -C "$WORKTREE_PATH" merge-base "$BASE_REF" HEAD 2>/dev/null || true)"
+    [ -n "$merge_base" ] || return 0
+
+    commits_behind="$(git -C "$WORKTREE_PATH" rev-list --count "$merge_base..${BASE_REF}" 2>/dev/null || printf '0')"
+    days_behind="$(( ( $(date +%s) - $(git -C "$WORKTREE_PATH" log -1 --format=%ct "$merge_base" 2>/dev/null || printf '%s' "$(date +%s)") ) / 86400 ))"
+
+    if [ "$commits_behind" -gt 100 ] || [ "$days_behind" -gt 14 ]; then
+        warn "Branch '$BRANCH' is ${commits_behind} commits / ${days_behind} days behind '${SW_BASE_BRANCH}'."
+        warn "The DB is cloned from current trunk — schema mismatches are likely."
+        warn "Recommended: rebase the branch first, then create the worktree."
+        warn "  cd $WORKTREE_PATH && git rebase $BASE_REF"
+        warn "  OR ask the developer to rebase and push."
+    elif [ "$commits_behind" -gt 20 ]; then
+        info "Branch is ${commits_behind} commits behind '${SW_BASE_BRANCH}' (${days_behind} days). Consider rebasing for best results."
+    fi
+}
+
 worktree_exists() {
     git -C "$PROJECT_ROOT" worktree list --porcelain | grep -Fxq "worktree $1"
 }
@@ -1225,6 +1247,10 @@ cmd_create() {
     WORKTREE_PATH="${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}"
 
     create_worktree
+
+    # Check how far behind the branch is from trunk.
+    # The DB is cloned from current trunk — a stale branch may have schema mismatches.
+    check_branch_staleness
 
     # Diff analysis drives the provisioning decision matrix:
     # what changed determines DB strategy, volume sharing, and build steps.
