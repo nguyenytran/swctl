@@ -356,6 +356,7 @@ write_metadata() {
         printf 'PACKAGE_CHANGES=%q\n' "${PACKAGE_CHANGES:-0}"
         printf 'BACKEND_CHANGES=%q\n' "${BACKEND_CHANGES:-0}"
         printf 'FRONTEND_CHANGES=%q\n' "$FRONTEND_CHANGES"
+        printf 'SWCTL_MODE=%q\n' "${SWCTL_MODE:-dev}"
         printf 'CREATED_AT=%q\n' "$(timestamp_utc)"
     } >"$meta_file"
 }
@@ -651,7 +652,7 @@ sync_gitignored_files() {
                 mkdir -p "$dst_dir"
                 # Use rsync if available for speed, fallback to cp
                 if command -v rsync >/dev/null 2>&1; then
-                    rsync -a --ignore-existing "$src_dir/" "$dst_dir/" 2>/dev/null || true
+                    rsync -a --ignore-existing --exclude='cache' "$src_dir/" "$dst_dir/" 2>/dev/null || true
                 else
                     cp -Rn "$src_dir"/* "$dst_dir"/ 2>/dev/null || true
                 fi
@@ -675,10 +676,13 @@ count_changes() {
 }
 
 sync_worktree_deps() {
-    # For monorepo setups: symlink vendor/ from project root when no composer changes.
-    # This avoids the expensive composer install per worktree.
+    # QA mode: always symlink vendor (read-only, no installs).
+    # Dev mode: symlink only when no composer/dependency changes.
     if [ -d "$PROJECT_ROOT/vendor" ] && [ ! -e "$WORKTREE_PATH/vendor" ]; then
-        if [ "$((MIGRATION_CHANGES + ENTITY_CHANGES + COMPOSER_CHANGES))" -gt 0 ]; then
+        if [ "$SWCTL_MODE" = "qa" ]; then
+            # QA mode: vendor is bind-mounted read-only via compose override.
+            info "Vendor will be mounted read-only from project root (QA mode)."
+        elif [ "$((MIGRATION_CHANGES + ENTITY_CHANGES + COMPOSER_CHANGES))" -gt 0 ]; then
             info "Dependency changes detected. Vendor will be installed fresh inside container."
         else
             ln -s "$PROJECT_ROOT/vendor" "$WORKTREE_PATH/vendor"
@@ -843,6 +847,18 @@ write_compose_volume_override() {
             printf '      swctl.issue: %s\n' "$ISSUE_ID"
         fi
     } > "$COMPOSE_VOLUME_OVERRIDE"
+
+    # QA mode: mount vendor from trunk as read-only bind (symlinks don't work in Docker)
+    if [ "$SWCTL_MODE" = "qa" ] && [ -d "$PROJECT_ROOT/vendor" ]; then
+        local svc="${SW_SERVICE_NAME:-web}"
+        cat >> "$COMPOSE_VOLUME_OVERRIDE" <<QAEOF
+
+services:
+  ${svc}:
+    volumes:
+      - ${PROJECT_ROOT}/vendor:/var/www/html/vendor:ro
+QAEOF
+    fi
 }
 
 app_container_id() {
@@ -1055,6 +1071,14 @@ refresh_shared_db() {
 
 run_frontend_build_if_needed() {
     local compose_project="$1"
+
+    # ── QA mode: skip ALL builds. Assets are synced from trunk. ──
+    if [ "$SWCTL_MODE" = "qa" ]; then
+        info "QA mode: skipping frontend builds (assets synced from project root)."
+        return
+    fi
+
+    # ── Dev mode: build only what changed. ──
     local needs_bundle_dump=0
 
     if [ "${ADMIN_CHANGES:-0}" -gt 0 ] || [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
@@ -1077,27 +1101,15 @@ run_frontend_build_if_needed() {
     fi
 
     if [ "$needs_bundle_dump" -eq 0 ]; then
-        # Even without frontend changes, ensure theme/admin assets exist in this worktree.
-        # The shared DB may have been installed by another worktree, but compiled assets
-        # live on the bind mount and must exist per-worktree.
-        if ! run_app_command "$compose_project" "test -d public/theme || test -d public/bundles" >/dev/null 2>&1; then
-            info "Theme/admin assets missing. Running initial asset build."
-            run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" || warn "bundle:dump failed."
-            run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" || warn "assets:install failed."
-            run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:change --all Storefront --no-compile" 2>/dev/null || true
-            run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:compile --active-only" || warn "theme:compile failed."
-        else
-            # Run bundle:dump + assets:install to register synced assets properly.
-            # Admin needs composer build:js:admin on first run to align Vite plugin versions.
-            run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" 2>/dev/null || true
-            run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" 2>/dev/null || true
-            run_app_command "$compose_project" "composer build:js:admin" 2>/dev/null || warn "Admin JS build failed. Run 'swctl exec <issue> composer build:js:admin' manually."
-            info "Assets installed. Skipping storefront rebuild (synced from project root)."
-        fi
+        # No frontend changes — ensure assets exist (synced from trunk) and register them.
+        run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" 2>/dev/null || true
+        run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" 2>/dev/null || true
+        run_app_command "$compose_project" "composer build:js:admin" 2>/dev/null || warn "Admin JS build failed."
+        info "Assets installed from synced files."
     fi
 
-    # Clear cache for any code change on shared DB
-    if [ "$((BACKEND_CHANGES + ADMIN_CHANGES + STOREFRONT_CHANGES + COMPOSER_CHANGES + PACKAGE_CHANGES))" -gt 0 ] && [ "${DB_STATE:-}" != "dedicated" ]; then
+    # Clear cache for any code change
+    if [ "$((BACKEND_CHANGES + ADMIN_CHANGES + STOREFRONT_CHANGES + COMPOSER_CHANGES + PACKAGE_CHANGES))" -gt 0 ] && [ "${DB_STATE:-}" != "fresh" ]; then
         run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
     fi
 }
@@ -1130,9 +1142,7 @@ provision_database_and_app() {
     local source_db
     source_db="$(sanitize_db_identifier "$SW_DB_SHARED_NAME")"
 
-    # Every worktree gets its own cloned database.
-    # Migration/entity changes: clone + run migrations.
-    # No schema changes: clone only (already has all data).
+    # Every worktree gets its own cloned database (never touches the source).
     DB_NAME="$(sanitize_db_identifier "${SW_DB_NAME_PREFIX}_${ISSUE_ID}")"
 
     if mysql_db_has_tables "$DB_NAME"; then
@@ -1142,8 +1152,8 @@ provision_database_and_app() {
         DB_STATE="cloned"
         clone_database "$source_db" "$DB_NAME"
     else
-        DB_STATE="dedicated"
-        info "Source database '$source_db' is empty. Running fresh install."
+        DB_STATE="fresh"
+        info "Source database '$source_db' is empty. Will run fresh install."
         create_database "$DB_NAME"
     fi
 
@@ -1152,26 +1162,45 @@ provision_database_and_app() {
     write_compose_volume_override
     compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     wait_for_app_container "$COMPOSE_PROJECT"
+
+    if [ "$SWCTL_MODE" = "qa" ]; then
+        # QA mode: minimal setup — no installs, no builds, no migrations.
+        # Vendor is symlinked, assets are synced, DB is cloned.
+        ensure_install_lock "$COMPOSE_PROJECT"
+        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
+        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE assets:install" 2>/dev/null || true
+        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
+        return
+    fi
+
+    # Dev mode: full provisioning based on diff analysis.
     bootstrap_dependencies "$COMPOSE_PROJECT"
 
-    if [ "$DB_STATE" = "dedicated" ]; then
+    if [ "$DB_STATE" = "fresh" ]; then
         run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
     elif [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected. Running migrations on cloned database."
         run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE database:migrate --all" || warn "Migrations failed."
     fi
 
-    # Safe to update domain — this is the worktree's own database
     update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
     ensure_install_lock "$COMPOSE_PROJECT"
     run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
 }
 
 cmd_create() {
+    SWCTL_MODE="${SWCTL_MODE:-dev}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --qa)  SWCTL_MODE="qa"; shift ;;
+            --dev) SWCTL_MODE="dev"; shift ;;
+            *)     break ;;
+        esac
+    done
     ISSUE="${1:-}"
     BRANCH="${2:-}"
-    [ -n "$ISSUE" ] || die "Usage: swctl create <issue> <branch>"
-    [ -n "$BRANCH" ] || die "Usage: swctl create <issue> <branch>"
+    [ -n "$ISSUE" ] || die "Usage: swctl create [--qa|--dev] <issue> <branch>"
+    [ -n "$BRANCH" ] || die "Usage: swctl create [--qa|--dev] <issue> <branch>"
 
     require_cmd git
     ensure_docker
@@ -1209,7 +1238,7 @@ cmd_create() {
     VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
     NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
 
-    info "Diff: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
+    info "Mode: ${SWCTL_MODE} | Diff: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
     info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
 
     provision_database_and_app "$COMPOSE_PROJECT"
@@ -1413,9 +1442,14 @@ cmd_batch_create() {
     local pairs=""
     local parallel=0
     local max_jobs=4
+    SWCTL_MODE="${SWCTL_MODE:-dev}"
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --qa)
+                SWCTL_MODE="qa"; shift ;;
+            --dev)
+                SWCTL_MODE="dev"; shift ;;
             --file|-f)
                 shift
                 [ -n "${1:-}" ] || die "Missing argument for --file."
@@ -1535,17 +1569,18 @@ render_status_table() {
     local file=""
     local found=0
 
-    printf '%-12s %-12s %-38s %-16s %-12s\n' "Issue" "Project" "Domain" "Container" "DB State"
-    printf '%-12s %-12s %-38s %-16s %-12s\n' "------------" "------------" "--------------------------------------" "----------------" "------------"
+    printf '%-12s %-6s %-12s %-34s %-16s %-10s\n' "Issue" "Mode" "Project" "Domain" "Container" "DB"
+    printf '%-12s %-6s %-12s %-34s %-16s %-10s\n' "------------" "------" "------------" "----------------------------------" "----------------" "----------"
 
     while IFS= read -r file; do
         [ -n "$file" ] || continue
         found=1
         load_instance_metadata "$file"
-        printf '%-12s %-12s %-38s %-16b %-12s\n' \
+        printf '%-12s %-6s %-12s %-34s %-16b %-10s\n' \
             "$(truncate_text 12 "$ISSUE_ID")" \
+            "${SWCTL_MODE:-dev}" \
             "$(truncate_text 12 "$PROJECT_SLUG")" \
-            "$(truncate_text 38 "$DOMAIN")" \
+            "$(truncate_text 34 "$DOMAIN")" \
             "$(status_label "$COMPOSE_PROJECT")" \
             "$DB_STATE"
     done <<EOF
@@ -2141,7 +2176,7 @@ swctl ${SWCTL_VERSION}
 
 Usage:
   swctl init
-  swctl create <issue> <branch>
+  swctl create [--qa|--dev] <issue> <branch>
   swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]
   swctl status
   swctl exec <issue> '<cmd>'
@@ -2156,7 +2191,7 @@ Usage:
 
 Commands:
   init        Idempotent setup of Traefik, MariaDB, Redis, and the swctl Docker network.
-  create      Create or attach a Git worktree, provision .env.local, and start the app container.
+  create      Create a worktree. --qa: fast read-only (clone DB + sync assets ~50s). --dev: full build (default).
   batch       Batch create worktrees from CLI pairs, a file, or GitLab/GitHub MRs.
   status      Show tracked worktrees, routed domains, container state, and DB mode.
   exec        Execute a command inside the worktree's app container.
@@ -2190,7 +2225,7 @@ main() {
         create)
             ensure_state_dirs
             shift
-            cmd_create "${1:-}" "${2:-}"
+            cmd_create "$@"
             ;;
         batch)
             ensure_state_dirs
