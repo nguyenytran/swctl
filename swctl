@@ -18,6 +18,7 @@ SWCTL_TEMPLATE_DIR="${SWCTL_TEMPLATE_DIR:-$SCRIPT_DIR}"
 SWCTL_STATE_DIR="${SWCTL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/swctl}"
 SWCTL_REGISTRY_DIR="$SWCTL_STATE_DIR/instances"
 SWCTL_INFRA_DIR="$SWCTL_STATE_DIR/infra"
+SWCTL_PROJECTS_FILE="$SWCTL_STATE_DIR/projects.conf"
 SWCTL_TMP_DIR="${TMPDIR:-/tmp}/swctl"
 
 COLOR_RESET=""
@@ -64,6 +65,7 @@ info() {
 }
 
 die() {
+    SWCTL_LAST_ERROR="$1"
     err "$1"
     exit 1
 }
@@ -279,6 +281,8 @@ load_project_config() {
         SW_SERVICE_NAME="web"
     fi
     SW_COMPOSE_TEMPLATE="$(detect_template_path)" || die "Could not find docker-compose.swctl.yml. Put it in the project root or export SWCTL_TEMPLATE_DIR."
+
+    auto_register_project
 }
 
 maybe_load_project_config() {
@@ -324,36 +328,44 @@ write_metadata() {
 
     mkdir -p "$(dirname "$meta_file")"
     {
-        printf 'SWCTL_META_VERSION=%q\n' "1"
-        printf 'ISSUE=%q\n' "$ISSUE"
-        printf 'ISSUE_ID=%q\n' "$ISSUE_ID"
-        printf 'PROJECT=%q\n' "$SW_PROJECT"
-        printf 'PROJECT_SLUG=%q\n' "$SW_PROJECT_SLUG"
-        printf 'PROJECT_ROOT=%q\n' "$PROJECT_ROOT"
-        printf 'CONFIG_PATH=%q\n' "$PROJECT_CONFIG"
-        printf 'BRANCH=%q\n' "$BRANCH"
-        printf 'BASE_REF=%q\n' "$BASE_REF"
-        printf 'WORKTREE_PATH=%q\n' "$WORKTREE_PATH"
-        printf 'WORKTREE_ID=%q\n' "$WORKTREE_ID"
-        printf 'DOMAIN=%q\n' "$DOMAIN"
-        printf 'APP_URL=%q\n' "$APP_URL"
-        printf 'DB_NAME=%q\n' "$DB_NAME"
-        printf 'DB_STATE=%q\n' "$DB_STATE"
-        printf 'COMPOSE_PROJECT=%q\n' "$COMPOSE_PROJECT"
-        printf 'COMPOSE_ENV_FILE=%q\n' "$COMPOSE_ENV_FILE"
-        printf 'COMPOSE_TEMPLATE=%q\n' "$SW_COMPOSE_TEMPLATE"
+        printf 'SWCTL_META_VERSION=%q\n' "2"
+        printf 'ISSUE=%q\n' "${ISSUE:-}"
+        printf 'ISSUE_ID=%q\n' "${ISSUE_ID:-}"
+        printf 'PROJECT=%q\n' "${SW_PROJECT:-}"
+        printf 'PROJECT_SLUG=%q\n' "${SW_PROJECT_SLUG:-}"
+        printf 'PROJECT_ROOT=%q\n' "${PROJECT_ROOT:-}"
+        printf 'CONFIG_PATH=%q\n' "${PROJECT_CONFIG:-}"
+        printf 'BRANCH=%q\n' "${BRANCH:-}"
+        printf 'BASE_REF=%q\n' "${BASE_REF:-}"
+        printf 'WORKTREE_PATH=%q\n' "${WORKTREE_PATH:-}"
+        printf 'WORKTREE_ID=%q\n' "${WORKTREE_ID:-}"
+        printf 'DOMAIN=%q\n' "${DOMAIN:-}"
+        printf 'APP_URL=%q\n' "${APP_URL:-}"
+        printf 'DB_NAME=%q\n' "${DB_NAME:-}"
+        printf 'DB_STATE=%q\n' "${DB_STATE:-}"
+        printf 'COMPOSE_PROJECT=%q\n' "${COMPOSE_PROJECT:-}"
+        printf 'COMPOSE_ENV_FILE=%q\n' "${COMPOSE_ENV_FILE:-}"
+        printf 'COMPOSE_TEMPLATE=%q\n' "${SW_COMPOSE_TEMPLATE:-}"
         printf 'COMPOSE_VOLUME_OVERRIDE=%q\n' "${COMPOSE_VOLUME_OVERRIDE:-}"
-        printf 'VENDOR_VOLUME=%q\n' "$VENDOR_VOLUME"
-        printf 'NODE_MODULES_VOLUME=%q\n' "$NODE_MODULES_VOLUME"
-        printf 'MIGRATION_CHANGES=%q\n' "$MIGRATION_CHANGES"
-        printf 'ENTITY_CHANGES=%q\n' "$ENTITY_CHANGES"
+        printf 'VENDOR_VOLUME=%q\n' "${VENDOR_VOLUME:-}"
+        printf 'NODE_MODULES_VOLUME=%q\n' "${NODE_MODULES_VOLUME:-}"
+        printf 'MIGRATION_CHANGES=%q\n' "${MIGRATION_CHANGES:-0}"
+        printf 'ENTITY_CHANGES=%q\n' "${ENTITY_CHANGES:-0}"
         printf 'ADMIN_CHANGES=%q\n' "${ADMIN_CHANGES:-0}"
         printf 'STOREFRONT_CHANGES=%q\n' "${STOREFRONT_CHANGES:-0}"
         printf 'COMPOSER_CHANGES=%q\n' "${COMPOSER_CHANGES:-0}"
         printf 'PACKAGE_CHANGES=%q\n' "${PACKAGE_CHANGES:-0}"
         printf 'BACKEND_CHANGES=%q\n' "${BACKEND_CHANGES:-0}"
-        printf 'FRONTEND_CHANGES=%q\n' "$FRONTEND_CHANGES"
+        printf 'FRONTEND_CHANGES=%q\n' "${FRONTEND_CHANGES:-0}"
         printf 'SWCTL_MODE=%q\n' "${SWCTL_MODE:-dev}"
+        printf 'PROJECT_TYPE=%q\n' "${PROJECT_TYPE:-platform}"
+        printf 'PLUGIN_NAME=%q\n' "${PLUGIN_NAME:-}"
+        printf 'LINKED_PLUGINS=%q\n' "${LINKED_PLUGINS:-}"
+        printf 'PLUGIN_WORKTREE_PATHS=%q\n' "${PLUGIN_WORKTREE_PATHS:-}"
+        printf 'PLATFORM_WORKTREE_PATH=%q\n' "${PLATFORM_WORKTREE_PATH:-}"
+        printf 'PLATFORM_ISSUE_ID=%q\n' "${PLATFORM_ISSUE_ID:-}"
+        printf 'STATUS=%q\n' "${STATUS:-complete}"
+        printf 'FAILED_AT=%q\n' "${FAILED_AT:-}"
         printf 'CREATED_AT=%q\n' "$(timestamp_utc)"
     } >"$meta_file"
 }
@@ -398,6 +410,202 @@ EOF
 
     printf '%s\n' "$first_hit"
     return 0
+}
+
+# --- Project registry ---
+
+ensure_projects_file() {
+    [ -f "$SWCTL_PROJECTS_FILE" ] || touch "$SWCTL_PROJECTS_FILE"
+}
+
+read_project() {
+    local name="$1"
+    ensure_projects_file
+    grep -E "^${name}	" "$SWCTL_PROJECTS_FILE" 2>/dev/null | head -1
+}
+
+read_project_field() {
+    local entry="$1" field="$2"
+    case "$field" in
+        name)       printf '%s' "$entry" | cut -f1 ;;
+        type)       printf '%s' "$entry" | cut -f2 ;;
+        path)       printf '%s' "$entry" | cut -f3 ;;
+        parent)     printf '%s' "$entry" | cut -f4 ;;
+        plugin_dir) printf '%s' "$entry" | cut -f5 ;;
+    esac
+}
+
+list_projects() {
+    ensure_projects_file
+    grep -v '^#' "$SWCTL_PROJECTS_FILE" 2>/dev/null | grep -v '^$' || true
+}
+
+add_project_entry() {
+    local name="$1" type="$2" proj_path="$3" parent="${4:--}" plugin_dir="${5:--}"
+    ensure_projects_file
+    if grep -qE "^${name}	" "$SWCTL_PROJECTS_FILE" 2>/dev/null; then
+        die "Project '$name' already registered. Use 'swctl project remove $name' first."
+    fi
+    [ -d "$proj_path" ] || die "Path does not exist: $proj_path"
+    case "$type" in
+        platform|plugin-embedded|plugin-external) ;;
+        *) die "Invalid project type: $type (expected: platform, plugin-embedded, plugin-external)" ;;
+    esac
+    if [ "$type" != "platform" ] && [ "$parent" = "-" ]; then
+        die "Plugin projects require --parent <platform-name>."
+    fi
+    if [ "$type" != "platform" ] && [ "$parent" != "-" ]; then
+        read_project "$parent" >/dev/null || die "Parent project '$parent' not found in registry."
+    fi
+    if [ "$type" = "plugin-embedded" ] && [ "$plugin_dir" = "-" ]; then
+        die "Embedded plugins require --plugin-dir <relative-path>."
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$type" "$proj_path" "$parent" "$plugin_dir" \
+        >> "$SWCTL_PROJECTS_FILE"
+    ok "Registered project '$name' ($type)."
+}
+
+remove_project_entry() {
+    local name="$1"
+    ensure_projects_file
+    if ! grep -qE "^${name}	" "$SWCTL_PROJECTS_FILE" 2>/dev/null; then
+        die "Project '$name' not found in registry."
+    fi
+    local tmp="$SWCTL_PROJECTS_FILE.tmp"
+    grep -vE "^${name}	" "$SWCTL_PROJECTS_FILE" > "$tmp"
+    mv "$tmp" "$SWCTL_PROJECTS_FILE"
+    ok "Removed project '$name' from registry."
+}
+
+auto_register_project() {
+    # Auto-register the current project if not already in the registry
+    local slug="${SW_PROJECT_SLUG:-}"
+    [ -n "$slug" ] || return
+    ensure_projects_file
+    if ! grep -qE "^${slug}	" "$SWCTL_PROJECTS_FILE" 2>/dev/null; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$slug" "platform" "$PROJECT_ROOT" "-" "-" \
+            >> "$SWCTL_PROJECTS_FILE"
+    fi
+}
+
+resolve_plugin_name_from_composer() {
+    local composer_file="$1"
+    if [ -f "$composer_file" ]; then
+        # Extract the last segment of the composer name (e.g. "swag/commercial" → "SwagCommercial")
+        # Fallback to directory name
+        local dir_name
+        dir_name="$(basename "$(dirname "$composer_file")")"
+        printf '%s' "$dir_name"
+    fi
+}
+
+cmd_project() {
+    local action="${1:-list}"
+    shift || true
+    ensure_projects_file
+
+    case "$action" in
+        add)
+            local name="" proj_path="" type="platform" parent="-" plugin_dir="-"
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --type)       type="$2"; shift 2 ;;
+                    --parent)     parent="$2"; shift 2 ;;
+                    --plugin-dir) plugin_dir="$2"; shift 2 ;;
+                    *)
+                        if [ -z "$name" ]; then
+                            name="$1"
+                        elif [ -z "$proj_path" ] || [ "$proj_path" = "" ]; then
+                            proj_path="$1"
+                        fi
+                        shift
+                        ;;
+                esac
+            done
+            [ -n "$name" ] || die "Usage: swctl project add <name> <path> --type <type> [--parent <name>] [--plugin-dir <dir>]"
+            [ -n "$proj_path" ] || die "Usage: swctl project add <name> <path> --type <type> [--parent <name>] [--plugin-dir <dir>]"
+            # Resolve to absolute path
+            if [ -d "$proj_path" ]; then
+                proj_path="$(cd "$proj_path" && pwd -P)"
+            fi
+            case "$proj_path" in
+                /*) ;; # absolute path — OK
+                *)  die "Path must be absolute: $proj_path" ;;
+            esac
+            [ -d "$proj_path/.git" ] || warn "Not a git repository: $proj_path (path may not be mounted yet)"
+            add_project_entry "$name" "$type" "$proj_path" "$parent" "$plugin_dir"
+            ;;
+
+        list)
+            local entries
+            entries="$(list_projects)"
+            if [ -z "$entries" ]; then
+                info "No projects registered. Use 'swctl project add' or 'swctl project init'."
+                return
+            fi
+            printf "${COLOR_BOLD}%-20s %-18s %-40s %-12s %-30s${COLOR_RESET}\n" \
+                "NAME" "TYPE" "PATH" "PARENT" "PLUGIN DIR"
+            printf '%.0s─' {1..120}; printf '\n'
+            while IFS=$'\t' read -r p_name p_type p_path p_parent p_pdir; do
+                printf "%-20s %-18s %-40s %-12s %-30s\n" \
+                    "$p_name" "$p_type" "$p_path" "$p_parent" "$p_pdir"
+            done <<< "$entries"
+            ;;
+
+        remove)
+            local name="${1:-}"
+            [ -n "$name" ] || die "Usage: swctl project remove <name>"
+            remove_project_entry "$name"
+            ;;
+
+        init)
+            maybe_load_project_config >/dev/null 2>&1 || die "Run from a project directory with .swctl.conf."
+            auto_register_project
+            local plugins_dir="$PROJECT_ROOT/custom/plugins"
+            [ -d "$plugins_dir" ] || { info "No custom/plugins directory found."; return; }
+            local count=0
+            for plugin_path in "$plugins_dir"/*/; do
+                [ -d "$plugin_path" ] || continue
+                local pname
+                pname="$(basename "$plugin_path")"
+                [ "$pname" = "*" ] && continue
+                [ -f "$plugin_path/composer.json" ] || continue
+                if [ -d "$plugin_path/.git" ]; then
+                    # Plugin has its own git repo — discovered dynamically via --plugin flag
+                    info "Found plugin with own repo: $pname (use --plugin $pname with create)"
+                    count=$((count + 1))
+                else
+                    # Plugin is part of platform repo — register as embedded
+                    local slug
+                    slug="$(sanitize_slug "$pname")"
+                    if grep -qE "^${slug}	" "$SWCTL_PROJECTS_FILE" 2>/dev/null; then
+                        info "Already registered: $slug"
+                        continue
+                    fi
+                    local rel_path="custom/plugins/$pname"
+                    printf '%s\t%s\t%s\t%s\t%s\n' "$slug" "plugin-embedded" "$PROJECT_ROOT" "$SW_PROJECT_SLUG" "$rel_path" \
+                        >> "$SWCTL_PROJECTS_FILE"
+                    ok "Registered embedded plugin: $slug ($rel_path)"
+                    count=$((count + 1))
+                fi
+            done
+            info "Discovered $count plugin(s)."
+            ;;
+
+        plugins)
+            local proj_name="${1:-}"
+            [ -n "$proj_name" ] || die "Usage: swctl project plugins <project-name>"
+            local entry
+            entry="$(read_project "$proj_name")" || die "Project '$proj_name' not found."
+            local proj_path
+            proj_path="$(read_project_field "$entry" path)"
+            list_available_plugins "$proj_path"
+            ;;
+
+        *)
+            die "Usage: swctl project [add|list|remove|init|plugins]"
+            ;;
+    esac
 }
 
 container_exists() {
@@ -625,7 +833,13 @@ create_worktree() {
     fi
 
     if [ -d "$WORKTREE_PATH" ]; then
-        die "Target worktree path already exists and is not a registered Git worktree: $WORKTREE_PATH"
+        # Check if this is a leftover from a failed/interrupted create
+        if [ "${STATUS:-}" = "creating" ] || [ "${STATUS:-}" = "failed" ]; then
+            warn "Cleaning up leftover directory from previous failed create: $WORKTREE_PATH"
+            git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || rm -rf "$WORKTREE_PATH"
+        else
+            die "Target worktree path already exists and is not a registered Git worktree: $WORKTREE_PATH"
+        fi
     fi
 
     if git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
@@ -660,20 +874,17 @@ sync_build_artifacts() {
         [ -f "$PROJECT_ROOT/$f" ] && cp "$PROJECT_ROOT/$f" "$WORKTREE_PATH/$f" 2>/dev/null || true
     done
 
-    # Build sync list based on what changed:
-    # - Always: public/bundles (62MB), public/theme (168MB), storefront vendor/dist (small)
-    # - Only if storefront changes: storefront node_modules (721MB)
-    # - Only if admin changes: admin node_modules (1.1GB)
+    # Build sync list — always include node_modules so watch:admin / watch:storefront
+    # work even when the branch has no JS changes (APFS clones are instant).
     local sync_dirs="public/theme public/bundles"
     sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/vendor"
     sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/dist"
-
-    if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
-        sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/node_modules"
-    fi
-    if [ "${ADMIN_CHANGES:-0}" -gt 0 ]; then
-        sync_dirs="$sync_dirs src/Administration/Resources/app/administration/node_modules"
-    fi
+    # Vite build output read by ViteFileAccessorDecorator (entrypoints.json + assets)
+    sync_dirs="$sync_dirs src/Administration/Resources/public"
+    sync_dirs="$sync_dirs src/Storefront/Resources/public"
+    # node_modules — always sync so watch:admin / watch:storefront work out of the box
+    sync_dirs="$sync_dirs src/Administration/Resources/app/administration/node_modules"
+    sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/node_modules"
 
     local dir
     for dir in $sync_dirs; do
@@ -893,16 +1104,36 @@ write_compose_volume_override() {
         fi
     } > "$COMPOSE_VOLUME_OVERRIDE"
 
+    local svc="${SW_SERVICE_NAME:-web}"
+    local extra_volumes=""
+
     # QA mode: mount vendor from trunk as read-only bind (symlinks don't work in Docker)
     if [ "$SWCTL_MODE" = "qa" ] && [ -d "$PROJECT_ROOT/vendor" ]; then
-        local svc="${SW_SERVICE_NAME:-web}"
-        cat >> "$COMPOSE_VOLUME_OVERRIDE" <<QAEOF
+        extra_volumes="${extra_volumes}      - ${PROJECT_ROOT}/vendor:/var/www/html/vendor:ro
+"
+    fi
 
-services:
-  ${svc}:
-    volumes:
-      - ${PROJECT_ROOT}/vendor:/var/www/html/vendor:ro
-QAEOF
+    # Plugin mounts: bind-mount external plugin worktrees into custom/plugins/
+    if [ -n "${PLUGIN_WORKTREE_PATHS:-}" ] && [ -n "${LINKED_PLUGINS:-}" ]; then
+        local saved_ifs="$IFS"
+        IFS=','
+        local pw_arr=($PLUGIN_WORKTREE_PATHS)
+        local pl_arr=($LINKED_PLUGINS)
+        IFS="$saved_ifs"
+        local i
+        for i in "${!pw_arr[@]}"; do
+            local pw_path="${pw_arr[$i]}"
+            local p_name="${pl_arr[$i]}"
+            if [ -n "$pw_path" ] && [ -d "$pw_path" ] && [ -n "$p_name" ]; then
+                extra_volumes="${extra_volumes}      - ${pw_path}:/var/www/html/custom/plugins/${p_name}:cached
+"
+            fi
+        done
+    fi
+
+    if [ -n "$extra_volumes" ]; then
+        printf '\nservices:\n  %s:\n    volumes:\n%s' "$svc" "$extra_volumes" \
+            >> "$COMPOSE_VOLUME_OVERRIDE"
     fi
 }
 
@@ -966,8 +1197,76 @@ exec_in_container() {
     if [ -t 0 ] && [ -t 1 ]; then
         docker exec -it "$container_id" bash -lc "$command_string"
     else
-        docker exec "$container_id" bash -lc "$command_string"
+        # Non-interactive: wrap command to track PID so it can be killed remotely.
+        # docker exec does NOT kill the container process when the client dies.
+        docker exec "$container_id" bash -c '
+            bash -lc "$1" &
+            child=$!
+            echo "$child" > /tmp/.swctl-exec.pid
+            wait "$child" 2>/dev/null
+            code=$?
+            rm -f /tmp/.swctl-exec.pid
+            exit $code
+        ' _ "$command_string"
     fi
+}
+
+cmd_kill_exec() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || return 1
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input" 2>/dev/null)" || return 1
+    load_instance_metadata "$meta_file"
+
+    local container_id
+    container_id="$(app_container_id "$COMPOSE_PROJECT" 2>/dev/null)" || return 1
+    [ -n "$container_id" ] || return 1
+
+    # Kill all processes spawned by swctl exec / watch commands.
+    # docker exec orphans get reparented to PID 0 or 1. BusyBox ps shows
+    # "MainThread" for node, so we can't rely on comm names. Instead:
+    # 1. Kill tracked PID tree via /proc
+    # 2. Kill any orphaned process (PPID 0) that isn't a core service
+    docker exec "$container_id" sh -c '
+        kill_tree() {
+            local pid=$1
+            # Kill children first (depth-first)
+            for child in $(ps -o pid,ppid 2>/dev/null | awk -v p="$pid" "\$2==p {print \$1}"); do
+                kill_tree "$child"
+            done
+            kill -TERM "$pid" 2>/dev/null
+        }
+
+        # 1. Kill tracked PID tree
+        pid=$(cat /tmp/.swctl-exec.pid 2>/dev/null)
+        rm -f /tmp/.swctl-exec.pid
+        [ -n "$pid" ] && kill_tree "$pid"
+
+        # 2. Kill orphaned exec processes (PPID 0, not core services)
+        #    Core services: PID 1 (supervisord), caddy, php-fpm, ps itself
+        for p in $(ps -o pid,ppid,comm 2>/dev/null | awk "\$2==0 && \$1!=1 {print \$1}"); do
+            # Read cmdline to check if it is a core service
+            cmdline=$(cat /proc/$p/cmdline 2>/dev/null | tr "\0" " ")
+            case "$cmdline" in
+                *supervisord*|*caddy*|*php-fpm*|*ps*) continue ;;
+            esac
+            kill_tree "$p"
+        done
+
+        sleep 1
+
+        # 3. Force kill any survivors
+        for p in $(ps -o pid,ppid 2>/dev/null | awk "\$2==0 && \$1!=1 {print \$1}"); do
+            cmdline=$(cat /proc/$p/cmdline 2>/dev/null | tr "\0" " ")
+            case "$cmdline" in
+                *supervisord*|*caddy*|*php-fpm*|*ps*) continue ;;
+            esac
+            kill -9 "$p" 2>/dev/null
+        done
+    ' 2>/dev/null || true
+    ok "Killed exec process for '$issue_input'."
 }
 
 run_app_command() {
@@ -1105,32 +1404,77 @@ run_install_command() {
     ensure_install_lock "$compose_project"
 }
 
+install_admin_deps_if_needed() {
+    local compose_project="$1"
+    local admin_pkg="src/Administration/Resources/app/administration/package.json"
+    local storefront_pkg="src/Storefront/Resources/app/storefront/package.json"
+
+    # If worktree's admin/storefront package.json differs from trunk's, the cloned
+    # node_modules from trunk is missing new deps. Run npm install inside the container.
+    local needs_admin=0 needs_storefront=0
+
+    if [ -f "$WORKTREE_PATH/$admin_pkg" ] && [ -f "$PROJECT_ROOT/$admin_pkg" ]; then
+        if ! diff -q "$PROJECT_ROOT/$admin_pkg" "$WORKTREE_PATH/$admin_pkg" >/dev/null 2>&1; then
+            needs_admin=1
+        fi
+    fi
+    if [ -f "$WORKTREE_PATH/$storefront_pkg" ] && [ -f "$PROJECT_ROOT/$storefront_pkg" ]; then
+        if ! diff -q "$PROJECT_ROOT/$storefront_pkg" "$WORKTREE_PATH/$storefront_pkg" >/dev/null 2>&1; then
+            needs_storefront=1
+        fi
+    fi
+
+    if [ "$needs_admin" -eq 1 ]; then
+        info "Admin package.json differs from trunk. Running npm install for admin."
+        run_app_command "$compose_project" "cd src/Administration/Resources/app/administration && npm install --no-audit --no-fund" \
+            || warn "Admin npm install failed."
+    fi
+    if [ "$needs_storefront" -eq 1 ]; then
+        info "Storefront package.json differs from trunk. Running npm install for storefront."
+        run_app_command "$compose_project" "cd src/Storefront/Resources/app/storefront && npm install --no-audit --no-fund" \
+            || warn "Storefront npm install failed."
+    fi
+}
+
 run_frontend_build_if_needed() {
     local compose_project="$1"
+    local is_first_create="${2:-0}"
 
-    # Both QA and Dev: auto-detect what changed and build only that.
-    local needs_bundle_dump=0
+    # Install missing deps when worktree's package.json diverged from trunk
+    install_admin_deps_if_needed "$compose_project"
 
-    if [ "${ADMIN_CHANGES:-0}" -gt 0 ] || [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
-        needs_bundle_dump=1
+    local needs_admin_build=0
+    local needs_storefront_build=0
+
+    # Only build if actual code changes — synced artifacts from trunk handle the baseline.
+    if [ "${ADMIN_CHANGES:-0}" -gt 0 ]; then
+        needs_admin_build=1
+    fi
+    if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
+        needs_storefront_build=1
     fi
 
-    if [ "$needs_bundle_dump" -eq 1 ]; then
+    if [ "$needs_admin_build" -eq 1 ] || [ "$needs_storefront_build" -eq 1 ]; then
         info "Frontend changes detected. Running bundle:dump."
         run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" || warn "bundle:dump failed."
-    fi
 
-    if [ "${ADMIN_CHANGES:-0}" -gt 0 ]; then
-        info "Admin changes detected. Running composer build:js:admin."
-        run_app_command "$compose_project" "composer build:js:admin" || warn "Admin JS build failed."
-    fi
-
-    if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
-        info "Storefront changes detected. Running composer build:js:storefront."
-        run_app_command "$compose_project" "composer build:js:storefront" || warn "Storefront JS build failed."
-    fi
-
-    if [ "$needs_bundle_dump" -eq 0 ]; then
+        if [ "$needs_admin_build" -eq 1 ] && [ "$needs_storefront_build" -eq 1 ]; then
+            # Build admin and storefront in parallel
+            info "Admin + Storefront changes detected. Building both in parallel."
+            run_app_command "$compose_project" "composer build:js:admin" &
+            local admin_pid=$!
+            run_app_command "$compose_project" "composer build:js:storefront" &
+            local storefront_pid=$!
+            wait "$admin_pid" || warn "Admin JS build failed."
+            wait "$storefront_pid" || warn "Storefront JS build failed."
+        elif [ "$needs_admin_build" -eq 1 ]; then
+            info "Admin changes detected. Running composer build:js:admin."
+            run_app_command "$compose_project" "composer build:js:admin" || warn "Admin JS build failed."
+        else
+            info "Storefront changes detected. Running composer build:js:storefront."
+            run_app_command "$compose_project" "composer build:js:storefront" || warn "Storefront JS build failed."
+        fi
+    else
         # No frontend changes — register synced assets. Skip full JS builds.
         run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" 2>/dev/null || true
         run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" 2>/dev/null || true
@@ -1212,35 +1556,83 @@ provision_database_and_app() {
     run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
 }
 
-cmd_create() {
-    SWCTL_MODE="${SWCTL_MODE:-dev}"
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --qa)  SWCTL_MODE="qa"; shift ;;
-            --dev) SWCTL_MODE="dev"; shift ;;
-            *)     break ;;
-        esac
-    done
-    ISSUE="${1:-}"
-    BRANCH="${2:-}"
-    [ -n "$ISSUE" ] || die "Usage: swctl create [--qa|--dev] <issue> [<branch>]"
+resolve_project_context() {
+    local project_name="${1:-}"
+    PROJECT_TYPE="platform"
+    PLUGIN_NAME=""
+    PLUGIN_REPO_PATH=""
+    PLUGIN_DIR=""
+    PLUGIN_WORKTREE_PATH=""
+    LINKED_PLUGINS=""
+    PLUGIN_WORKTREE_PATHS=""
+    PLATFORM_WORKTREE_PATH=""
+    PLATFORM_ISSUE_ID=""
 
-    if [ -z "$BRANCH" ]; then
-        if [ "$SWCTL_MODE" = "qa" ]; then
-            die "QA mode requires a branch: swctl create --qa <issue> <branch>"
-        fi
-        # Dev mode: prompt for new branch name
-        BRANCH="$(prompt_text "New branch name for issue '$ISSUE'")"
-        [ -n "$BRANCH" ] || die "Branch name cannot be empty."
-        info "Will create new branch '$BRANCH' from ${SW_BASE_BRANCH:-trunk}."
+    SELECTED_PROJECT_PATH=""
+    [ -n "$project_name" ] || return 0
+    local entry
+    entry="$(read_project "$project_name")" || die "Project '$project_name' not registered. Run 'swctl project list' to see available projects."
+
+    PROJECT_TYPE="$(read_project_field "$entry" type)"
+    local proj_path parent plugin_dir
+    proj_path="$(read_project_field "$entry" path)"
+    SELECTED_PROJECT_PATH="$proj_path"
+    parent="$(read_project_field "$entry" parent)"
+    plugin_dir="$(read_project_field "$entry" plugin_dir)"
+
+    case "$PROJECT_TYPE" in
+        plugin-external)
+            PLUGIN_NAME="$(basename "$proj_path")"
+            PLUGIN_REPO_PATH="$proj_path"
+            local parent_entry
+            parent_entry="$(read_project "$parent")" || die "Parent project '$parent' not found."
+            PARENT_PROJECT_ROOT="$(read_project_field "$parent_entry" path)"
+            PARENT_PROJECT_SLUG="$(read_project_field "$parent_entry" name)"
+            ;;
+        plugin-embedded)
+            PLUGIN_NAME="$(basename "$plugin_dir")"
+            PLUGIN_DIR="$plugin_dir"
+            ;;
+    esac
+}
+
+activate_plugin() {
+    local compose_project="$1" plugin_name="$2"
+    info "Activating plugin: $plugin_name"
+    run_app_command "$compose_project" \
+        "$SW_BIN_CONSOLE plugin:refresh" || warn "plugin:refresh failed."
+    run_app_command "$compose_project" \
+        "$SW_BIN_CONSOLE plugin:install --activate $plugin_name" \
+        || warn "Plugin activation failed for '$plugin_name'."
+}
+
+ensure_platform_worktree() {
+    # For external plugins: create or reuse a platform worktree from the parent project.
+    # Sets PLATFORM_WORKTREE_PATH, loads parent config, and provisions if new.
+    local issue_id="$1"
+    local branch="$2"
+    local parent_meta
+    parent_meta="$(instance_dir "$PARENT_PROJECT_SLUG")/${issue_id}.env"
+
+    if [ -f "$parent_meta" ]; then
+        # Reuse existing platform worktree
+        local saved_project_type="$PROJECT_TYPE"
+        local saved_plugin_name="$PLUGIN_NAME"
+        local saved_plugin_repo="$PLUGIN_REPO_PATH"
+        load_instance_metadata "$parent_meta"
+        PLATFORM_WORKTREE_PATH="$WORKTREE_PATH"
+        PLATFORM_ISSUE_ID="$ISSUE_ID"
+        # Restore plugin context
+        PROJECT_TYPE="$saved_project_type"
+        PLUGIN_NAME="$saved_plugin_name"
+        PLUGIN_REPO_PATH="$saved_plugin_repo"
+        info "Reusing existing platform worktree: $PLATFORM_WORKTREE_PATH"
+        return 0
     fi
 
-    require_cmd git
-    ensure_docker
-    load_project_config
-    ensure_infra_ready
-
-    git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Project root is not a Git repository: $PROJECT_ROOT"
+    # Create new platform worktree by loading parent config and running the platform flow
+    info "Creating platform worktree for parent project '$PARENT_PROJECT_SLUG'."
+    load_project_config "$PARENT_PROJECT_ROOT/.swctl.conf"
 
     ISSUE_ID="$(sanitize_slug "$ISSUE")"
     WORKTREE_ID="$ISSUE_ID"
@@ -1261,31 +1653,321 @@ cmd_create() {
 
     create_worktree
 
-    # Check how far behind the branch is from trunk.
-    # The DB is cloned from current trunk — a stale branch may have schema mismatches.
-    check_branch_staleness
-
-    # Diff analysis drives the provisioning decision matrix:
-    # what changed determines DB strategy, volume sharing, and build steps.
-    DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
+    DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" 2>/dev/null || true)"
     count_changes "$DIFF_FILES"
-
-    # Resolve dependencies and sync assets AFTER diff analysis
     sync_build_artifacts
     sync_worktree_deps
     VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
     NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
 
-    info "Mode: ${SWCTL_MODE} | Diff: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
-    info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
-
     provision_database_and_app "$COMPOSE_PROJECT"
-    run_frontend_build_if_needed "$COMPOSE_PROJECT"
-    write_metadata "$(instance_file "$SW_PROJECT_SLUG" "$ISSUE_ID")"
+    run_frontend_build_if_needed "$COMPOSE_PROJECT" 1
 
-    ok "Worktree '${WORKTREE_ID}' is ready."
-    info "URL: ${APP_URL}"
-    info "Worktree: ${WORKTREE_PATH}"
+    PLATFORM_WORKTREE_PATH="$WORKTREE_PATH"
+    PLATFORM_ISSUE_ID="$ISSUE_ID"
+
+    # Write platform metadata (will be updated later with plugin linkage)
+    write_metadata "$(instance_file "$SW_PROJECT_SLUG" "$ISSUE_ID")"
+    ok "Platform worktree ready: $PLATFORM_WORKTREE_PATH"
+}
+
+list_available_plugins() {
+    # List plugins with their own git repo in <project_root>/custom/plugins/*
+    local project_root="$1"
+    local plugins_dir="$project_root/custom/plugins"
+    [ -d "$plugins_dir" ] || return 0
+    for plugin_path in "$plugins_dir"/*/; do
+        [ -d "$plugin_path" ] || continue
+        local pname
+        pname="$(basename "$plugin_path")"
+        [ "$pname" = "*" ] && continue
+        [ -f "$plugin_path/composer.json" ] || continue
+        if [ -d "$plugin_path/.git" ]; then
+            printf '%s\n' "$pname"
+        fi
+    done
+}
+
+cmd_create() {
+    SWCTL_MODE="${SWCTL_MODE:-dev}"
+    local selected_project=""
+    local selected_plugin=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --qa)      SWCTL_MODE="qa"; shift ;;
+            --dev)     SWCTL_MODE="dev"; shift ;;
+            --project) selected_project="$2"; shift 2 ;;
+            --plugin)  selected_plugin="$2"; shift 2 ;;
+            *)         break ;;
+        esac
+    done
+    export SWCTL_MODE
+    ISSUE="${1:-}"
+    BRANCH="${2:-}"
+    [ -n "$ISSUE" ] || die "Usage: swctl create [--qa|--dev] [--project <name>] [--plugin <name>] <issue> [<branch>]"
+
+    if [ -z "$BRANCH" ]; then
+        if [ "$SWCTL_MODE" = "qa" ]; then
+            die "QA mode requires a branch: swctl create --qa <issue> <branch>"
+        fi
+        # Dev mode: prompt for new branch name
+        BRANCH="$(prompt_text "New branch name for issue '$ISSUE'")"
+        [ -n "$BRANCH" ] || die "Branch name cannot be empty."
+        info "Will create new branch '$BRANCH' from ${SW_BASE_BRANCH:-trunk}."
+    fi
+
+    require_cmd git
+    ensure_docker
+
+    # Resolve project context (platform vs plugin)
+    resolve_project_context "$selected_project"
+
+    # If --plugin was given with a platform project, set up plugin-external context dynamically
+    if [ -n "$selected_plugin" ]; then
+        if [ "$PROJECT_TYPE" != "platform" ]; then
+            die "--plugin can only be used with a platform project, not '$PROJECT_TYPE'."
+        fi
+        local plugin_repo_path="${SELECTED_PROJECT_PATH:-$PROJECT_ROOT}/custom/plugins/$selected_plugin"
+        [ -d "$plugin_repo_path" ] || die "Plugin not found: $plugin_repo_path"
+        [ -d "$plugin_repo_path/.git" ] || die "Plugin '$selected_plugin' has no git repository at: $plugin_repo_path"
+        PROJECT_TYPE="plugin-external"
+        PLUGIN_NAME="$selected_plugin"
+        PLUGIN_REPO_PATH="$(cd "$plugin_repo_path" && pwd -P)"
+        # Read parent info from the platform project
+        local parent_entry
+        parent_entry="$(read_project "$selected_project")" || die "Project '$selected_project' not registered."
+        PARENT_PROJECT_ROOT="$(read_project_field "$parent_entry" path)"
+        PARENT_PROJECT_SLUG="$(read_project_field "$parent_entry" name)"
+    fi
+
+    # If --project was given, use the registered path to locate .swctl.conf
+    local project_config_arg=""
+    if [ -n "${SELECTED_PROJECT_PATH:-}" ]; then
+        project_config_arg="$SELECTED_PROJECT_PATH/.swctl.conf"
+    fi
+
+    case "$PROJECT_TYPE" in
+        plugin-external)
+            info "Plugin (external): $PLUGIN_NAME → parent: $PARENT_PROJECT_SLUG"
+            load_project_config "$PARENT_PROJECT_ROOT/.swctl.conf"
+            ensure_infra_ready
+
+            ISSUE_ID="$(sanitize_slug "$ISSUE")"
+
+            # Write early metadata for the plugin instance
+            local plugin_slug
+            plugin_slug="$(sanitize_slug "$PLUGIN_NAME")"
+            SWCTL_ACTIVE_META_FILE="$(instance_file "$plugin_slug" "$ISSUE_ID")"
+            STATUS="creating"
+            FAILED_AT=""
+            DB_NAME="${DB_NAME:-}"
+            DB_STATE="${DB_STATE:-}"
+            VENDOR_VOLUME="${VENDOR_VOLUME:-}"
+            NODE_MODULES_VOLUME="${NODE_MODULES_VOLUME:-}"
+            MIGRATION_CHANGES="${MIGRATION_CHANGES:-0}"
+            ENTITY_CHANGES="${ENTITY_CHANGES:-0}"
+            FRONTEND_CHANGES="${FRONTEND_CHANGES:-0}"
+            WORKTREE_PATH=""
+            write_metadata "$SWCTL_ACTIVE_META_FILE"
+
+            trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+
+            # 1. Create or reuse platform worktree
+            ensure_platform_worktree "$ISSUE" "$BRANCH"
+
+            # 2. Create plugin worktree from plugin repo
+            local plugin_issue_id
+            plugin_issue_id="$ISSUE_ID"
+            PLUGIN_WORKTREE_PATH="${SW_WORKTREE_ROOT}/${PLUGIN_NAME}-${plugin_issue_id}"
+
+            if [ ! -d "$PLUGIN_WORKTREE_PATH" ]; then
+                info "Creating plugin worktree: $PLUGIN_WORKTREE_PATH"
+                git -C "$PLUGIN_REPO_PATH" fetch --all --prune 2>/dev/null || true
+                if git -C "$PLUGIN_REPO_PATH" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+                    git -C "$PLUGIN_REPO_PATH" worktree add "$PLUGIN_WORKTREE_PATH" -b "swctl/${plugin_issue_id}" "origin/$BRANCH" 2>/dev/null \
+                        || git -C "$PLUGIN_REPO_PATH" worktree add "$PLUGIN_WORKTREE_PATH" "origin/$BRANCH" 2>/dev/null \
+                        || die "Failed to create plugin worktree."
+                elif git -C "$PLUGIN_REPO_PATH" rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+                    git -C "$PLUGIN_REPO_PATH" worktree add "$PLUGIN_WORKTREE_PATH" "$BRANCH" 2>/dev/null \
+                        || die "Failed to create plugin worktree."
+                else
+                    die "Branch '$BRANCH' not found in plugin repo: $PLUGIN_REPO_PATH"
+                fi
+                ok "Plugin worktree created: $PLUGIN_WORKTREE_PATH"
+            else
+                info "Plugin worktree already exists: $PLUGIN_WORKTREE_PATH"
+            fi
+
+            # 3. Track plugin linkage
+            LINKED_PLUGINS="$PLUGIN_NAME"
+            PLUGIN_WORKTREE_PATHS="$PLUGIN_WORKTREE_PATH"
+
+            # 4. Update compose override with plugin mount and restart container
+            write_compose_volume_override
+            local compose_files="-f $SW_COMPOSE_TEMPLATE"
+            [ -n "${COMPOSE_VOLUME_OVERRIDE:-}" ] && compose_files="$compose_files -f $COMPOSE_VOLUME_OVERRIDE"
+            compose --project-directory "$SWCTL_TMP_DIR" $compose_files --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d 2>/dev/null || warn "Container restart with plugin mount failed."
+
+            # 5. Activate plugin
+            activate_plugin "$COMPOSE_PROJECT" "$PLUGIN_NAME"
+
+            # 6. Write metadata for the plugin instance
+            STATUS="complete"
+            FAILED_AT=""
+            trap - EXIT
+            write_metadata "$SWCTL_ACTIVE_META_FILE"
+
+            # 7. Update platform metadata with linkage
+            local platform_meta
+            platform_meta="$(instance_file "$SW_PROJECT_SLUG" "$PLATFORM_ISSUE_ID")"
+            if [ -f "$platform_meta" ]; then
+                # Append plugin linkage to platform metadata
+                printf 'LINKED_PLUGINS=%q\n' "$LINKED_PLUGINS" >> "$platform_meta"
+                printf 'PLUGIN_WORKTREE_PATHS=%q\n' "$PLUGIN_WORKTREE_PATHS" >> "$platform_meta"
+            fi
+
+            ok "Plugin '$PLUGIN_NAME' is ready."
+            info "URL: ${APP_URL}"
+            info "Platform: ${PLATFORM_WORKTREE_PATH}"
+            info "Plugin: ${PLUGIN_WORKTREE_PATH}"
+            ;;
+
+        plugin-embedded)
+            info "Plugin (embedded): $PLUGIN_NAME"
+            load_project_config ${project_config_arg:+"$project_config_arg"}
+            ensure_infra_ready
+
+            git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Project root is not a Git repository: $PROJECT_ROOT"
+
+            ISSUE_ID="$(sanitize_slug "$ISSUE")"
+            WORKTREE_ID="$ISSUE_ID"
+            BASE_REF="$(git_base_ref)"
+            COMPOSE_PROJECT="$(sanitize_slug "${SW_PROJECT_SLUG}-${ISSUE_ID}")"
+
+            if [ "$SW_RUNTIME" = "orbstack" ]; then
+                DOMAIN="${SW_SERVICE_NAME}.${COMPOSE_PROJECT}.orb.local"
+                APP_URL="http://${DOMAIN}"
+            else
+                DOMAIN="${SW_PROJECT_SLUG}-${ISSUE_ID}.${SW_DOMAIN_SUFFIX}"
+                APP_URL="http://${DOMAIN}"
+            fi
+
+            TRAEFIK_ROUTER="$(sanitize_router_id "${SW_PROJECT_SLUG}_${ISSUE_ID}")"
+            TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
+            WORKTREE_PATH="${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}"
+
+            # Write early metadata so failed creates are tracked
+            SWCTL_ACTIVE_META_FILE="$(instance_file "$SW_PROJECT_SLUG" "$ISSUE_ID")"
+            STATUS="creating"
+            FAILED_AT=""
+            DB_NAME="${DB_NAME:-}"
+            DB_STATE="${DB_STATE:-}"
+            VENDOR_VOLUME="${VENDOR_VOLUME:-}"
+            NODE_MODULES_VOLUME="${NODE_MODULES_VOLUME:-}"
+            MIGRATION_CHANGES="${MIGRATION_CHANGES:-0}"
+            ENTITY_CHANGES="${ENTITY_CHANGES:-0}"
+            FRONTEND_CHANGES="${FRONTEND_CHANGES:-0}"
+            write_metadata "$SWCTL_ACTIVE_META_FILE"
+
+            trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+
+            create_worktree
+            check_branch_staleness
+
+            # Diff analysis — focus on plugin directory for change detection
+            DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
+            count_changes "$DIFF_FILES"
+
+            sync_build_artifacts
+            sync_worktree_deps
+            VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
+            NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
+
+            info "Mode: ${SWCTL_MODE} | Plugin: ${PLUGIN_NAME}"
+            info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
+
+            provision_database_and_app "$COMPOSE_PROJECT"
+            run_frontend_build_if_needed "$COMPOSE_PROJECT" 1
+            activate_plugin "$COMPOSE_PROJECT" "$PLUGIN_NAME"
+
+            STATUS="complete"
+            FAILED_AT=""
+            trap - EXIT
+            write_metadata "$SWCTL_ACTIVE_META_FILE"
+
+            ok "Worktree '${WORKTREE_ID}' with plugin '${PLUGIN_NAME}' is ready."
+            info "URL: ${APP_URL}"
+            info "Worktree: ${WORKTREE_PATH}"
+            ;;
+
+        platform|*)
+            # --- Original platform flow ---
+            load_project_config ${project_config_arg:+"$project_config_arg"}
+            ensure_infra_ready
+
+            git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Project root is not a Git repository: $PROJECT_ROOT"
+
+            ISSUE_ID="$(sanitize_slug "$ISSUE")"
+            WORKTREE_ID="$ISSUE_ID"
+            BASE_REF="$(git_base_ref)"
+            COMPOSE_PROJECT="$(sanitize_slug "${SW_PROJECT_SLUG}-${ISSUE_ID}")"
+
+            if [ "$SW_RUNTIME" = "orbstack" ]; then
+                DOMAIN="${SW_SERVICE_NAME}.${COMPOSE_PROJECT}.orb.local"
+                APP_URL="http://${DOMAIN}"
+            else
+                DOMAIN="${SW_PROJECT_SLUG}-${ISSUE_ID}.${SW_DOMAIN_SUFFIX}"
+                APP_URL="http://${DOMAIN}"
+            fi
+
+            TRAEFIK_ROUTER="$(sanitize_router_id "${SW_PROJECT_SLUG}_${ISSUE_ID}")"
+            TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
+            WORKTREE_PATH="${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}"
+
+            # Write early metadata so failed creates are tracked
+            SWCTL_ACTIVE_META_FILE="$(instance_file "$SW_PROJECT_SLUG" "$ISSUE_ID")"
+            STATUS="creating"
+            FAILED_AT=""
+            DB_NAME="${DB_NAME:-}"
+            DB_STATE="${DB_STATE:-}"
+            VENDOR_VOLUME="${VENDOR_VOLUME:-}"
+            NODE_MODULES_VOLUME="${NODE_MODULES_VOLUME:-}"
+            MIGRATION_CHANGES="${MIGRATION_CHANGES:-0}"
+            ENTITY_CHANGES="${ENTITY_CHANGES:-0}"
+            FRONTEND_CHANGES="${FRONTEND_CHANGES:-0}"
+            write_metadata "$SWCTL_ACTIVE_META_FILE"
+
+            # On any exit while STATUS=creating, mark as failed
+            trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+
+            create_worktree
+            check_branch_staleness
+
+            DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
+            count_changes "$DIFF_FILES"
+
+            sync_build_artifacts
+            sync_worktree_deps
+            VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
+            NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
+
+            info "Mode: ${SWCTL_MODE} | Diff: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
+            info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
+
+            provision_database_and_app "$COMPOSE_PROJECT"
+            run_frontend_build_if_needed "$COMPOSE_PROJECT" 1
+
+            # Mark complete and remove EXIT trap
+            STATUS="complete"
+            FAILED_AT=""
+            trap - EXIT
+            write_metadata "$SWCTL_ACTIVE_META_FILE"
+
+            ok "Worktree '${WORKTREE_ID}' is ready."
+            info "URL: ${APP_URL}"
+            info "Worktree: ${WORKTREE_PATH}"
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -1617,6 +2299,16 @@ cmd_exec() {
     maybe_load_project_config >/dev/null 2>&1 || true
     meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
     load_instance_metadata "$meta_file"
+
+    # Vite watch commands proxy /api to APP_URL, but inside the container
+    # APP_URL resolves to the container's own IP on port 80 while Caddy
+    # listens on port 8000. Override APP_URL for the Vite process only.
+    case "$command_string" in
+        *watch:admin*|*watch:storefront*|*"npm run dev"*)
+            command_string="APP_URL=http://localhost:8000 $command_string"
+            ;;
+    esac
+
     run_app_command "$COMPOSE_PROJECT" "$command_string"
 }
 
@@ -1663,15 +2355,121 @@ cmd_restart() {
     ok "Restarted '$ISSUE_ID'."
 }
 
+cmd_stop() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl stop <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    if [ -f "${COMPOSE_ENV_FILE:-}" ] && [ -f "${COMPOSE_TEMPLATE:-}" ]; then
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" ${COMPOSE_VOLUME_OVERRIDE:+-f "$COMPOSE_VOLUME_OVERRIDE"} --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" stop
+    else
+        local container_id
+        container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
+        [ -n "$container_id" ] || die "No container found for '$COMPOSE_PROJECT'."
+        docker stop "$container_id"
+    fi
+    ok "Stopped '$ISSUE_ID'."
+}
+
+cmd_start() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl start <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    if [ -f "${COMPOSE_ENV_FILE:-}" ] && [ -f "${COMPOSE_TEMPLATE:-}" ]; then
+        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" ${COMPOSE_VOLUME_OVERRIDE:+-f "$COMPOSE_VOLUME_OVERRIDE"} --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" start
+    else
+        local container_id
+        container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
+        [ -n "$container_id" ] || die "No container found for '$COMPOSE_PROJECT'."
+        docker start "$container_id"
+    fi
+    ok "Started '$ISSUE_ID'."
+}
+
 cmd_refresh() {
     local issue_input="${1:-}"
-    local meta_file=""
+    SWCTL_ACTIVE_META_FILE=""
 
     [ -n "$issue_input" ] || die "Usage: swctl refresh <issue>"
 
     maybe_load_project_config >/dev/null 2>&1 || true
-    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
-    load_instance_metadata "$meta_file"
+    SWCTL_ACTIVE_META_FILE="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$SWCTL_ACTIVE_META_FILE"
+
+    # Resume failed/interrupted creates
+    if [ "${STATUS:-complete}" = "failed" ] || [ "${STATUS:-complete}" = "creating" ]; then
+        info "Worktree '$ISSUE_ID' has status '${STATUS}'. Resuming provisioning..."
+        STATUS="creating"
+        load_project_config ${CONFIG_PATH:+"$CONFIG_PATH"}
+        ensure_infra_ready
+
+        # Recompute derived variables not stored in metadata
+        WORKTREE_ID="${WORKTREE_ID:-$ISSUE_ID}"
+        TRAEFIK_ROUTER="$(sanitize_router_id "${SW_PROJECT_SLUG}_${ISSUE_ID}")"
+        TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
+        if [ -z "${WORKTREE_PATH:-}" ]; then
+            WORKTREE_PATH="${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}"
+        fi
+        if [ -z "${DOMAIN:-}" ]; then
+            if [ "$SW_RUNTIME" = "orbstack" ]; then
+                DOMAIN="${SW_SERVICE_NAME}.${COMPOSE_PROJECT}.orb.local"
+            else
+                DOMAIN="${SW_PROJECT_SLUG}-${ISSUE_ID}.${SW_DOMAIN_SUFFIX}"
+            fi
+            APP_URL="http://${DOMAIN}"
+        fi
+
+        # On any exit while STATUS=creating, mark as failed
+        trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+
+        # 1. Ensure worktree exists
+        if [ -n "$WORKTREE_PATH" ] && [ ! -d "$WORKTREE_PATH" ]; then
+            create_worktree
+        fi
+
+        # 2. Re-compute diff and changes
+        BASE_REF="$(git_base_ref)"
+        DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" 2>/dev/null || true)"
+        count_changes "$DIFF_FILES"
+
+        # 3. Re-sync artifacts and deps
+        sync_build_artifacts
+        sync_worktree_deps
+        VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
+        NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
+
+        # 4. Re-provision DB + app
+        provision_database_and_app "$COMPOSE_PROJECT"
+
+        # 5. Frontend build
+        run_frontend_build_if_needed "$COMPOSE_PROJECT" 1
+
+        # 6. Activate plugin if needed
+        if [ -n "${PLUGIN_NAME:-}" ]; then
+            activate_plugin "$COMPOSE_PROJECT" "$PLUGIN_NAME"
+        fi
+
+        # 7. Mark complete
+        STATUS="complete"
+        FAILED_AT=""
+        trap - EXIT
+        write_metadata "$SWCTL_ACTIVE_META_FILE"
+
+        ok "Worktree '$ISSUE_ID' successfully provisioned."
+        info "URL: ${APP_URL}"
+        return
+    fi
+
+    # --- Normal refresh: pull + rebuild ---
 
     # Remember the old HEAD before pulling
     local old_head
@@ -1732,7 +2530,8 @@ cmd_refresh() {
     run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
 
     # Update metadata with new HEAD
-    write_metadata "$meta_file"
+    STATUS="complete"
+    write_metadata "$SWCTL_ACTIVE_META_FILE"
 
     ok "Refreshed '$ISSUE_ID'. Changes applied."
     info "URL: ${APP_URL}"
@@ -1760,25 +2559,73 @@ cmd_open() {
 }
 
 cmd_code() {
-    local issue_input="${1:-}"
+    local issue_input=""
+    local editor=""
     local meta_file=""
 
-    [ -n "$issue_input" ] || die "Usage: swctl code <issue>"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --claude)   editor="claude"; shift ;;
+            --codex)    editor="codex"; shift ;;
+            --phpstorm) editor="phpstorm"; shift ;;
+            --code)     editor="vscode"; shift ;;
+            --cursor)   editor="cursor"; shift ;;
+            *)          issue_input="$1"; shift ;;
+        esac
+    done
+
+    [ -n "$issue_input" ] || die "Usage: swctl code <issue> [--claude|--codex|--phpstorm|--code|--cursor]"
 
     maybe_load_project_config >/dev/null 2>&1 || true
     meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
     load_instance_metadata "$meta_file"
 
-    info "Opening '$WORKTREE_PATH' in PhpStorm."
-    if command -v phpstorm >/dev/null 2>&1; then
-        phpstorm "$WORKTREE_PATH"
-    elif command -v pstorm >/dev/null 2>&1; then
-        pstorm "$WORKTREE_PATH"
-    elif [ -x "$HOME/Library/Application Support/JetBrains/Toolbox/scripts/phpstorm" ]; then
-        "$HOME/Library/Application Support/JetBrains/Toolbox/scripts/phpstorm" "$WORKTREE_PATH"
-    else
-        warn "PhpStorm not found. Open manually: $WORKTREE_PATH"
-    fi
+    case "${editor:-phpstorm}" in
+        claude)
+            info "Opening '$WORKTREE_PATH' in Claude."
+            if [ -d "/Applications/Claude.app" ]; then
+                open -a Claude "$WORKTREE_PATH"
+            else
+                warn "Claude desktop app not found. Use CLI: cd '$WORKTREE_PATH' && claude"
+            fi
+            ;;
+        codex)
+            info "Opening '$WORKTREE_PATH' in Codex."
+            if command -v codex >/dev/null 2>&1; then
+                codex app "$WORKTREE_PATH"
+            else
+                warn "Codex not found. Install: npm i -g @anthropic-ai/codex"
+            fi
+            ;;
+        vscode)
+            info "Opening '$WORKTREE_PATH' in VS Code."
+            if command -v code >/dev/null 2>&1; then
+                code "$WORKTREE_PATH"
+            else
+                warn "VS Code not found."
+            fi
+            ;;
+        cursor)
+            info "Opening '$WORKTREE_PATH' in Cursor."
+            if command -v cursor >/dev/null 2>&1; then
+                cursor "$WORKTREE_PATH"
+            else
+                warn "Cursor not found."
+            fi
+            ;;
+        phpstorm|*)
+            info "Opening '$WORKTREE_PATH' in PhpStorm."
+            if command -v phpstorm >/dev/null 2>&1; then
+                phpstorm "$WORKTREE_PATH"
+            elif command -v pstorm >/dev/null 2>&1; then
+                pstorm "$WORKTREE_PATH"
+            elif [ -x "$HOME/Library/Application Support/JetBrains/Toolbox/scripts/phpstorm" ]; then
+                "$HOME/Library/Application Support/JetBrains/Toolbox/scripts/phpstorm" "$WORKTREE_PATH"
+            else
+                warn "PhpStorm not found. Open manually: $WORKTREE_PATH"
+            fi
+            ;;
+    esac
 }
 
 cmd_switch() {
@@ -1879,9 +2726,17 @@ remove_labeled_volumes() {
 
 cmd_clean() {
     local issue_input="${1:-}"
+    local force=0
     local meta_file=""
 
-    [ -n "$issue_input" ] || die "Usage: swctl clean <issue>"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force|-f) force=1; shift ;;
+            *)          issue_input="$1"; shift ;;
+        esac
+    done
+
+    [ -n "$issue_input" ] || die "Usage: swctl clean [--force] <issue>"
     maybe_load_project_config >/dev/null 2>&1 || true
 
     meta_file="$(resolve_instance_file_by_issue "$issue_input")" || {
@@ -1890,6 +2745,91 @@ cmd_clean() {
     }
 
     load_instance_metadata "$meta_file"
+
+    # Plugin-aware cleanup
+    case "${PROJECT_TYPE:-platform}" in
+        plugin-external)
+            # Clean plugin worktree
+            if [ -n "${PLUGIN_WORKTREE_PATHS:-}" ]; then
+                local saved_ifs="$IFS"
+                IFS=','
+                local pw_arr=($PLUGIN_WORKTREE_PATHS)
+                IFS="$saved_ifs"
+                for pw_path in "${pw_arr[@]}"; do
+                    if [ -d "$pw_path" ]; then
+                        # Find the plugin's git repo to remove the worktree properly
+                        local plugin_git_dir
+                        plugin_git_dir="$(git -C "$pw_path" rev-parse --git-common-dir 2>/dev/null || true)"
+                        if [ -n "$plugin_git_dir" ]; then
+                            git -C "$(dirname "$plugin_git_dir")" worktree remove --force "$pw_path" >/dev/null 2>&1 \
+                                || rm -rf "$pw_path" 2>/dev/null || true
+                        else
+                            rm -rf "$pw_path" 2>/dev/null || true
+                        fi
+                        ok "Removed plugin worktree: $pw_path"
+                    fi
+                done
+            fi
+
+            # Update parent platform metadata to remove linkage
+            if [ -n "${PLATFORM_ISSUE_ID:-}" ] && [ -n "${SW_PROJECT_SLUG:-}" ]; then
+                local platform_meta
+                platform_meta="$(instance_dir "$SW_PROJECT_SLUG")/${PLATFORM_ISSUE_ID}.env"
+                if [ -f "$platform_meta" ]; then
+                    # Remove LINKED_PLUGINS and PLUGIN_WORKTREE_PATHS from platform metadata
+                    local tmp_meta="${platform_meta}.tmp"
+                    grep -vE '^(LINKED_PLUGINS|PLUGIN_WORKTREE_PATHS)=' "$platform_meta" > "$tmp_meta" 2>/dev/null || true
+                    mv "$tmp_meta" "$platform_meta"
+                fi
+            fi
+
+            # Remove plugin metadata
+            rm -f "$meta_file"
+            ok "Cleaned plugin '${PLUGIN_NAME:-$ISSUE_ID}'."
+            return 0
+            ;;
+
+        platform)
+            # If platform has linked plugins, require --force
+            if [ -n "${LINKED_PLUGINS:-}" ] && [ "$force" -eq 0 ]; then
+                die "Platform worktree has linked plugins: ${LINKED_PLUGINS}. Use --force to clean all, or clean plugins first."
+            fi
+
+            # With --force, clean linked plugin metadata
+            if [ -n "${LINKED_PLUGINS:-}" ]; then
+                info "Cleaning linked plugins: ${LINKED_PLUGINS}"
+                local saved_ifs="$IFS"
+                IFS=','
+                local pl_arr=($LINKED_PLUGINS)
+                IFS="$saved_ifs"
+                for p_name in "${pl_arr[@]}"; do
+                    local p_slug
+                    p_slug="$(sanitize_slug "$p_name")"
+                    local p_meta
+                    p_meta="$(instance_dir "$p_slug")/${ISSUE_ID}.env"
+                    if [ -f "$p_meta" ]; then
+                        rm -f "$p_meta"
+                        ok "Removed plugin metadata: $p_slug/$ISSUE_ID"
+                    fi
+                done
+
+                # Clean plugin worktrees
+                if [ -n "${PLUGIN_WORKTREE_PATHS:-}" ]; then
+                    IFS=','
+                    local pw_arr=($PLUGIN_WORKTREE_PATHS)
+                    IFS="$saved_ifs"
+                    for pw_path in "${pw_arr[@]}"; do
+                        if [ -d "$pw_path" ]; then
+                            rm -rf "$pw_path" 2>/dev/null || true
+                            ok "Removed plugin worktree: $pw_path"
+                        fi
+                    done
+                fi
+            fi
+            ;;
+    esac
+
+    # Standard cleanup (containers, volumes, networks, DB, worktree)
 
     # 1. Stop and remove ALL containers belonging to this compose project
     local containers
@@ -2040,8 +2980,8 @@ EOF
     if command -v fzf >/dev/null 2>&1; then
         selected="$(cut -f1 "$choices_file" | fzf --prompt='Issue> ' --height=40% --reverse || true)"
     else
-        printf '%s\n' "Available issues:"
-        cut -f1 "$choices_file"
+        printf '%s\n' "Available issues:" >&2
+        cut -f1 "$choices_file" >&2
         selected="$(prompt_text "Enter issue id")"
     fi
 
@@ -2064,16 +3004,137 @@ render_tui_header() {
 }
 
 render_tui_menu() {
-    printf '%s\n' "[1] Init infra    [2] Create worktree    [3] Status"
-    printf '%s\n' "[4] Exec command  [5] Clean worktree     [6] Live dashboard"
-    printf '%s\n' "[7] Logs          [8] Restart            [9] Open in browser"
-    printf '%s\n' "[r] Refresh       [q] Quit"
+    printf '%s\n' "[1] Create worktree   [2] Instance detail   [3] Exec command"
+    printf '%s\n' "[4] Logs (follow)     [5] Stop container    [6] Start container"
+    printf '%s\n' "[7] Restart           [8] Refresh (pull)    [9] Switch mode"
+    printf '%s\n' "[0] Clean worktree    [o] Open in browser   [d] Live dashboard"
+    printf '%s\n' "[i] Init infra        [r] Reload            [q] Quit"
     printf '\n'
+}
+
+tui_select_project() {
+    local projects_list=""
+    projects_list="$(list_projects)"
+    if [ -z "$projects_list" ]; then
+        warn "No projects registered. Run 'swctl project add' first."
+        return 1
+    fi
+
+    local names=""
+    names="$(printf '%s\n' "$projects_list" | cut -f1)"
+    local count
+    count="$(printf '%s\n' "$names" | wc -l | tr -d ' ')"
+
+    if [ "$count" -eq 1 ]; then
+        printf '%s' "$names"
+        return
+    fi
+
+    if command -v fzf >/dev/null 2>&1; then
+        printf '%s\n' "$names" | fzf --prompt='Project> ' --height=40% --reverse || return 1
+    else
+        printf '%s\n' "Available projects:" >&2
+        local i=1
+        while IFS= read -r name; do
+            printf '  [%d] %s\n' "$i" "$name" >&2
+            i=$((i + 1))
+        done <<< "$names"
+        local choice
+        choice="$(prompt_text "Select project [1-$count]")"
+        printf '%s\n' "$names" | sed -n "${choice}p"
+    fi
+}
+
+tui_select_mode() {
+    if command -v fzf >/dev/null 2>&1; then
+        printf 'dev\nqa\n' | fzf --prompt='Mode> ' --height=20% --reverse || printf 'dev'
+    else
+        printf '%s\n' "  [1] dev  [2] qa" >&2
+        local choice
+        choice="$(prompt_text "Select mode [1-2]")"
+        case "$choice" in
+            2) printf 'qa' ;;
+            *) printf 'dev' ;;
+        esac
+    fi
+}
+
+tui_select_branch() {
+    local project_path="$1"
+    local mode="$2"
+
+    # Fetch both local and remote branches, dedup, sorted by recent commit
+    local branches=""
+    branches="$(git -C "$project_path" for-each-ref --sort=-committerdate \
+        --format='%(refname:short)' refs/heads/ refs/remotes/origin/ --count=200 2>/dev/null \
+        | sed 's|^origin/||' | grep -v '^HEAD$' | awk '!seen[$0]++' || true)"
+
+    if command -v fzf >/dev/null 2>&1 && [ -n "$branches" ]; then
+        local selected=""
+        selected="$(printf '%s\n' "$branches" | fzf --prompt='Branch> ' --height=40% --reverse --print-query | tail -1 || true)"
+        [ -n "$selected" ] && { printf '%s' "$selected"; return; }
+    fi
+
+    prompt_text "Branch name"
+}
+
+tui_select_plugin() {
+    local project_path="$1"
+    local plugins=""
+    plugins="$(list_available_plugins "$project_path")"
+    [ -n "$plugins" ] || return 0
+
+    # Add "none" option at the top
+    local options=""
+    options="$(printf '%s\n%s' "(none - platform only)" "$plugins")"
+
+    local selected=""
+    if command -v fzf >/dev/null 2>&1; then
+        selected="$(printf '%s\n' "$options" | fzf --prompt='Plugin (optional)> ' --height=40% --reverse || true)"
+    else
+        printf '%s\n' "Available plugins:" >&2
+        printf '  [0] (none - platform only)\n' >&2
+        local i=1
+        while IFS= read -r name; do
+            printf '  [%d] %s\n' "$i" "$name" >&2
+            i=$((i + 1))
+        done <<< "$plugins"
+        local choice
+        choice="$(prompt_text "Select plugin [0-$((i - 1))]")"
+        [ "$choice" = "0" ] && return 0
+        [ -n "$choice" ] && selected="$(printf '%s\n' "$plugins" | sed -n "${choice}p")"
+    fi
+
+    case "$selected" in
+        "(none"*|"") return 0 ;;
+        *) printf '%s' "$selected" ;;
+    esac
 }
 
 tui_create_flow() {
     local issue_input=""
     local branch_input=""
+    local project_input=""
+    local plugin_input=""
+    local mode_input=""
+
+    # Select project (platform only)
+    project_input="$(tui_select_project || true)"
+    [ -n "$project_input" ] || { warn "No project selected."; return; }
+
+    # Resolve project path
+    local project_path=""
+    project_path="$(list_projects | awk -F'\t' -v p="$project_input" '$1==p {print $3}')"
+
+    # Select plugin (optional — only for platform projects)
+    local project_type=""
+    project_type="$(list_projects | awk -F'\t' -v p="$project_input" '$1==p {print $2}')"
+    if [ "$project_type" = "platform" ]; then
+        plugin_input="$(tui_select_plugin "$project_path" || true)"
+    fi
+
+    # Select mode
+    mode_input="$(tui_select_mode)"
 
     issue_input="$(prompt_text "Issue id")"
     [ -n "$issue_input" ] || {
@@ -2081,13 +3142,21 @@ tui_create_flow() {
         return
     }
 
-    branch_input="$(prompt_text "Branch name")"
+    # Branch listing: use plugin repo if a plugin was selected
+    local branch_repo_path="$project_path"
+    if [ -n "$plugin_input" ]; then
+        branch_repo_path="$project_path/custom/plugins/$plugin_input"
+    fi
+
+    branch_input="$(tui_select_branch "$branch_repo_path" "$mode_input")"
     [ -n "$branch_input" ] || {
         warn "Branch name cannot be empty."
         return
     }
 
-    cmd_create "$issue_input" "$branch_input"
+    local create_args="--$mode_input --project $project_input"
+    [ -n "$plugin_input" ] && create_args="$create_args --plugin $plugin_input"
+    cmd_create $create_args "$issue_input" "$branch_input"
 }
 
 tui_exec_flow() {
@@ -2182,6 +3251,134 @@ tui_open_flow() {
     cmd_open "$issue_input"
 }
 
+tui_stop_flow() {
+    local scope="all"
+    if maybe_load_project_config >/dev/null 2>&1; then scope="project"; fi
+    local issue_input=""
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    [ -n "$issue_input" ] || { warn "No issue selected."; return; }
+    cmd_stop "$issue_input"
+}
+
+tui_start_flow() {
+    local scope="all"
+    if maybe_load_project_config >/dev/null 2>&1; then scope="project"; fi
+    local issue_input=""
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    [ -n "$issue_input" ] || { warn "No issue selected."; return; }
+    cmd_start "$issue_input"
+}
+
+tui_refresh_flow() {
+    local scope="all"
+    if maybe_load_project_config >/dev/null 2>&1; then scope="project"; fi
+    local issue_input=""
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    [ -n "$issue_input" ] || { warn "No issue selected."; return; }
+    cmd_refresh "$issue_input"
+}
+
+tui_switch_mode_flow() {
+    local scope="all"
+    if maybe_load_project_config >/dev/null 2>&1; then scope="project"; fi
+    local issue_input=""
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    [ -n "$issue_input" ] || { warn "No issue selected."; return; }
+    local mode=""
+    mode="$(tui_select_mode)"
+    cmd_switch "$issue_input" "--$mode"
+}
+
+tui_detail_flow() {
+    local scope="all"
+    if maybe_load_project_config >/dev/null 2>&1; then scope="project"; fi
+    local issue_input=""
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    [ -n "$issue_input" ] || { warn "No issue selected."; return; }
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || { warn "No worktree found for '$issue_input'."; return; }
+    load_instance_metadata "$meta_file"
+
+    local container_state=""
+    if [ -n "$(app_container_id "$COMPOSE_PROJECT" 2>/dev/null)" ]; then
+        container_state="running"
+    elif [ -n "$(app_container_exists_any_state "$COMPOSE_PROJECT" 2>/dev/null)" ]; then
+        container_state="stopped"
+    else
+        container_state="missing"
+    fi
+
+    local choice=""
+    while true; do
+        clear_screen
+        printf '%b── Instance: %s ──%b\n\n' "$COLOR_BOLD" "$ISSUE_ID" "$COLOR_RESET"
+        printf '  %-16s %s\n' "Issue:" "$ISSUE_ID"
+        printf '  %-16s %s\n' "Branch:" "${BRANCH:---}"
+        printf '  %-16s %s\n' "Base Ref:" "${BASE_REF:---}"
+        printf '  %-16s %s\n' "Mode:" "${SWCTL_MODE:-dev}"
+        printf '  %-16s %s (%s)\n' "Project:" "$PROJECT" "${PROJECT_TYPE:-platform}"
+        printf '  %-16s %s\n' "Domain:" "${DOMAIN:---}"
+        printf '  %-16s %s\n' "App URL:" "${APP_URL:---}"
+        printf '  %-16s %s (%s)\n' "Database:" "${DB_NAME:---}" "${DB_STATE:-unknown}"
+        printf '  %-16s %s\n' "Compose:" "${COMPOSE_PROJECT:---}"
+        printf '  %-16s %s\n' "Worktree:" "${WORKTREE_PATH:---}"
+        printf '  %-16s %b\n' "Container:" "$(status_label "$COMPOSE_PROJECT")"
+        printf '  %-16s %s\n' "Created:" "${CREATED_AT:---}"
+        [ -z "${PLUGIN_NAME:-}" ] || printf '  %-16s %s\n' "Plugin:" "$PLUGIN_NAME"
+        printf '\n'
+
+        printf '%s\n' "[l] Logs (follow)    [e] Exec command    [o] Open in browser"
+        if [ "$container_state" = "running" ]; then
+            printf '%s\n' "[s] Stop            [r] Restart         [w] Switch mode"
+        elif [ "$container_state" = "stopped" ]; then
+            printf '%s\n' "[s] Start           [r] Restart         [w] Switch mode"
+        fi
+        printf '%s\n' "[f] Refresh (pull)  [d] Delete          [b] Back"
+        printf '\n'
+        printf '%bAction: %b' "$COLOR_BLUE" "$COLOR_RESET"
+        read -r -n 1 choice
+        printf '\n\n'
+
+        case "$choice" in
+            l) show_cursor; cmd_logs "$ISSUE_ID" "--follow"; hide_cursor; pause_for_key ;;
+            e)
+                show_cursor
+                local cmd_str=""
+                cmd_str="$(prompt_text "Command")"
+                if [ -n "$cmd_str" ]; then
+                    cmd_exec "$ISSUE_ID" "$cmd_str"
+                fi
+                hide_cursor
+                pause_for_key
+                ;;
+            o) cmd_open "$ISSUE_ID"; pause_for_key ;;
+            s)
+                if [ "$container_state" = "running" ]; then
+                    cmd_stop "$ISSUE_ID"; container_state="stopped"
+                else
+                    cmd_start "$ISSUE_ID"; container_state="running"
+                fi
+                pause_for_key
+                ;;
+            r) cmd_restart "$ISSUE_ID"; pause_for_key ;;
+            w)
+                show_cursor
+                local new_mode=""
+                new_mode="$(tui_select_mode)"
+                cmd_switch "$ISSUE_ID" "--$new_mode"
+                hide_cursor
+                pause_for_key
+                ;;
+            f) cmd_refresh "$ISSUE_ID"; pause_for_key ;;
+            d) cmd_clean "$ISSUE_ID"; pause_for_key; return ;;
+            b|q) return ;;
+            *) warn "Unknown option: $choice"; pause_for_key ;;
+        esac
+    done
+}
+
 cmd_tui() {
     local choice=""
 
@@ -2194,20 +3391,24 @@ cmd_tui() {
         render_status_table "all"
         printf '\n'
         render_tui_menu
-        printf '%bChoose an action [1-9, r, q]: %b' "$COLOR_BLUE" "$COLOR_RESET"
+        printf '%bAction: %b' "$COLOR_BLUE" "$COLOR_RESET"
         read -r -n 1 choice
         printf '\n\n'
 
         case "$choice" in
-            1) init_infra; pause_for_key ;;
-            2) tui_create_flow; pause_for_key ;;
-            3) cmd_status; pause_for_key ;;
-            4) tui_exec_flow; pause_for_key ;;
-            5) tui_clean_flow; pause_for_key ;;
-            6) cmd_dashboard ;;
-            7) tui_logs_flow; pause_for_key ;;
-            8) tui_restart_flow; pause_for_key ;;
-            9) tui_open_flow; pause_for_key ;;
+            1) show_cursor; tui_create_flow; hide_cursor; pause_for_key ;;
+            2) tui_detail_flow ;;
+            3) show_cursor; tui_exec_flow; hide_cursor; pause_for_key ;;
+            4) show_cursor; tui_logs_flow; hide_cursor; pause_for_key ;;
+            5) show_cursor; tui_stop_flow; hide_cursor; pause_for_key ;;
+            6) show_cursor; tui_start_flow; hide_cursor; pause_for_key ;;
+            7) show_cursor; tui_restart_flow; hide_cursor; pause_for_key ;;
+            8) show_cursor; tui_refresh_flow; hide_cursor; pause_for_key ;;
+            9) show_cursor; tui_switch_mode_flow; hide_cursor; pause_for_key ;;
+            0) show_cursor; tui_clean_flow; hide_cursor; pause_for_key ;;
+            o|O) show_cursor; tui_open_flow; hide_cursor; pause_for_key ;;
+            d|D) cmd_dashboard ;;
+            i|I) init_infra; pause_for_key ;;
             r|R) ;;
             q|Q) break ;;
             *) warn "Unknown option: $choice"; pause_for_key ;;
@@ -2390,7 +3591,7 @@ Usage:
   swctl restart <issue>
   swctl refresh <issue>
   swctl open <issue>
-  swctl code <issue>
+  swctl code <issue> [--claude|--codex|--phpstorm|--code|--cursor]
   swctl switch <issue> --qa|--dev
   swctl clean <issue>
   swctl tui
@@ -2408,11 +3609,13 @@ Commands:
   restart     Restart the app container for a worktree without full recreate.
   refresh     Pull latest changes, detect what changed, rebuild only the delta.
   open        Open the worktree URL in the default browser.
-  code        Open the worktree in PhpStorm.
+  code        Open worktree in an editor: --phpstorm (default), --claude, --codex, --code, --cursor.
   switch      Switch a worktree between QA and Dev mode (rebuilds only what's needed).
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
   tui         Open the interactive ANSI dashboard.
   dashboard   Open the live monitoring dashboard.
+  ui          Start/stop the web UI (http://swctl.orb.local). Usage: swctl ui [start|stop|logs]
+  project     Manage registered projects: swctl project [add|list|remove|init]
   build-base  Pre-populate shared vendor and node_modules base volumes from the project root.
   clean-base  Remove shared base volumes for the current project.
 
@@ -2420,6 +3623,52 @@ Environment:
   swctl auto-detects .swctl.conf in the current directory or a parent directory.
   Set SWCTL_TEMPLATE_DIR if docker-compose.swctl.yml lives beside the installed binary.
 EOF
+}
+
+cmd_ui() {
+    local action="${1:-start}"
+    local ui_compose="$SWCTL_TEMPLATE_DIR/ui/docker-compose.ui.yml"
+    [ -f "$ui_compose" ] || die "UI compose file not found: $ui_compose"
+
+    # Try loading config from current dir, or fall back to first registered platform project
+    if ! maybe_load_project_config >/dev/null 2>&1; then
+        ensure_projects_file
+        local platform_entry
+        platform_entry="$(grep -E $'\tplatform\t' "$SWCTL_PROJECTS_FILE" | head -1)" || true
+        if [ -n "$platform_entry" ]; then
+            local platform_path
+            platform_path="$(printf '%s' "$platform_entry" | cut -f3)"
+            load_project_config "$platform_path/.swctl.conf"
+        else
+            die "No .swctl.conf found and no platform project registered. Run 'swctl project add' first."
+        fi
+    fi
+
+    export SWCTL_SCRIPT_DIR="$SWCTL_TEMPLATE_DIR"
+    export SWCTL_PROJECT_ROOT="$PROJECT_ROOT"
+    export SWCTL_WORKTREE_ROOT="$SW_WORKTREE_ROOT"
+    export SWCTL_STATE_DIR="$SWCTL_STATE_DIR"
+    export SW_TRUNK_NETWORK="${SW_TRUNK_NETWORK:-trunk_default}"
+    export SW_RUNTIME="${SW_RUNTIME:-$(detect_runtime)}"
+    export SWCTL_EDITOR="${SWCTL_EDITOR:-phpstorm}"
+    export SWCTL_BROWSE_ROOT="${SWCTL_BROWSE_ROOT:-$HOME}"
+
+    case "$action" in
+        start)
+            compose --project-directory "$SWCTL_TEMPLATE_DIR/ui" -f "$ui_compose" -p swctl-ui up -d --build
+            ok "swctl UI running at http://swctl.orb.local"
+            ;;
+        stop)
+            compose --project-directory "$SWCTL_TEMPLATE_DIR/ui" -f "$ui_compose" -p swctl-ui down
+            ok "swctl UI stopped."
+            ;;
+        logs)
+            compose --project-directory "$SWCTL_TEMPLATE_DIR/ui" -f "$ui_compose" -p swctl-ui logs -f
+            ;;
+        *)
+            die "Usage: swctl ui [start|stop|logs]"
+            ;;
+    esac
 }
 
 cmd_version() {
@@ -2468,6 +3717,21 @@ main() {
             shift
             cmd_restart "${1:-}"
             ;;
+        stop)
+            ensure_state_dirs
+            shift
+            cmd_stop "${1:-}"
+            ;;
+        start)
+            ensure_state_dirs
+            shift
+            cmd_start "${1:-}"
+            ;;
+        kill-exec)
+            ensure_state_dirs
+            shift
+            cmd_kill_exec "${1:-}"
+            ;;
         refresh)
             ensure_state_dirs
             shift
@@ -2481,7 +3745,7 @@ main() {
         code)
             ensure_state_dirs
             shift
-            cmd_code "${1:-}"
+            cmd_code "$@"
             ;;
         switch)
             ensure_state_dirs
@@ -2496,6 +3760,11 @@ main() {
             ensure_state_dirs
             cmd_dashboard
             ;;
+        ui)
+            ensure_state_dirs
+            shift
+            cmd_ui "${1:-start}"
+            ;;
         build-base)
             ensure_state_dirs
             cmd_build_base
@@ -2503,6 +3772,11 @@ main() {
         clean-base)
             ensure_state_dirs
             cmd_clean_base
+            ;;
+        project)
+            ensure_state_dirs
+            shift
+            cmd_project "$@"
             ;;
         --version|-v)
             cmd_version
