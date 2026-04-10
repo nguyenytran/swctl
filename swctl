@@ -1799,36 +1799,56 @@ cmd_clean() {
 
     load_instance_metadata "$meta_file"
 
-    if [ -f "$COMPOSE_ENV_FILE" ] && [ -f "$COMPOSE_TEMPLATE" ]; then
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" ${COMPOSE_VOLUME_OVERRIDE:+-f "$COMPOSE_VOLUME_OVERRIDE"} --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" down --remove-orphans >/dev/null || true
-        ok "Stopped compose project '$COMPOSE_PROJECT'."
-    else
-        local container_id
-        container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
-        if [ -n "$container_id" ]; then
-            docker rm -f "$container_id" >/dev/null || true
-            ok "Removed container '$COMPOSE_PROJECT'."
-        fi
+    # 1. Stop and remove ALL containers belonging to this compose project
+    local containers
+    containers="$(docker ps -aq --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" 2>/dev/null || true)"
+    if [ -n "$containers" ]; then
+        # shellcheck disable=SC2086
+        docker rm -f $containers >/dev/null 2>&1 || true
+        ok "Removed containers for '${COMPOSE_PROJECT}'."
     fi
 
+    # 2. Remove ALL volumes belonging to this compose project
+    local volumes
+    volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" 2>/dev/null || true)"
+    if [ -n "$volumes" ]; then
+        # shellcheck disable=SC2086
+        docker volume rm $volumes >/dev/null 2>&1 || true
+        ok "Removed compose volumes for '${COMPOSE_PROJECT}'."
+    fi
+
+    # Also remove any swctl-labeled volumes for this issue
     remove_labeled_volumes
 
-    # Every worktree gets its own cloned DB — always safe to drop.
-    local source_db
-    source_db="$(sanitize_db_identifier "${SW_DB_SHARED_NAME:-shopware}")"
-    if [ "$DB_NAME" != "$source_db" ]; then
-        mysql_exec "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" >/dev/null 2>&1 || warn "Could not drop database '${DB_NAME}'."
-        ok "Dropped database '${DB_NAME}'."
-    else
-        info "Database '${DB_NAME}' is the source database; leaving it in place."
+    # 3. Remove Docker networks created by this compose project
+    local networks
+    networks="$(docker network ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" 2>/dev/null || true)"
+    if [ -n "$networks" ]; then
+        # shellcheck disable=SC2086
+        docker network rm $networks >/dev/null 2>&1 || true
+        ok "Removed networks for '${COMPOSE_PROJECT}'."
     fi
 
+    # 4. Drop the cloned database (never touches the source)
+    local source_db
+    source_db="$(sanitize_db_identifier "${SW_DB_SHARED_NAME:-shopware}")"
+    if [ -n "$DB_NAME" ] && [ "$DB_NAME" != "$source_db" ]; then
+        mysql_exec "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" >/dev/null 2>&1 || warn "Could not drop database '${DB_NAME}'."
+        ok "Dropped database '${DB_NAME}'."
+    fi
+
+    # 5. Remove the git worktree
     if [ -d "$WORKTREE_PATH" ] && git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" >/dev/null 2>&1 || warn "Could not remove worktree '${WORKTREE_PATH}'."
         ok "Removed worktree '${WORKTREE_PATH}'."
     else
         info "Worktree path '${WORKTREE_PATH}' is already absent."
     fi
+
+    # 6. Clean up generated files in tmp
+    rm -f "$SWCTL_TMP_DIR/${COMPOSE_PROJECT}.compose.env" \
+          "$SWCTL_TMP_DIR/${COMPOSE_PROJECT}.volumes.override.yml" \
+          2>/dev/null || true
 
     rm -f "$meta_file"
     ok "Cleaned issue '${ISSUE_ID}'."
