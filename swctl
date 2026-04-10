@@ -1223,8 +1223,17 @@ cmd_create() {
     done
     ISSUE="${1:-}"
     BRANCH="${2:-}"
-    [ -n "$ISSUE" ] || die "Usage: swctl create [--qa|--dev] <issue> <branch>"
-    [ -n "$BRANCH" ] || die "Usage: swctl create [--qa|--dev] <issue> <branch>"
+    [ -n "$ISSUE" ] || die "Usage: swctl create [--qa|--dev] <issue> [<branch>]"
+
+    if [ -z "$BRANCH" ]; then
+        if [ "$SWCTL_MODE" = "qa" ]; then
+            die "QA mode requires a branch: swctl create --qa <issue> <branch>"
+        fi
+        # Dev mode: prompt for new branch name
+        BRANCH="$(prompt_text "New branch name for issue '$ISSUE'")"
+        [ -n "$BRANCH" ] || die "Branch name cannot be empty."
+        info "Will create new branch '$BRANCH' from ${SW_BASE_BRANCH:-trunk}."
+    fi
 
     require_cmd git
     ensure_docker
@@ -2373,7 +2382,7 @@ swctl ${SWCTL_VERSION}
 
 Usage:
   swctl init
-  swctl create [--qa|--dev] <issue> <branch>
+  swctl create [--qa|--dev] <issue> [<branch>]
   swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]
   swctl status
   swctl exec <issue> '<cmd>'
