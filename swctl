@@ -633,15 +633,27 @@ sync_gitignored_files() {
     # Sync gitignored build artifacts from project root (node_modules, storefront vendor, etc.)
     # These directories may exist as empty stubs (with .gitkeep) from the checkout,
     # so we check for actual content beyond .gitkeep.
-    for dir in \
-        src/Storefront/Resources/app/storefront/vendor \
-        src/Storefront/Resources/app/storefront/node_modules \
-        src/Storefront/Resources/app/storefront/dist \
-        src/Administration/Resources/app/administration/node_modules \
-        public/theme \
-        public/bundles \
-        var \
-    ; do
+    # Only sync what's needed based on diff analysis:
+    # - Always: public/bundles, public/theme, var (small, fast)
+    # - Storefront node_modules/vendor/dist: only if storefront changes detected
+    # - Admin node_modules: only if admin changes detected
+    local sync_dirs="public/theme public/bundles var"
+
+    if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ] || [ "${FRONTEND_CHANGES:-0}" -eq 0 ]; then
+        # Sync storefront assets if storefront changed OR if no frontend changes at all
+        # (need base assets for the storefront to render)
+        sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/vendor"
+        sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/dist"
+    fi
+    if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
+        sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/node_modules"
+    fi
+    if [ "${ADMIN_CHANGES:-0}" -gt 0 ]; then
+        sync_dirs="$sync_dirs src/Administration/Resources/app/administration/node_modules"
+    fi
+
+    local dir
+    for dir in $sync_dirs; do
         local src_dir="$PROJECT_ROOT/$dir"
         local dst_dir="$WORKTREE_PATH/$dir"
         # Only sync if source has real content and destination is empty/missing
