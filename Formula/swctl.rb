@@ -1,22 +1,31 @@
 class Swctl < Formula
-  desc "Manage Shopware 6 worktrees with Docker, Traefik, and an ANSI TUI"
-  homepage "https://github.com/your-org/swctl"
-  url "file:///Users/ytran/Shopware/swctl/dist/swctl-0.1.0.tar.gz"
-  sha256 "9d4213d527879d89706043a395efb580a8e44263fb28558240b62eeac5bcc725"
+  desc "Manage Shopware 6 worktrees with Docker, OrbStack, and an ANSI TUI"
+  homepage "https://github.com/nguyenytran/swctl"
+  url "https://github.com/nguyenytran/swctl/releases/download/v0.2.0/swctl-0.2.0.tar.gz"
+  sha256 "634fb5c31cb742f7022883f055e7cf0def0da835fdab25e512d0f85f303295d1"
   license "MIT"
-  version "0.1.0"
+  version "0.2.0"
 
   depends_on "docker"
   depends_on "git"
-  depends_on "mariadb"
 
   def install
     libexec.install "swctl"
-    bin.env_script_all_files(libexec, SWCTL_TEMPLATE_DIR: pkgshare)
-    pkgshare.install ".swctl.conf.example", "docker-compose.swctl.yml", "README.md"
+    chmod 0755, libexec/"swctl"
+    pkgshare.install ".swctl.conf.example",
+                     "docker-compose.swctl.yml",
+                     "docker-compose.swctl.orbstack.yml",
+                     "ui",
+                     "README.md"
 
-    # Placeholder for future shell completion support:
-    # bash_completion.install "completions/swctl.bash" => "swctl"
+    # Create a wrapper that sets SWCTL_TEMPLATE_DIR so swctl can find
+    # the compose templates and ui/ directory installed into pkgshare.
+    (bin/"swctl").write <<~SH
+      #!/bin/bash
+      export SWCTL_TEMPLATE_DIR="#{pkgshare}"
+      exec "#{libexec}/swctl" "$@"
+    SH
+    chmod 0755, bin/"swctl"
   end
 
   def caveats
@@ -24,11 +33,14 @@ class Swctl < Formula
       Copy the example config into your Shopware project root:
         cp #{pkgshare}/.swctl.conf.example /path/to/your/project/.swctl.conf
 
-      The bundled compose template lives at:
-        #{pkgshare}/docker-compose.swctl.yml
+      Compose templates are at:
+        #{pkgshare}/docker-compose.swctl.yml          (Traefik)
+        #{pkgshare}/docker-compose.swctl.orbstack.yml (OrbStack)
 
-      Update the `url` and `sha256` in Formula/swctl.rb when switching from local file testing
-      to GitHub Releases.
+      Start the web UI with:
+        swctl ui
+
+      Requires Docker (or OrbStack) to be installed and running.
     EOS
   end
 

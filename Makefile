@@ -1,5 +1,5 @@
 SHELL := /usr/bin/env bash
-VERSION ?= 0.1.0
+VERSION ?= 0.2.0
 DIST_DIR := dist
 PACKAGE := swctl-$(VERSION)
 ARTIFACT := $(DIST_DIR)/$(PACKAGE).tar.gz
@@ -16,7 +16,8 @@ release: validate
 	@mkdir -p $(DIST_DIR)
 	@tmpdir=$$(mktemp -d); \
 	  mkdir -p "$$tmpdir/$(PACKAGE)"; \
-	  cp swctl .swctl.conf.example docker-compose.swctl.yml README.md "$$tmpdir/$(PACKAGE)/"; \
+	  cp swctl .swctl.conf.example docker-compose.swctl.yml docker-compose.swctl.orbstack.yml README.md "$$tmpdir/$(PACKAGE)/"; \
+	  rsync -a --exclude='node_modules' --exclude='dist' --exclude='.vite' ui/ "$$tmpdir/$(PACKAGE)/ui/"; \
 	  tar -C "$$tmpdir" -czf "$(ARTIFACT)" "$(PACKAGE)"; \
 	  rm -rf "$$tmpdir"; \
 	  printf "Created %s\n" "$(ARTIFACT)"; \
