@@ -231,6 +231,17 @@ detect_template_path() {
     return 1
 }
 
+# Build the -f flag chain for docker compose: base template + project override + per-worktree override.
+# Supports both SW_COMPOSE_* (from config) and COMPOSE_* (from metadata) variable names.
+compose_file_args() {
+    local base="${SW_COMPOSE_TEMPLATE:-${COMPOSE_TEMPLATE:-}}"
+    local project_override="${SW_COMPOSE_PROJECT_OVERRIDE:-${COMPOSE_PROJECT_OVERRIDE:-}}"
+    local volume_override="${COMPOSE_VOLUME_OVERRIDE:-}"
+    printf '%s' "-f $base"
+    [ -n "$project_override" ] && [ -f "$project_override" ] && printf ' %s' "-f $project_override"
+    [ -n "$volume_override" ] && [ -f "$volume_override" ] && printf ' %s' "-f $volume_override"
+}
+
 load_project_config() {
     local config_path="${1:-}"
 
@@ -260,7 +271,7 @@ load_project_config() {
     SW_REDIS_URL="${SW_REDIS_URL:-redis://host.docker.internal:6379}"
     SW_MAILER_DSN="${SW_MAILER_DSN:-null://localhost}"
     SW_OPENSEARCH_URL="${SW_OPENSEARCH_URL:-}"
-    SW_TRUNK_NETWORK="${SW_TRUNK_NETWORK:-trunk_default}"
+    SW_PROJECT_NETWORK="${SW_PROJECT_NETWORK:-trunk_default}"
     SW_BIN_CONSOLE="${SW_BIN_CONSOLE:-bin/console}"
     SW_APP_HTTP_PORT="${SW_APP_HTTP_PORT:-8000}"
     SW_TRAEFIK_NETWORK="${SW_TRAEFIK_NETWORK:-swctl-proxy}"
@@ -281,6 +292,16 @@ load_project_config() {
         SW_SERVICE_NAME="web"
     fi
     SW_COMPOSE_TEMPLATE="$(detect_template_path)" || die "Could not find docker-compose.swctl.yml. Put it in the project root or export SWCTL_TEMPLATE_DIR."
+
+    # Project-level compose override (optional)
+    # Project-level compose override (optional, swctl-namespaced to avoid
+    # conflicts with the project's own compose.override.yaml)
+    SW_COMPOSE_PROJECT_OVERRIDE=""
+    if [ -f "$PROJECT_ROOT/docker-compose.swctl.override.yml" ]; then
+        SW_COMPOSE_PROJECT_OVERRIDE="$PROJECT_ROOT/docker-compose.swctl.override.yml"
+    elif [ -f "$PROJECT_ROOT/docker-compose.swctl.override.yaml" ]; then
+        SW_COMPOSE_PROJECT_OVERRIDE="$PROJECT_ROOT/docker-compose.swctl.override.yaml"
+    fi
 
     auto_register_project
 }
@@ -346,6 +367,7 @@ write_metadata() {
         printf 'COMPOSE_PROJECT=%q\n' "${COMPOSE_PROJECT:-}"
         printf 'COMPOSE_ENV_FILE=%q\n' "${COMPOSE_ENV_FILE:-}"
         printf 'COMPOSE_TEMPLATE=%q\n' "${SW_COMPOSE_TEMPLATE:-}"
+        printf 'COMPOSE_PROJECT_OVERRIDE=%q\n' "${SW_COMPOSE_PROJECT_OVERRIDE:-}"
         printf 'COMPOSE_VOLUME_OVERRIDE=%q\n' "${COMPOSE_VOLUME_OVERRIDE:-}"
         printf 'VENDOR_VOLUME=%q\n' "${VENDOR_VOLUME:-}"
         printf 'NODE_MODULES_VOLUME=%q\n' "${NODE_MODULES_VOLUME:-}"
@@ -649,11 +671,11 @@ start_or_create_container() {
 
 resolve_db_container() {
     # In OrbStack/trunk mode, find the DB container on the trunk network.
-    if [ -n "${SW_TRUNK_NETWORK:-}" ] && [ "$(detect_runtime)" = "orbstack" ]; then
+    if [ -n "${SW_PROJECT_NETWORK:-}" ] && [ "$(detect_runtime)" = "orbstack" ]; then
         local trunk_db
-        trunk_db="$(docker ps --filter "network=${SW_TRUNK_NETWORK}" --filter "ancestor=mariadb" --format '{{.Names}}' 2>/dev/null | head -1)"
+        trunk_db="$(docker ps --filter "network=${SW_PROJECT_NETWORK}" --filter "ancestor=mariadb" --format '{{.Names}}' 2>/dev/null | head -1)"
         if [ -z "$trunk_db" ]; then
-            trunk_db="$(docker ps --filter "network=${SW_TRUNK_NETWORK}" --format '{{.Names}}' 2>/dev/null | grep -i database | head -1)"
+            trunk_db="$(docker ps --filter "network=${SW_PROJECT_NETWORK}" --format '{{.Names}}' 2>/dev/null | grep -i database | head -1)"
         fi
         if [ -n "$trunk_db" ]; then
             printf '%s' "$trunk_db"
@@ -776,10 +798,10 @@ ensure_infra_ready() {
     else
         # OrbStack mode: worktrees connect to trunk's network.
         # Just verify the trunk network exists.
-        if [ -n "${SW_TRUNK_NETWORK:-}" ] && docker network inspect "$SW_TRUNK_NETWORK" >/dev/null 2>&1; then
-            ok "Trunk network '$SW_TRUNK_NETWORK' is available."
+        if [ -n "${SW_PROJECT_NETWORK:-}" ] && docker network inspect "$SW_PROJECT_NETWORK" >/dev/null 2>&1; then
+            ok "Project network '$SW_PROJECT_NETWORK' is available."
         else
-            warn "Trunk network '${SW_TRUNK_NETWORK:-trunk_default}' not found. Start your trunk project first: cd $PROJECT_ROOT && docker compose up -d"
+            warn "Project network '${SW_PROJECT_NETWORK:-trunk_default}' not found. Start your project first: cd $PROJECT_ROOT && docker compose up -d"
         fi
     fi
 }
@@ -1050,7 +1072,7 @@ SW_DB_ROOT_PASSWORD=${SW_DB_ROOT_PASSWORD}
 SW_REDIS_URL=${SW_REDIS_URL}
 SW_MAILER_DSN=${SW_MAILER_DSN}
 SW_OPENSEARCH_URL=${SW_OPENSEARCH_URL:-}
-SW_TRUNK_NETWORK=${SW_TRUNK_NETWORK:-trunk_default}
+SW_PROJECT_NETWORK=${SW_PROJECT_NETWORK:-trunk_default}
 SW_PROJECT_ROOT=${PROJECT_ROOT}
 SW_VENDOR_VOLUME=${VENDOR_VOLUME}
 SW_NODE_MODULES_VOLUME=${NODE_MODULES_VOLUME}
@@ -1106,6 +1128,24 @@ write_compose_volume_override() {
 
     local svc="${SW_SERVICE_NAME:-web}"
     local extra_volumes=""
+
+    # Share media/thumbnail from project root to avoid duplicating large assets.
+    # Use :ro when cloning an existing DB (media already matches), :cached for fresh installs
+    # (system:install needs to write media files).
+    if [ "$SW_RUNTIME" = "orbstack" ]; then
+        local media_mode="ro"
+        if [ "${DB_STATE:-}" = "fresh" ]; then
+            media_mode="cached"
+        fi
+        if [ -d "$PROJECT_ROOT/public/media" ]; then
+            extra_volumes="${extra_volumes}      - ${PROJECT_ROOT}/public/media:/var/www/html/public/media:${media_mode}
+"
+        fi
+        if [ -d "$PROJECT_ROOT/public/thumbnail" ]; then
+            extra_volumes="${extra_volumes}      - ${PROJECT_ROOT}/public/thumbnail:/var/www/html/public/thumbnail:${media_mode}
+"
+        fi
+    fi
 
     # QA mode: mount vendor from trunk as read-only bind (symlinks don't work in Docker)
     if [ "$SWCTL_MODE" = "qa" ] && [ -d "$PROJECT_ROOT/vendor" ]; then
@@ -1179,12 +1219,12 @@ app_container_exists_any_state() {
 wait_for_app_container() {
     local compose_project="$1"
     local attempt=0
-    while [ "$attempt" -lt 30 ]; do
+    while [ "$attempt" -lt 60 ]; do
         if [ -n "$(app_container_id "$compose_project")" ]; then
             return 0
         fi
         attempt=$((attempt + 1))
-        sleep 2
+        sleep 1
     done
 
     die "App container for '$compose_project' did not start in time."
@@ -1309,11 +1349,6 @@ bootstrap_dependencies() {
         info "Reusing existing vendor volume. Skipping composer install."
     fi
 
-    if [ "$vendor_needs_install" -eq 1 ]; then
-        run_app_command "$compose_project" "composer install --no-interaction" \
-            || warn "composer install failed. Continue after fixing the image or composer setup."
-    fi
-
     # --- Node modules ---
     package_install_cmd="$(detect_package_install_command "$WORKTREE_PATH" || true)"
     if [ -n "$package_install_cmd" ]; then
@@ -1328,11 +1363,23 @@ bootstrap_dependencies() {
         else
             info "Reusing existing node_modules volume. Skipping npm/pnpm install."
         fi
+    fi
 
-        if [ "$node_needs_install" -eq 1 ]; then
-            run_app_command "$compose_project" "$package_install_cmd" \
-                || warn "Frontend dependency install failed."
-        fi
+    # --- Run installs (in parallel when both needed) ---
+    if [ "$vendor_needs_install" -eq 1 ] && [ "$node_needs_install" -eq 1 ]; then
+        info "Running composer install and $package_install_cmd in parallel."
+        run_app_command "$compose_project" "composer install --no-interaction" &
+        local composer_pid=$!
+        run_app_command "$compose_project" "$package_install_cmd" &
+        local node_pid=$!
+        wait "$composer_pid" || warn "composer install failed."
+        wait "$node_pid" || warn "Frontend dependency install failed."
+    elif [ "$vendor_needs_install" -eq 1 ]; then
+        run_app_command "$compose_project" "composer install --no-interaction" \
+            || warn "composer install failed. Continue after fixing the image or composer setup."
+    elif [ "$node_needs_install" -eq 1 ]; then
+        run_app_command "$compose_project" "$package_install_cmd" \
+            || warn "Frontend dependency install failed."
     fi
 
     ensure_jwt_keys "$compose_project"
@@ -1440,6 +1487,12 @@ run_frontend_build_if_needed() {
     local compose_project="$1"
     local is_first_create="${2:-0}"
 
+    # QA mode: all frontend assets are synced from project root. No builds needed.
+    if [ "$SWCTL_MODE" = "qa" ]; then
+        info "QA mode: skipping frontend builds (using synced assets)."
+        return
+    fi
+
     # Install missing deps when worktree's package.json diverged from trunk
     install_admin_deps_if_needed "$compose_project"
 
@@ -1514,38 +1567,58 @@ provision_database_and_app() {
     # Every worktree gets its own cloned database (never touches the source).
     DB_NAME="$(sanitize_db_identifier "${SW_DB_NAME_PREFIX}_${ISSUE_ID}")"
 
-    # Write configs first (needed by both DB clone and compose up)
+    # Determine DB_STATE early so the compose override can adjust mount modes
+    # (fresh installs need writable media mounts for system:install).
+    if mysql_db_has_tables "$DB_NAME"; then
+        DB_STATE="cloned"
+    elif mysql_db_has_tables "$source_db"; then
+        DB_STATE="cloned"
+    else
+        DB_STATE="fresh"
+    fi
+
+    # Write configs (needed by both DB clone and compose up)
     write_env_file
     write_compose_env_file
     write_compose_volume_override
 
-    # Check DB state and start clone + container in parallel when possible
-    if mysql_db_has_tables "$DB_NAME"; then
-        DB_STATE="cloned"
+    # Clone DB and start container
+    if [ "$DB_STATE" = "fresh" ]; then
+        info "Source database '$source_db' is empty. Will run fresh install."
+        create_database "$DB_NAME"
+        compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+    elif mysql_db_has_tables "$DB_NAME"; then
         info "Database '$DB_NAME' already exists. Reusing."
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
-    elif mysql_db_has_tables "$source_db"; then
-        DB_STATE="cloned"
+        compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+    else
         # Clone DB in background while container starts
         clone_database "$source_db" "$DB_NAME" &
         local clone_pid=$!
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+        compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait "$clone_pid" || die "Database clone failed."
-    else
-        DB_STATE="fresh"
-        info "Source database '$source_db' is empty. Will run fresh install."
-        create_database "$DB_NAME"
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     fi
     wait_for_app_container "$COMPOSE_PROJECT"
 
-    # Both QA and Dev modes: fully automatic provisioning based on diff analysis.
-    # QA skips composer install (vendor bind-mounted from trunk).
-    # Dev runs composer install if dependencies changed.
+    if [ "$SWCTL_MODE" = "qa" ]; then
+        # QA mode: no console operations. Vendor, node_modules, and theme
+        # files are all synced/mounted from the project root. Just set up
+        # the domain and install lock so the app responds correctly.
+        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
+        ensure_install_lock "$COMPOSE_PROJECT"
+        return
+    fi
+
+    # Dev mode: fully automatic provisioning based on diff analysis.
     bootstrap_dependencies "$COMPOSE_PROJECT"
 
     if [ "$DB_STATE" = "fresh" ]; then
         run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
+        # Populate the shared DB so future worktrees can clone from it
+        # instead of running a full install every time.
+        if ! mysql_db_has_tables "$source_db"; then
+            info "Populating shared database '$source_db' from fresh install."
+            clone_database "$DB_NAME" "$source_db"
+        fi
     elif [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected. Running migrations on cloned database."
         run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE database:migrate --all && $SW_BIN_CONSOLE database:migrate-destructive --all" || warn "Migrations failed."
@@ -1553,7 +1626,25 @@ provision_database_and_app() {
 
     update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
     ensure_install_lock "$COMPOSE_PROJECT"
-    run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
+
+    # Batch post-provision commands to reduce docker exec overhead.
+    # - Fresh installs: system:install already runs theme:compile → just refresh + cache:clear
+    # - Cloned DB, no storefront changes: synced theme files are sufficient → refresh + cache:clear
+    # - Cloned DB, with storefront changes: run_frontend_build_if_needed handles rebuild → refresh + cache:clear
+    # - Only run full theme:compile when DB was cloned AND there are storefront changes AND
+    #   we need the compiled output before run_frontend_build_if_needed (edge case safety)
+    if [ "$DB_STATE" = "fresh" ]; then
+        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE theme:refresh 2>/dev/null; $SW_BIN_CONSOLE cache:clear" \
+            || warn "Post-provision commands failed."
+    elif [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
+        run_app_command "$COMPOSE_PROJECT" \
+            "$SW_BIN_CONSOLE theme:refresh 2>/dev/null; $SW_BIN_CONSOLE theme:compile --sync || echo '[WARN] theme:compile failed.'; $SW_BIN_CONSOLE cache:clear || echo '[WARN] cache:clear failed.'" \
+            || warn "Post-provision commands failed."
+    else
+        # Cloned DB, no storefront changes — synced theme files are correct.
+        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE theme:refresh 2>/dev/null; $SW_BIN_CONSOLE cache:clear" \
+            || warn "Post-provision commands failed."
+    fi
 }
 
 resolve_project_context() {
@@ -1604,6 +1695,27 @@ activate_plugin() {
     run_app_command "$compose_project" \
         "$SW_BIN_CONSOLE plugin:install --activate $plugin_name" \
         || warn "Plugin activation failed for '$plugin_name'."
+}
+
+setup_plugin_database() {
+    # Clone a separate DB for a plugin issue (no full provision — just the DB).
+    local source_db
+    source_db="$(sanitize_db_identifier "$SW_DB_SHARED_NAME")"
+    DB_NAME="$(sanitize_db_identifier "${SW_DB_NAME_PREFIX}_${ISSUE_ID}")"
+
+    if mysql_db_has_tables "$DB_NAME"; then
+        DB_STATE="cloned"
+        info "Database '$DB_NAME' already exists. Reusing."
+    elif mysql_db_has_tables "$source_db"; then
+        DB_STATE="cloned"
+        info "Cloning database '$source_db' → '$DB_NAME'..."
+        clone_database "$source_db" "$DB_NAME"
+        ok "Database cloned."
+    else
+        DB_STATE="fresh"
+        info "Source database '$source_db' is empty. Creating fresh database."
+        create_database "$DB_NAME"
+    fi
 }
 
 ensure_platform_worktree() {
@@ -1753,6 +1865,7 @@ cmd_create() {
             ensure_infra_ready
 
             ISSUE_ID="$(sanitize_slug "$ISSUE")"
+            WORKTREE_ID="$ISSUE_ID"
 
             # Write early metadata for the plugin instance
             local plugin_slug
@@ -1772,10 +1885,35 @@ cmd_create() {
 
             trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
 
-            # 1. Create or reuse platform worktree
-            ensure_platform_worktree "$ISSUE" "$BRANCH"
+            # Use trunk code — no platform git worktree needed
+            PLATFORM_WORKTREE_PATH="$PARENT_PROJECT_ROOT"
+            PLATFORM_ISSUE_ID="trunk"
+            WORKTREE_PATH="$PARENT_PROJECT_ROOT"
 
-            # 2. Create plugin worktree from plugin repo
+            # Each plugin issue gets its own compose project (separate container + DB)
+            COMPOSE_PROJECT="$(sanitize_slug "${plugin_slug}-${ISSUE_ID}")"
+
+            if [ "$SW_RUNTIME" = "orbstack" ]; then
+                DOMAIN="${SW_SERVICE_NAME}.${COMPOSE_PROJECT}.orb.local"
+                APP_URL="http://${DOMAIN}"
+            else
+                DOMAIN="${plugin_slug}-${ISSUE_ID}.${SW_DOMAIN_SUFFIX}"
+                APP_URL="http://${DOMAIN}"
+            fi
+            TRAEFIK_ROUTER="$(sanitize_router_id "${plugin_slug}_${ISSUE_ID}")"
+            TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
+
+            # 1. Clone a separate database for this plugin issue
+            setup_plugin_database
+
+            # 2. Reuse trunk's vendor/node_modules volumes
+            VENDOR_VOLUME="$(resolve_vendor_volume "base")"
+            NODE_MODULES_VOLUME="$(resolve_node_modules_volume "base")"
+
+            # 3. Write compose env file (passes DB_NAME, APP_URL, etc. to container)
+            write_compose_env_file
+
+            # 4. Create plugin worktree from plugin repo
             local plugin_issue_id
             plugin_issue_id="$ISSUE_ID"
             PLUGIN_WORKTREE_PATH="${SW_WORKTREE_ROOT}/${PLUGIN_NAME}-${plugin_issue_id}"
@@ -1798,38 +1936,42 @@ cmd_create() {
                 info "Plugin worktree already exists: $PLUGIN_WORKTREE_PATH"
             fi
 
-            # 3. Track plugin linkage
+            # 5. Track plugin linkage + write compose volume override (mounts plugin)
             LINKED_PLUGINS="$PLUGIN_NAME"
             PLUGIN_WORKTREE_PATHS="$PLUGIN_WORKTREE_PATH"
-
-            # 4. Update compose override with plugin mount and restart container
             write_compose_volume_override
-            local compose_files="-f $SW_COMPOSE_TEMPLATE"
-            [ -n "${COMPOSE_VOLUME_OVERRIDE:-}" ] && compose_files="$compose_files -f $COMPOSE_VOLUME_OVERRIDE"
-            compose --project-directory "$SWCTL_TMP_DIR" $compose_files --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d 2>/dev/null || warn "Container restart with plugin mount failed."
 
-            # 5. Activate plugin
+            # 6. Start container (new compose project: trunk code + plugin mount + cloned DB)
+            compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+            wait_for_app_container "$COMPOSE_PROJECT"
+
+            # 7. No write_env_file — DATABASE_URL is passed via compose environment
+            #    (avoids clobbering trunk's .env.local when multiple plugins run)
+
+            # 8. Run install/migrations if needed on the cloned DB
+            bootstrap_dependencies "$COMPOSE_PROJECT"
+            if [ "$DB_STATE" = "fresh" ]; then
+                run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
+            fi
+
+            # 9. Activate plugin
             activate_plugin "$COMPOSE_PROJECT" "$PLUGIN_NAME"
 
-            # 6. Write metadata for the plugin instance
+            update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
+            ensure_install_lock "$COMPOSE_PROJECT"
+            run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
+
+            # 10. Write final metadata
             STATUS="complete"
             FAILED_AT=""
             trap - EXIT
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            # 7. Update platform metadata with linkage
-            local platform_meta
-            platform_meta="$(instance_file "$SW_PROJECT_SLUG" "$PLATFORM_ISSUE_ID")"
-            if [ -f "$platform_meta" ]; then
-                # Append plugin linkage to platform metadata
-                printf 'LINKED_PLUGINS=%q\n' "$LINKED_PLUGINS" >> "$platform_meta"
-                printf 'PLUGIN_WORKTREE_PATHS=%q\n' "$PLUGIN_WORKTREE_PATHS" >> "$platform_meta"
-            fi
-
             ok "Plugin '$PLUGIN_NAME' is ready."
             info "URL: ${APP_URL}"
-            info "Platform: ${PLATFORM_WORKTREE_PATH}"
+            info "Platform: ${PLATFORM_WORKTREE_PATH} (trunk — no worktree)"
             info "Plugin: ${PLUGIN_WORKTREE_PATH}"
+            info "Database: ${DB_NAME}"
             ;;
 
         plugin-embedded)
@@ -1940,22 +2082,36 @@ cmd_create() {
             # On any exit while STATUS=creating, mark as failed
             trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
 
+            local step_start create_start
+            create_start=$SECONDS
+
+            step_start=$SECONDS
             create_worktree
             check_branch_staleness
+            info "[timing] create_worktree: $((SECONDS - step_start))s"
 
+            step_start=$SECONDS
             DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
             count_changes "$DIFF_FILES"
+            info "[timing] count_changes: $((SECONDS - step_start))s"
 
+            step_start=$SECONDS
             sync_build_artifacts
             sync_worktree_deps
             VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
             NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
+            info "[timing] sync: $((SECONDS - step_start))s"
 
             info "Mode: ${SWCTL_MODE} | Diff: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
             info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
 
+            step_start=$SECONDS
             provision_database_and_app "$COMPOSE_PROJECT"
+            info "[timing] provision: $((SECONDS - step_start))s"
+
+            step_start=$SECONDS
             run_frontend_build_if_needed "$COMPOSE_PROJECT" 1
+            info "[timing] frontend: $((SECONDS - step_start))s"
 
             # Mark complete and remove EXIT trap
             STATUS="complete"
@@ -1963,7 +2119,7 @@ cmd_create() {
             trap - EXIT
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            ok "Worktree '${WORKTREE_ID}' is ready."
+            ok "Worktree '${WORKTREE_ID}' is ready. (total: $((SECONDS - create_start))s)"
             info "URL: ${APP_URL}"
             info "Worktree: ${WORKTREE_PATH}"
             ;;
@@ -2021,6 +2177,10 @@ fetch_gitlab_mrs() {
 fetch_github_prs() {
     local repo="$1"
     local token="${SWCTL_GITHUB_TOKEN:-}"
+    # Load from token file if not set via env
+    if [ -z "$token" ] && [ -f "$SWCTL_GITHUB_TOKEN_FILE" ]; then
+        token="$(cat "$SWCTL_GITHUB_TOKEN_FILE")"
+    fi
     local auth_header=""
 
     if [ -n "$token" ]; then
@@ -2345,7 +2505,7 @@ cmd_restart() {
     load_instance_metadata "$meta_file"
 
     if [ -f "$COMPOSE_ENV_FILE" ] && [ -f "$COMPOSE_TEMPLATE" ]; then
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" ${COMPOSE_VOLUME_OVERRIDE:+-f "$COMPOSE_VOLUME_OVERRIDE"} --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" restart
+        compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" restart
     else
         local container_id
         container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
@@ -2365,7 +2525,7 @@ cmd_stop() {
     load_instance_metadata "$meta_file"
 
     if [ -f "${COMPOSE_ENV_FILE:-}" ] && [ -f "${COMPOSE_TEMPLATE:-}" ]; then
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" ${COMPOSE_VOLUME_OVERRIDE:+-f "$COMPOSE_VOLUME_OVERRIDE"} --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" stop
+        compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" stop
     else
         local container_id
         container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
@@ -2385,7 +2545,7 @@ cmd_start() {
     load_instance_metadata "$meta_file"
 
     if [ -f "${COMPOSE_ENV_FILE:-}" ] && [ -f "${COMPOSE_TEMPLATE:-}" ]; then
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$COMPOSE_TEMPLATE" ${COMPOSE_VOLUME_OVERRIDE:+-f "$COMPOSE_VOLUME_OVERRIDE"} --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" start
+        compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" start
     else
         local container_id
         container_id="$(app_container_exists_any_state "$COMPOSE_PROJECT" || true)"
@@ -2414,6 +2574,9 @@ cmd_refresh() {
 
         # Recompute derived variables not stored in metadata
         WORKTREE_ID="${WORKTREE_ID:-$ISSUE_ID}"
+        if [ -z "${COMPOSE_PROJECT:-}" ]; then
+            COMPOSE_PROJECT="$(sanitize_slug "${SW_PROJECT_SLUG}-${ISSUE_ID}")"
+        fi
         TRAEFIK_ROUTER="$(sanitize_router_id "${SW_PROJECT_SLUG}_${ISSUE_ID}")"
         TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
         if [ -z "${WORKTREE_PATH:-}" ]; then
@@ -2681,7 +2844,7 @@ cmd_switch() {
         write_compose_volume_override
 
         # Restart container with new volume config
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+        compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait_for_app_container "$COMPOSE_PROJECT"
 
         # Run composer install if deps changed
@@ -2700,7 +2863,7 @@ cmd_switch() {
         write_compose_volume_override
 
         # Restart container with new volume config
-        compose --project-directory "$SWCTL_TMP_DIR" -f "$SW_COMPOSE_TEMPLATE" -f "$COMPOSE_VOLUME_OVERRIDE" --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
+        compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait_for_app_container "$COMPOSE_PROJECT"
         run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" 2>/dev/null || true
     fi
@@ -3603,8 +3766,10 @@ SW_COMPOSER_ROOT_VERSION=${SW_COMPOSER_ROOT_VERSION}
 ENVEOF
 
     # Start temporary container with base volumes
+    local base_compose_args="-f $SW_COMPOSE_TEMPLATE"
+    [ -n "${SW_COMPOSE_PROJECT_OVERRIDE:-}" ] && [ -f "${SW_COMPOSE_PROJECT_OVERRIDE:-}" ] && base_compose_args="$base_compose_args -f $SW_COMPOSE_PROJECT_OVERRIDE"
     compose --project-directory "$SWCTL_TMP_DIR" \
-        -f "$SW_COMPOSE_TEMPLATE" --env-file "$tmp_env" \
+        $base_compose_args --env-file "$tmp_env" \
         -p "$tmp_project" up -d
 
     wait_for_app_container "$tmp_project"
@@ -3622,11 +3787,53 @@ ENVEOF
 
     # Tear down temporary container
     compose --project-directory "$SWCTL_TMP_DIR" \
-        -f "$SW_COMPOSE_TEMPLATE" --env-file "$tmp_env" \
+        $base_compose_args --env-file "$tmp_env" \
         -p "$tmp_project" down --remove-orphans >/dev/null || true
 
     rm -f "$tmp_env"
     ok "Base volumes populated: $vendor_base, $node_base"
+}
+
+cmd_build_shared_db() {
+    local force=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force|-f) force=true; shift ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    load_project_config
+    ensure_docker
+    ensure_infra_ready
+
+    local shared_db
+    shared_db="$(sanitize_db_identifier "$SW_DB_SHARED_NAME")"
+
+    if mysql_db_has_tables "$shared_db" && [ "$force" = false ]; then
+        warn "Shared database '$shared_db' already has tables."
+        warn "Use --force to drop and rebuild it."
+        return 1
+    fi
+
+    # Find the main project's running web container
+    local main_container
+    main_container="$(docker ps --filter "network=${SW_PROJECT_NETWORK}" \
+        --format '{{.Names}}' 2>/dev/null | grep -E "^${SW_PROJECT}-web-" | head -1)"
+    [ -n "$main_container" ] || die "Main project container not found. Start your project first: cd $PROJECT_ROOT && docker compose up -d"
+
+    info "Building shared database '$shared_db' using container '$main_container'."
+
+    # Create/reset the shared DB
+    create_database "$shared_db"
+
+    # Run system:install against the shared DB by overriding DATABASE_URL
+    local install_url="mysql://${SW_DB_ROOT_USER}:${SW_DB_ROOT_PASSWORD}@${SW_DB_HOST}:${SW_DB_PORT}/${shared_db}"
+    docker exec -e "DATABASE_URL=$install_url" "$main_container" \
+        $SW_BIN_CONSOLE system:install $SW_SHARED_DB_INSTALL_ARGS \
+        || die "system:install failed."
+
+    ok "Shared database '$shared_db' built for project '${SW_PROJECT_SLUG}'."
 }
 
 cmd_clean_base() {
@@ -3635,6 +3842,167 @@ cmd_clean_base() {
     local node_base="node_modules-base-${SW_PROJECT_SLUG}"
     docker volume rm "$vendor_base" 2>/dev/null && ok "Removed $vendor_base" || info "$vendor_base not found."
     docker volume rm "$node_base" 2>/dev/null && ok "Removed $node_base" || info "$node_base not found."
+}
+
+SWCTL_GITHUB_TOKEN_FILE="$SWCTL_STATE_DIR/github.token"
+
+cmd_auth() {
+    local action="${1:-status}"
+
+    case "$action" in
+        login)
+            # Try gh CLI first — simplest path, works with private repos
+            if command -v gh >/dev/null 2>&1; then
+                local gh_token
+                gh_token="$(gh auth token 2>/dev/null)" || true
+                if [ -n "$gh_token" ]; then
+                    mkdir -p "$SWCTL_STATE_DIR"
+                    printf '%s' "$gh_token" > "$SWCTL_GITHUB_TOKEN_FILE"
+                    chmod 600 "$SWCTL_GITHUB_TOKEN_FILE"
+
+                    local user_login
+                    user_login="$(curl -sS -H "Authorization: token $gh_token" \
+                        -H 'Accept: application/vnd.github.v3+json' \
+                        'https://api.github.com/user' 2>/dev/null | sed -n 's/.*"login"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+
+                    ok "Authenticated as ${COLOR_BOLD}${user_login:-unknown}${COLOR_RESET} (via gh CLI)"
+                    info "Token saved to $SWCTL_GITHUB_TOKEN_FILE"
+                    return 0
+                fi
+                warn "gh CLI found but no active session. Falling back to Device Flow."
+            fi
+
+            # Fall back to Device Flow if gh CLI not available
+            local client_id="${SWCTL_GITHUB_CLIENT_ID:-}"
+            if [ -z "$client_id" ]; then
+                die "SWCTL_GITHUB_CLIENT_ID is not set and gh CLI is not available.\nInstall gh CLI: https://cli.github.com and run 'gh auth login'\nOr create a GitHub App and export SWCTL_GITHUB_CLIENT_ID."
+            fi
+
+            info "Starting GitHub Device Flow authentication..."
+
+            # Step 1: Request device code
+            local device_response
+            device_response="$(curl -sS -X POST 'https://github.com/login/device/code' \
+                -H 'Accept: application/json' \
+                -H 'Content-Type: application/json' \
+                -d "{\"client_id\":\"${client_id}\",\"scope\":\"repo read:org\"}")"
+
+            local user_code verification_uri device_code interval
+            user_code="$(printf '%s' "$device_response" | sed -n 's/.*"user_code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            verification_uri="$(printf '%s' "$device_response" | sed -n 's/.*"verification_uri"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            device_code="$(printf '%s' "$device_response" | sed -n 's/.*"device_code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            interval="$(printf '%s' "$device_response" | sed -n 's/.*"interval"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
+            interval="${interval:-5}"
+
+            if [ -z "$user_code" ] || [ -z "$device_code" ]; then
+                die "Failed to start device flow. Response: $device_response"
+            fi
+
+            printf '\n'
+            printf '  %b%bOpen:%b  %s\n' "$COLOR_BOLD" "$COLOR_CYAN" "$COLOR_RESET" "$verification_uri"
+            printf '  %b%bCode:%b  %s\n' "$COLOR_BOLD" "$COLOR_GREEN" "$COLOR_RESET" "$user_code"
+            printf '\n'
+
+            # Try to open browser
+            if command -v open >/dev/null 2>&1; then
+                open "$verification_uri" 2>/dev/null || true
+            elif command -v xdg-open >/dev/null 2>&1; then
+                xdg-open "$verification_uri" 2>/dev/null || true
+            fi
+
+            info "Waiting for authorization (press Ctrl+C to cancel)..."
+
+            # Step 2: Poll for authorization
+            while true; do
+                sleep "$interval"
+                local poll_response
+                poll_response="$(curl -sS -X POST 'https://github.com/login/oauth/access_token' \
+                    -H 'Accept: application/json' \
+                    -H 'Content-Type: application/json' \
+                    -d "{\"client_id\":\"${client_id}\",\"device_code\":\"${device_code}\",\"grant_type\":\"urn:ietf:params:oauth:grant-type:device_code\"}")"
+
+                local access_token error_code
+                access_token="$(printf '%s' "$poll_response" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+                error_code="$(printf '%s' "$poll_response" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+
+                if [ -n "$access_token" ]; then
+                    mkdir -p "$SWCTL_STATE_DIR"
+                    printf '%s' "$access_token" > "$SWCTL_GITHUB_TOKEN_FILE"
+                    chmod 600 "$SWCTL_GITHUB_TOKEN_FILE"
+
+                    # Fetch username
+                    local user_login
+                    user_login="$(curl -sS -H "Authorization: token $access_token" \
+                        -H 'Accept: application/vnd.github.v3+json' \
+                        'https://api.github.com/user' | sed -n 's/.*"login"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+
+                    printf '\n'
+                    ok "Authenticated as ${COLOR_BOLD}${user_login:-unknown}${COLOR_RESET}"
+                    info "Token saved to $SWCTL_GITHUB_TOKEN_FILE"
+                    return 0
+                fi
+
+                case "$error_code" in
+                    authorization_pending) ;;
+                    slow_down) interval=$((interval + 5)) ;;
+                    expired_token)
+                        printf '\n'
+                        die "Device code expired. Run 'swctl auth login' to try again."
+                        ;;
+                    *)
+                        printf '\n'
+                        die "Authentication failed: $error_code"
+                        ;;
+                esac
+            done
+            ;;
+
+        logout)
+            if [ -f "$SWCTL_GITHUB_TOKEN_FILE" ]; then
+                rm -f "$SWCTL_GITHUB_TOKEN_FILE"
+                ok "GitHub token removed."
+            else
+                info "Not logged in."
+            fi
+            ;;
+
+        status)
+            local token="" token_source=""
+            if [ -f "$SWCTL_GITHUB_TOKEN_FILE" ]; then
+                token="$(cat "$SWCTL_GITHUB_TOKEN_FILE")"
+                token_source="token file"
+            elif [ -n "${SWCTL_GITHUB_TOKEN:-}" ]; then
+                token="$SWCTL_GITHUB_TOKEN"
+                token_source="environment variable"
+            elif command -v gh >/dev/null 2>&1; then
+                token="$(gh auth token 2>/dev/null)" || true
+                token_source="gh CLI"
+            fi
+
+            if [ -z "$token" ]; then
+                info "Not authenticated. Run 'swctl auth login' to connect your GitHub account."
+                return 0
+            fi
+
+            local user_response
+            user_response="$(curl -sS -H "Authorization: token $token" \
+                -H 'Accept: application/vnd.github.v3+json' \
+                'https://api.github.com/user' 2>/dev/null)" || true
+
+            local user_login
+            user_login="$(printf '%s' "$user_response" | sed -n 's/.*"login"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+
+            if [ -n "$user_login" ]; then
+                ok "Authenticated as ${COLOR_BOLD}${user_login}${COLOR_RESET} (${token_source})"
+            else
+                warn "Token exists but may be invalid. Run 'swctl auth login' to re-authenticate."
+            fi
+            ;;
+
+        *)
+            die "Usage: swctl auth [login|logout|status]"
+            ;;
+    esac
 }
 
 show_help() {
@@ -3654,6 +4022,7 @@ Usage:
   swctl code <issue> [--claude|--codex|--phpstorm|--code|--cursor]
   swctl switch <issue> --qa|--dev
   swctl clean <issue>
+  swctl auth [login|logout|status]
   swctl tui
   swctl dashboard
   swctl --version
@@ -3672,6 +4041,7 @@ Commands:
   code        Open worktree in an editor: --phpstorm (default), --claude, --codex, --code, --cursor.
   switch      Switch a worktree between QA and Dev mode (rebuilds only what's needed).
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
+  auth        Authenticate with GitHub using Device Flow. Subcommands: login, logout, status.
   tui         Open the interactive ANSI dashboard.
   dashboard   Open the live monitoring dashboard.
   ui          Start/stop the web UI (http://swctl.orb.local). Usage: swctl ui [start|stop|logs]
@@ -3687,7 +4057,7 @@ EOF
 
 cmd_ui() {
     local action="${1:-start}"
-    local ui_compose="$SWCTL_TEMPLATE_DIR/ui/docker-compose.ui.yml"
+    local ui_compose="$SWCTL_TEMPLATE_DIR/app/docker-compose.ui.yml"
     [ -f "$ui_compose" ] || die "UI compose file not found: $ui_compose"
 
     # Try loading config from current dir, or fall back to first registered platform project
@@ -3708,22 +4078,27 @@ cmd_ui() {
     export SWCTL_PROJECT_ROOT="$PROJECT_ROOT"
     export SWCTL_WORKTREE_ROOT="$SW_WORKTREE_ROOT"
     export SWCTL_STATE_DIR="$SWCTL_STATE_DIR"
-    export SW_TRUNK_NETWORK="${SW_TRUNK_NETWORK:-trunk_default}"
     export SW_RUNTIME="${SW_RUNTIME:-$(detect_runtime)}"
     export SWCTL_EDITOR="${SWCTL_EDITOR:-phpstorm}"
     export SWCTL_BROWSE_ROOT="${SWCTL_BROWSE_ROOT:-$HOME}"
+    # Load GitHub token from file if not set via env
+    if [ -z "${SWCTL_GITHUB_TOKEN:-}" ] && [ -f "$SWCTL_GITHUB_TOKEN_FILE" ]; then
+        SWCTL_GITHUB_TOKEN="$(cat "$SWCTL_GITHUB_TOKEN_FILE")"
+    fi
+    export SWCTL_GITHUB_TOKEN="${SWCTL_GITHUB_TOKEN:-}"
+    export SWCTL_GITHUB_CLIENT_ID="${SWCTL_GITHUB_CLIENT_ID:-}"
 
     case "$action" in
         start)
-            compose --project-directory "$SWCTL_TEMPLATE_DIR/ui" -f "$ui_compose" -p swctl-ui up -d --build
+            compose --project-directory "$SWCTL_TEMPLATE_DIR/app" -f "$ui_compose" -p swctl-ui up -d --build
             ok "swctl UI running at http://swctl.orb.local"
             ;;
         stop)
-            compose --project-directory "$SWCTL_TEMPLATE_DIR/ui" -f "$ui_compose" -p swctl-ui down
+            compose --project-directory "$SWCTL_TEMPLATE_DIR/app" -f "$ui_compose" -p swctl-ui down
             ok "swctl UI stopped."
             ;;
         logs)
-            compose --project-directory "$SWCTL_TEMPLATE_DIR/ui" -f "$ui_compose" -p swctl-ui logs -f
+            compose --project-directory "$SWCTL_TEMPLATE_DIR/app" -f "$ui_compose" -p swctl-ui logs -f
             ;;
         *)
             die "Usage: swctl ui [start|stop|logs]"
@@ -3820,6 +4195,11 @@ main() {
             ensure_state_dirs
             cmd_dashboard
             ;;
+        auth)
+            ensure_state_dirs
+            shift
+            cmd_auth "${1:-status}"
+            ;;
         ui)
             ensure_state_dirs
             shift
@@ -3828,6 +4208,11 @@ main() {
         build-base)
             ensure_state_dirs
             cmd_build_base
+            ;;
+        build-shared-db)
+            ensure_state_dirs
+            shift
+            cmd_build_shared_db "$@"
             ;;
         clean-base)
             ensure_state_dirs

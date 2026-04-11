@@ -17,7 +17,7 @@ release: validate
 	@tmpdir=$$(mktemp -d); \
 	  mkdir -p "$$tmpdir/$(PACKAGE)"; \
 	  cp swctl .swctl.conf.example docker-compose.swctl.yml docker-compose.swctl.orbstack.yml README.md "$$tmpdir/$(PACKAGE)/"; \
-	  rsync -a --exclude='node_modules' --exclude='dist' --exclude='.vite' ui/ "$$tmpdir/$(PACKAGE)/ui/"; \
+	  rsync -a --exclude='node_modules' --exclude='dist' --exclude='.vite' app/ "$$tmpdir/$(PACKAGE)/app/"; \
 	  tar -C "$$tmpdir" -czf "$(ARTIFACT)" "$(PACKAGE)"; \
 	  rm -rf "$$tmpdir"; \
 	  printf "Created %s\n" "$(ARTIFACT)"; \

@@ -1,0 +1,27 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: swctl-ui
+    restart: unless-stopped
+    environment:
+      SWCTL_PATH: /swctl/swctl
+      SWCTL_STATE_DIR: ${SWCTL_STATE_DIR}
+      PROJECT_ROOT: ${SWCTL_PROJECT_ROOT}
+      SW_RUNTIME: ${SW_RUNTIME:-traefik}
+      SWCTL_EDITOR: ${SWCTL_EDITOR:-phpstorm}
+      SWCTL_BROWSE_ROOT: ${SWCTL_BROWSE_ROOT:-}
+      SWCTL_GITHUB_TOKEN: ${SWCTL_GITHUB_TOKEN:-}
+      SWCTL_GITHUB_CLIENT_ID: ${SWCTL_GITHUB_CLIENT_ID:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SWCTL_SCRIPT_DIR}:/swctl:ro
+      # Mount HOME so browse can list all directories and init-config can write .swctl.conf
+      - ${SWCTL_BROWSE_ROOT}:${SWCTL_BROWSE_ROOT}
+      # Mount at host-identical paths so swctl metadata paths work for both CLI and UI
+      - ${SWCTL_PROJECT_ROOT}:${SWCTL_PROJECT_ROOT}
+      - ${SWCTL_WORKTREE_ROOT}:${SWCTL_WORKTREE_ROOT}
+      - ${SWCTL_STATE_DIR}:${SWCTL_STATE_DIR}
+    labels:
+      - "dev.orbstack.domains=swctl.orb.local"
