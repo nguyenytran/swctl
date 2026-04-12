@@ -42,12 +42,17 @@ const ghPolling = ref(false)
 const ghDeviceError = ref('')
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 
+// QA mode: track skipped issues with no linked PR
+const ghSkippedCount = ref(0)
+let ghSkippedTimer: ReturnType<typeof setTimeout> | null = null
+
 // Load GitHub auth status on mount
 fetchGitHubStatus().then(s => { ghAuth.value = s }).catch(() => {})
 
-// Clean up poll timer on unmount
+// Clean up timers on unmount
 onUnmounted(() => {
   if (pollTimer) clearTimeout(pollTimer)
+  if (ghSkippedTimer) clearTimeout(ghSkippedTimer)
 })
 
 async function startDeviceFlow() {
@@ -223,11 +228,18 @@ function toggleGhItem(num: number) {
   ghSelected.value = s
 }
 
+function selectableGhItems() {
+  // In QA mode, only items with a linked PR branch are selectable
+  if (mode.value === 'qa') return ghItems.value.filter(i => i.branch)
+  return ghItems.value
+}
+
 function toggleAllGh() {
-  if (ghSelected.value.size === ghItems.value.length) {
+  const selectable = selectableGhItems()
+  if (ghSelected.value.size === selectable.length) {
     ghSelected.value = new Set()
   } else {
-    ghSelected.value = new Set(ghItems.value.map(i => i.number))
+    ghSelected.value = new Set(selectable.map(i => i.number))
   }
 }
 
@@ -247,12 +259,23 @@ function branchPrefixFromType(type?: string | null): string {
 }
 
 function addSelectedGhItems() {
+  let skipped = 0
   for (const item of ghItems.value) {
     if (!ghSelected.value.has(item.number)) continue
+    // QA mode: skip issues with no linked PR branch — nothing to test
+    if (mode.value === 'qa' && !item.branch) {
+      skipped++
+      continue
+    }
     const issue = String(item.number)
     // Use linked PR branch if available, otherwise derive from issue type
     const branch = item.branch || `${branchPrefixFromType(item.issueType)}/${item.number}`
     batch.addJob(issue, branch, selectedPlugin.value)
+  }
+  if (skipped > 0) {
+    ghSkippedCount.value = skipped
+    if (ghSkippedTimer) clearTimeout(ghSkippedTimer)
+    ghSkippedTimer = setTimeout(() => { ghSkippedCount.value = 0 }, 5000)
   }
   ghSelected.value = new Set()
 }
@@ -523,7 +546,7 @@ function handleNewBatch() {
                   <button
                     class="text-xs text-gray-400 hover:text-white transition-colors"
                     @click="toggleAllGh"
-                  >{{ ghSelected.size === ghItems.length ? 'Deselect all' : 'Select all' }} ({{ ghItems.length }})</button>
+                  >{{ ghSelected.size === selectableGhItems().length ? 'Deselect all' : 'Select all' }} ({{ selectableGhItems().length }})</button>
                   <button
                     :disabled="ghSelected.size === 0"
                     class="px-3 py-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs rounded transition-colors"
@@ -532,16 +555,21 @@ function handleNewBatch() {
                     Add {{ ghSelected.size }} selected
                   </button>
                 </div>
+                <div v-if="ghSkippedCount > 0" class="mb-2 px-3 py-1.5 bg-yellow-600/10 border border-yellow-600/30 rounded text-xs text-yellow-400">
+                  Skipped {{ ghSkippedCount }} issue(s) with no linked PR (QA mode).
+                </div>
                 <div class="overflow-y-auto border border-border rounded bg-surface-dark">
                   <div
                     v-for="item in ghItems"
                     :key="item.number"
                     class="flex items-start gap-2 px-3 py-2 border-b border-border last:border-b-0 hover:bg-surface-hover transition-colors"
+                    :class="{ 'opacity-40': mode === 'qa' && !item.branch }"
                   >
                     <input
                       type="checkbox"
                       :checked="ghSelected.has(item.number)"
                       class="mt-0.5 accent-blue-500 cursor-pointer shrink-0"
+                      :disabled="mode === 'qa' && !item.branch"
                       @change="toggleGhItem(item.number)"
                     />
                     <div class="flex-1 min-w-0">
@@ -600,6 +628,10 @@ function handleNewBatch() {
                           <span v-if="item.linkedPRs.length > 1" class="text-[10px] text-gray-600">+{{ item.linkedPRs.length - 1 }} more</span>
                         </template>
                         <span v-else-if="item.branch" class="text-[10px] text-gray-500 font-mono truncate">{{ item.branch }}</span>
+                        <span
+                          v-else-if="mode === 'qa'"
+                          class="text-[10px] px-1 py-0 rounded bg-red-600/20 text-red-400 border border-red-600/30 shrink-0"
+                        >No PR</span>
                         <span v-if="item.user" class="text-[10px] text-gray-600">@{{ item.user }}</span>
                         <span
                           v-for="label in item.labels.slice(0, 3)"

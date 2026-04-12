@@ -2338,6 +2338,25 @@ cmd_batch_create() {
 
     [ -n "$pairs" ] || die "No issue/branch pairs provided.\nUsage: swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]"
 
+    # In QA mode, skip pairs without a branch (no linked PR/MR)
+    if [ "$SWCTL_MODE" = "qa" ]; then
+        local filtered=""
+        local skipped=0
+        while IFS=' ' read -r issue branch; do
+            [ -n "$issue" ] || continue
+            if [ -z "$branch" ]; then
+                warn "Skipping issue '$issue': no linked PR/MR (QA mode)."
+                skipped=$((skipped + 1))
+                continue
+            fi
+            filtered="${filtered:+$filtered
+}$issue $branch"
+        done <<< "$pairs"
+        [ "$skipped" -gt 0 ] && warn "Skipped $skipped issue(s) with no linked branch."
+        pairs="$filtered"
+        [ -n "$pairs" ] || die "No issue/branch pairs remaining after filtering (all lacked linked PRs)."
+    fi
+
     local total=0
     local succeeded=0
     local failed=0
@@ -2828,7 +2847,8 @@ cmd_switch() {
     count_changes "$diff_files"
 
     if [ "$target_mode" = "dev" ]; then
-        # QA → Dev: need writable vendor + run any missing builds
+        # QA → Dev: QA skipped all console operations (bootstrap_dependencies,
+        # theme:compile, cache:clear, frontend builds). Need a full refresh.
 
         # Replace vendor symlink/bind-mount with a real writable copy
         if [ -L "$WORKTREE_PATH/vendor" ] || [ ! -d "$WORKTREE_PATH/vendor/autoload.php" ]; then
@@ -2847,17 +2867,31 @@ cmd_switch() {
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait_for_app_container "$COMPOSE_PROJECT"
 
-        # Run composer install if deps changed
-        if [ "$((COMPOSER_CHANGES))" -gt 0 ]; then
-            info "Running composer install for dev mode."
-            run_app_command "$COMPOSE_PROJECT" "composer install --no-interaction" || warn "Composer install failed."
+        # Full dev provisioning — QA skipped all of this
+        bootstrap_dependencies "$COMPOSE_PROJECT"
+
+        # Run migrations if schema changes exist
+        if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
+            info "Schema changes detected. Running migrations."
+            run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE database:migrate --all && $SW_BIN_CONSOLE database:migrate-destructive --all" || warn "Migrations failed."
         fi
 
-        # Run builds that QA skipped
+        # Post-provision: theme refresh + compile + cache clear
+        if [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
+            run_app_command "$COMPOSE_PROJECT" \
+                "$SW_BIN_CONSOLE theme:refresh 2>/dev/null; $SW_BIN_CONSOLE theme:compile --sync || echo '[WARN] theme:compile failed.'; $SW_BIN_CONSOLE cache:clear || echo '[WARN] cache:clear failed.'" \
+                || warn "Post-provision commands failed."
+        else
+            run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE theme:refresh 2>/dev/null; $SW_BIN_CONSOLE cache:clear" \
+                || warn "Post-provision commands failed."
+        fi
+
+        # Frontend builds that QA skipped
         run_frontend_build_if_needed "$COMPOSE_PROJECT"
 
     else
-        # Dev → QA: switch to read-only vendor, lighter container
+        # Dev → QA: Dev already has everything built. Just switch to
+        # read-only vendor mount and restart — no refresh needed.
 
         # Recreate compose override with QA vendor bind mount
         write_compose_volume_override
@@ -2865,7 +2899,6 @@ cmd_switch() {
         # Restart container with new volume config
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait_for_app_container "$COMPOSE_PROJECT"
-        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" 2>/dev/null || true
     fi
 
     # Update metadata with new mode
