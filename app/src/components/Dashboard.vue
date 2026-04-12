@@ -11,7 +11,7 @@ import ProjectsModal from './ProjectsModal.vue'
 import LogPanel from './LogPanel.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import InstanceDetail from './InstanceDetail.vue'
-import { buildStreamUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject } from '@/api'
+import { buildStreamUrl, buildCreateUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject } from '@/api'
 import type { Instance, ExternalWorktree } from '@/types'
 
 const route = useRoute()
@@ -173,6 +173,35 @@ function refreshExternal(wt: ExternalWorktree) {
   stream.start(buildRefreshExternalUrl(wt.worktreePath, wt.projectSlug))
 }
 
+// Adopt external plugin worktree (create full environment)
+const adoptingWorktree = ref<ExternalWorktree | null>(null)
+const adoptIssueId = ref('')
+
+function startAdopt(wt: ExternalWorktree) {
+  adoptingWorktree.value = wt
+  adoptIssueId.value = ''
+}
+
+function cancelAdopt() {
+  adoptingWorktree.value = null
+  adoptIssueId.value = ''
+}
+
+function submitAdopt() {
+  if (!adoptingWorktree.value || !adoptIssueId.value.trim()) return
+  const wt = adoptingWorktree.value
+  const url = buildCreateUrl({
+    issue: adoptIssueId.value.trim(),
+    mode: 'dev',
+    project: wt.parentProject || '',
+    plugin: wt.pluginName || '',
+    adoptWorktreePath: wt.worktreePath,
+  })
+  stream.start(url)
+  adoptingWorktree.value = null
+  adoptIssueId.value = ''
+}
+
 function onStreamDone() {
   refresh()
 }
@@ -326,11 +355,39 @@ watch(() => stream.result.value, (val) => {
                 }"
               >{{ wt.source === 'claude' ? 'Claude' : wt.source === 'codex' ? 'Codex' : wt.source === 'swctl' ? 'swctl' : 'Manual' }}</span>
             </td>
-            <td class="px-4 py-2.5 text-xs text-gray-500">{{ wt.projectSlug }}</td>
+            <td class="px-4 py-2.5 text-xs text-gray-500">
+              <template v-if="wt.isPlugin">
+                <span class="text-gray-400">{{ wt.pluginName }}</span>
+                <span class="text-gray-600"> / {{ wt.projectSlug }}</span>
+              </template>
+              <template v-else>{{ wt.projectSlug }}</template>
+            </td>
             <td class="px-4 py-2.5 text-xs font-mono text-gray-600">{{ wt.head?.slice(0, 7) }}</td>
             <td class="px-4 py-2.5 text-right whitespace-nowrap">
+              <!-- Adopt plugin worktree inline form -->
+              <template v-if="adoptingWorktree?.worktreePath === wt.worktreePath">
+                <div class="inline-flex items-center gap-1">
+                  <input
+                    v-model="adoptIssueId"
+                    type="text"
+                    placeholder="Issue ID (e.g. NEXT-12345)"
+                    class="bg-surface-dark border border-border rounded px-2 py-0.5 text-xs text-white w-40 focus:outline-none focus:border-emerald-500"
+                    @keyup.enter="submitAdopt"
+                    @keyup.escape="cancelAdopt"
+                  />
+                  <button
+                    @click="submitAdopt"
+                    :disabled="!adoptIssueId.trim()"
+                    class="text-[10px] px-1.5 py-0.5 bg-emerald-600/20 text-emerald-400 border border-emerald-600/30 rounded hover:bg-emerald-600/30 transition-colors disabled:opacity-40"
+                  >Start</button>
+                  <button
+                    @click="cancelAdopt"
+                    class="text-[10px] px-1.5 py-0.5 text-gray-500 hover:text-gray-300 transition-colors"
+                  >Cancel</button>
+                </div>
+              </template>
               <!-- Link issue inline form -->
-              <template v-if="linkingWorktree?.worktreePath === wt.worktreePath">
+              <template v-else-if="linkingWorktree?.worktreePath === wt.worktreePath">
                 <div class="inline-flex items-center gap-1">
                   <input
                     v-model="linkIssueId"
@@ -352,7 +409,17 @@ watch(() => stream.result.value, (val) => {
                 </div>
               </template>
               <template v-else>
-                <template v-if="wt.registered">
+                <template v-if="wt.isPlugin">
+                  <button
+                    @click="startAdopt(wt)"
+                    class="text-xs text-emerald-400 hover:text-emerald-300 mr-2 transition-colors"
+                  >Start</button>
+                  <button
+                    @click="refreshExternal(wt)"
+                    class="text-xs text-emerald-400 hover:text-emerald-300 transition-colors"
+                  >Refresh</button>
+                </template>
+                <template v-else-if="wt.registered">
                   <button
                     @click="startLinkIssue(wt)"
                     class="text-xs text-blue-400 hover:text-blue-300 mr-2 transition-colors"

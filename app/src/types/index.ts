@@ -104,6 +104,9 @@ export interface ExternalWorktree {
   source: 'claude' | 'codex' | 'swctl' | 'manual'
   registered: boolean
   repoPath?: string
+  isPlugin: boolean
+  pluginName: string | null
+  parentProject: string | null
 }
 
 export type WorktreeItem = (Instance & { kind?: 'managed' }) | ExternalWorktree

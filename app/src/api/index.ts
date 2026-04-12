@@ -174,6 +174,8 @@ export function buildCreateUrl(params: {
   branch?: string
   project?: string
   plugin?: string
+  deps?: string
+  adoptWorktreePath?: string
 }): string {
   const u = new URL(`${BASE}/stream/create`, window.location.origin)
   u.searchParams.set('issue', params.issue)
@@ -181,6 +183,8 @@ export function buildCreateUrl(params: {
   if (params.branch) u.searchParams.set('branch', params.branch)
   if (params.project) u.searchParams.set('project', params.project)
   if (params.plugin) u.searchParams.set('plugin', params.plugin)
+  if (params.deps) u.searchParams.set('deps', params.deps)
+  if (params.adoptWorktreePath) u.searchParams.set('adoptWorktreePath', params.adoptWorktreePath)
   return u.pathname + u.search
 }
 

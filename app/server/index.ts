@@ -9,7 +9,7 @@ import { readAllInstances } from './lib/metadata.js'
 import { getContainerStatuses } from './lib/docker.js'
 import { readProjects, readProjectConfig, addProjectEntry, removeProjectEntry } from './lib/projects.js'
 import { streamSwctl, spawnSwctl, isStreamActive, cancelStream, streamCommand } from './lib/stream.js'
-import { listBranches, listGitWorktrees, discoverToolWorktrees } from './lib/git.js'
+import { listBranches, listGitWorktrees, discoverToolWorktrees, discoverPluginWorktrees } from './lib/git.js'
 import {
   fetchGitHubIssues,
   isDeviceFlowConfigured,
@@ -54,14 +54,26 @@ app.get('/api/instances', async (c) => {
   )
   const fromRegistered = gitWtArrays.flat().filter(wt => !managedPaths.has(wt.worktreePath))
 
-  // 2. From tool directories (~/.codex/worktrees/, ~/.claude/worktrees/)
+  // 2. From plugin repos under registered platforms (git worktree list)
+  // Filter out plugin worktrees nested inside managed instance worktree paths
+  // (e.g., _worktrees/sw-14540/custom/plugins/X is part of managed sw-14540)
+  const managedPathsArr = [...managedPaths]
+  const isInsideManaged = (wtPath: string) =>
+    managedPaths.has(wtPath) || managedPathsArr.some(mp => wtPath.startsWith(mp + '/'))
+  const fromPlugins = await discoverPluginWorktrees(projects)
+  const pluginFiltered = fromPlugins.filter(wt => !isInsideManaged(wt.worktreePath))
+
+  // 3. From tool directories (~/.codex/worktrees/, ~/.claude/worktrees/)
+  const allDiscoveredPaths = new Set([
+    ...fromRegistered.map(wt => wt.worktreePath),
+    ...pluginFiltered.map(wt => wt.worktreePath),
+  ])
   const fromTools = await discoverToolWorktrees(registeredPaths, registeredSlugs)
-  const fromToolsPaths = new Set(fromRegistered.map(wt => wt.worktreePath))
   const toolFiltered = fromTools.filter(wt =>
-    !managedPaths.has(wt.worktreePath) && !fromToolsPaths.has(wt.worktreePath)
+    !managedPaths.has(wt.worktreePath) && !allDiscoveredPaths.has(wt.worktreePath)
   )
 
-  return c.json([...instances, ...fromRegistered, ...toolFiltered])
+  return c.json([...instances, ...fromRegistered, ...pluginFiltered, ...toolFiltered])
 })
 
 app.get('/api/config', (c) => {
@@ -402,18 +414,23 @@ app.get('/api/stream/create', (c) => {
   let branch = c.req.query('branch') || ''
   const project = c.req.query('project') || ''
   const plugin = c.req.query('plugin') || ''
+  const deps = c.req.query('deps') || ''
+  const adoptWorktreePath = c.req.query('adoptWorktreePath') || ''
 
   if (!issue) return c.json({ error: 'Missing issue parameter' }, 400)
 
   // In dev mode, swctl prompts interactively for branch name if not provided.
   // Since we run non-interactively (no TTY in container), auto-generate a branch name.
-  if (mode === 'dev' && !branch) {
+  // When adopting an external worktree, the branch is inferred from the worktree itself.
+  if (mode === 'dev' && !branch && !adoptWorktreePath) {
     branch = `feature/${issue}`
   }
 
   const args = ['create']
   if (project) args.push('--project', project)
   if (plugin) args.push('--plugin', plugin)
+  if (deps) args.push('--deps', deps)
+  if (adoptWorktreePath) args.push('--adopt-worktree', adoptWorktreePath)
   if (mode === 'qa') args.push('--qa')
   if (branch) args.push(issue, branch)
   else args.push(issue)

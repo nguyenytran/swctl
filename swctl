@@ -331,7 +331,10 @@ list_instance_files() {
     local scope="${1:-all}"
 
     if [ "$scope" = "project" ] && [ -n "${SW_PROJECT_SLUG:-}" ]; then
-        find "$(instance_dir "$SW_PROJECT_SLUG")" -type f -name '*.env' 2>/dev/null | sort
+        # Include both direct project instances AND plugin instances whose
+        # parent project matches (plugin-external stores PROJECT_SLUG=<parent>).
+        grep -rl "^PROJECT_SLUG=${SW_PROJECT_SLUG}$" "$SWCTL_REGISTRY_DIR" 2>/dev/null \
+            | grep '\.env$' | sort
         return
     fi
 
@@ -1230,6 +1233,18 @@ wait_for_app_container() {
     die "App container for '$compose_project' did not start in time."
 }
 
+# Gracefully restart PHP-FPM workers to clear the FPM OPcache.
+# OrbStack probes the container immediately after "docker compose up", causing
+# PHP-FPM to cache bytecode before provisioning finishes. SIGUSR2 tells the
+# FPM master to respawn all worker processes with a clean OPcache.
+restart_php_fpm() {
+    local compose_project="$1"
+    local container_id
+    container_id="$(app_container_id "$compose_project")"
+    [ -n "$container_id" ] || return 0
+    docker exec "$container_id" bash -c 'kill -USR2 $(pgrep -o php-fpm) 2>/dev/null' >/dev/null 2>&1 || true
+}
+
 exec_in_container() {
     local container_id="$1"
     local command_string="$2"
@@ -1486,9 +1501,12 @@ install_admin_deps_if_needed() {
 run_frontend_build_if_needed() {
     local compose_project="$1"
     local is_first_create="${2:-0}"
+    local force_plugin_build="${3:-0}"
 
-    # QA mode: all frontend assets are synced from project root. No builds needed.
-    if [ "$SWCTL_MODE" = "qa" ]; then
+    # QA mode: all frontend assets are synced from project root. No builds needed
+    # UNLESS a plugin has admin/storefront extensions that weren't in the synced
+    # assets (force_plugin_build=1).
+    if [ "$SWCTL_MODE" = "qa" ] && [ "$force_plugin_build" -ne 1 ]; then
         info "QA mode: skipping frontend builds (using synced assets)."
         return
     fi
@@ -1512,14 +1530,41 @@ run_frontend_build_if_needed() {
         run_app_command "$compose_project" "$SW_BIN_CONSOLE bundle:dump" || warn "bundle:dump failed."
 
         if [ "$needs_admin_build" -eq 1 ] && [ "$needs_storefront_build" -eq 1 ]; then
-            # Build admin and storefront in parallel
-            info "Admin + Storefront changes detected. Building both in parallel."
-            run_app_command "$compose_project" "composer build:js:admin" &
-            local admin_pid=$!
-            run_app_command "$compose_project" "composer build:js:storefront" &
-            local storefront_pid=$!
-            wait "$admin_pid" || warn "Admin JS build failed."
-            wait "$storefront_pid" || warn "Storefront JS build failed."
+            # composer build:js:admin and build:js:storefront each run
+            # bundle:dump + feature:dump + npm build + assets:install.
+            # Running them separately duplicates the shared PHP steps.
+            # Instead: run shared prep once, npm builds in parallel, cleanup once.
+            info "Admin + Storefront changes detected. Building with parallel npm."
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE feature:dump" || warn "feature:dump failed."
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE admin:generate-entity-schema-types" 2>/dev/null || true
+            run_app_command "$compose_project" 'set -e
+ADMIN_DIR=src/Administration/Resources/app/administration
+STOREFRONT_DIR=src/Storefront/Resources/app/storefront
+export PROJECT_ROOT="$PWD"
+
+# Admin npm build (background)
+( cd "$ADMIN_DIR" && export PATH="$PWD/node_modules/.bin:$PATH" && npm run build ) &
+ADMIN_PID=$!
+
+# Storefront npm build (background)
+( cd "$STOREFRONT_DIR" && export PATH="$PWD/node_modules/.bin:$PATH" && npm run production ) &
+STOREFRONT_PID=$!
+
+# Wait for both
+ADMIN_OK=0; STOREFRONT_OK=0
+wait $ADMIN_PID || ADMIN_OK=1
+wait $STOREFRONT_PID || STOREFRONT_OK=1
+
+# Storefront post-steps
+cd "$STOREFRONT_DIR" && node copy-to-vendor.js
+cd "$PROJECT_ROOT"
+
+[ $ADMIN_OK -eq 0 ] || echo "[WARN] Admin npm build failed."
+[ $STOREFRONT_OK -eq 0 ] || echo "[WARN] Storefront npm build failed."
+exit $((ADMIN_OK + STOREFRONT_OK))
+' || warn "Parallel JS build had errors."
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE theme:compile --sync" 2>/dev/null || true
+            run_app_command "$compose_project" "$SW_BIN_CONSOLE assets:install" || warn "assets:install failed."
         elif [ "$needs_admin_build" -eq 1 ]; then
             info "Admin changes detected. Running composer build:js:admin."
             run_app_command "$compose_project" "composer build:js:admin" || warn "Admin JS build failed."
@@ -1645,6 +1690,11 @@ provision_database_and_app() {
         run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE theme:refresh 2>/dev/null; $SW_BIN_CONSOLE cache:clear" \
             || warn "Post-provision commands failed."
     fi
+
+    # Restart PHP-FPM workers to flush OPcache.  OrbStack probes the container
+    # right after "compose up", which can pollute the FPM OPcache with bytecode
+    # compiled before provisioning finished.
+    restart_php_fpm "$compose_project"
 }
 
 resolve_project_context() {
@@ -1800,16 +1850,66 @@ list_available_plugins() {
     done
 }
 
+read_plugin_deps() {
+    # Read .swctl.deps.yaml from a plugin directory and print dependency names.
+    local plugin_dir="$1"
+    local deps_file="$plugin_dir/.swctl.deps.yaml"
+    [ -f "$deps_file" ] || return 0
+    python3 -c "
+import yaml, sys
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f)
+for dep in data.get('dependencies', []):
+    print(dep)
+" "$deps_file" 2>/dev/null
+}
+
+create_dep_plugin_worktree() {
+    # Create a git worktree for a dependency plugin at its default branch.
+    local dep_name="$1"
+    local dep_repo="${PROJECT_ROOT}/custom/plugins/${dep_name}"
+    local dep_target="${WORKTREE_PATH}/custom/plugins/${dep_name}"
+
+    if [ ! -d "$dep_repo/.git" ]; then
+        warn "Dependency plugin repo not found: $dep_repo — skipping."
+        return 1
+    fi
+
+    if [ -d "$dep_target/.git" ] || [ -f "$dep_target/.git" ]; then
+        info "Dependency plugin already exists: $dep_name"
+        return 0
+    fi
+
+    # Determine the dep's default branch
+    local dep_default_branch
+    dep_default_branch="$(git -C "$dep_repo" symbolic-ref --short HEAD 2>/dev/null)" || dep_default_branch="main"
+
+    info "Creating dependency worktree: $dep_name (at $dep_default_branch)"
+    mkdir -p "$(dirname "$dep_target")"
+    rm -rf "$dep_target" 2>/dev/null || true
+
+    git -C "$dep_repo" fetch --all --prune 2>/dev/null || true
+    git -C "$dep_repo" worktree add --detach "$dep_target" "origin/$dep_default_branch" 2>/dev/null \
+        || git -C "$dep_repo" worktree add --detach "$dep_target" "$dep_default_branch" 2>/dev/null \
+        || { warn "Failed to create worktree for dependency: $dep_name"; return 1; }
+
+    ok "Dependency plugin nested: custom/plugins/${dep_name} (detached at $dep_default_branch)"
+}
+
 cmd_create() {
     SWCTL_MODE="${SWCTL_MODE:-dev}"
     local selected_project=""
     local selected_plugin=""
+    local selected_deps=""
+    local adopt_worktree_path=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --qa)      SWCTL_MODE="qa"; shift ;;
             --dev)     SWCTL_MODE="dev"; shift ;;
             --project) selected_project="$2"; shift 2 ;;
             --plugin)  selected_plugin="$2"; shift 2 ;;
+            --deps)    selected_deps="$2"; shift 2 ;;
+            --adopt-worktree) adopt_worktree_path="$2"; shift 2 ;;
             *)         break ;;
         esac
     done
@@ -1817,6 +1917,19 @@ cmd_create() {
     ISSUE="${1:-}"
     BRANCH="${2:-}"
     [ -n "$ISSUE" ] || die "Usage: swctl create [--qa|--dev] [--project <name>] [--plugin <name>] <issue> [<branch>]"
+
+    # When adopting an external worktree, the branch belongs to the PLUGIN,
+    # not the trunk.  Record it for metadata but don't use it for the trunk
+    # worktree (which will be created in detached mode at BASE_REF).
+    if [ -n "${adopt_worktree_path:-}" ] && [ -z "$BRANCH" ]; then
+        BRANCH="$(git -C "$adopt_worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
+        if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+            BRANCH="$(git -C "$adopt_worktree_path" rev-parse --short HEAD 2>/dev/null)" || true
+            info "Adopted worktree is detached at: ${BRANCH:-unknown}"
+        else
+            info "Inferred plugin branch from adopted worktree: $BRANCH"
+        fi
+    fi
 
     if [ -z "$BRANCH" ]; then
         if [ "$SWCTL_MODE" = "qa" ]; then
@@ -1860,118 +1973,229 @@ cmd_create() {
 
     case "$PROJECT_TYPE" in
         plugin-external)
+            # Create a standard trunk worktree, then nest the plugin's git
+            # worktree inside it at custom/plugins/<PluginName>/.
+            # Since custom/ is gitignored, the plugin dir is empty in the
+            # trunk worktree — we fill it with the plugin's own branch.
             info "Plugin (external): $PLUGIN_NAME → parent: $PARENT_PROJECT_SLUG"
             load_project_config "$PARENT_PROJECT_ROOT/.swctl.conf"
             ensure_infra_ready
 
+            git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+                || die "Project root is not a Git repository: $PROJECT_ROOT"
+
             ISSUE_ID="$(sanitize_slug "$ISSUE")"
             WORKTREE_ID="$ISSUE_ID"
+            BASE_REF="$(git_base_ref)"
 
-            # Write early metadata for the plugin instance
-            local plugin_slug
-            plugin_slug="$(sanitize_slug "$PLUGIN_NAME")"
-            SWCTL_ACTIVE_META_FILE="$(instance_file "$plugin_slug" "$ISSUE_ID")"
+            # Use trunk's naming — this IS a trunk worktree
+            COMPOSE_PROJECT="$(sanitize_slug "${SW_PROJECT_SLUG}-${ISSUE_ID}")"
+
+            if [ "$SW_RUNTIME" = "orbstack" ]; then
+                DOMAIN="${SW_SERVICE_NAME}.${COMPOSE_PROJECT}.orb.local"
+                APP_URL="http://${DOMAIN}"
+            else
+                DOMAIN="${SW_PROJECT_SLUG}-${ISSUE_ID}.${SW_DOMAIN_SUFFIX}"
+                APP_URL="http://${DOMAIN}"
+            fi
+            TRAEFIK_ROUTER="$(sanitize_router_id "${SW_PROJECT_SLUG}_${ISSUE_ID}")"
+            TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
+            WORKTREE_PATH="${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}"
+
+            # Early metadata — stored under trunk project slug
+            SWCTL_ACTIVE_META_FILE="$(instance_file "$SW_PROJECT_SLUG" "$ISSUE_ID")"
             STATUS="creating"
             FAILED_AT=""
             DB_NAME="${DB_NAME:-}"
             DB_STATE="${DB_STATE:-}"
             VENDOR_VOLUME="${VENDOR_VOLUME:-}"
             NODE_MODULES_VOLUME="${NODE_MODULES_VOLUME:-}"
-            MIGRATION_CHANGES="${MIGRATION_CHANGES:-0}"
-            ENTITY_CHANGES="${ENTITY_CHANGES:-0}"
-            FRONTEND_CHANGES="${FRONTEND_CHANGES:-0}"
-            WORKTREE_PATH=""
+            MIGRATION_CHANGES=0; ENTITY_CHANGES=0; COMPOSER_CHANGES=0
+            PACKAGE_CHANGES=0; ADMIN_CHANGES=0; STOREFRONT_CHANGES=0
+            BACKEND_CHANGES=0; FRONTEND_CHANGES=0
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
             trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
 
-            # Use trunk code — no platform git worktree needed
-            PLATFORM_WORKTREE_PATH="$PARENT_PROJECT_ROOT"
-            PLATFORM_ISSUE_ID="trunk"
-            WORKTREE_PATH="$PARENT_PROJECT_ROOT"
-
-            # Each plugin issue gets its own compose project (separate container + DB)
-            COMPOSE_PROJECT="$(sanitize_slug "${plugin_slug}-${ISSUE_ID}")"
-
-            if [ "$SW_RUNTIME" = "orbstack" ]; then
-                DOMAIN="${SW_SERVICE_NAME}.${COMPOSE_PROJECT}.orb.local"
-                APP_URL="http://${DOMAIN}"
-            else
-                DOMAIN="${plugin_slug}-${ISSUE_ID}.${SW_DOMAIN_SUFFIX}"
-                APP_URL="http://${DOMAIN}"
+            # 1. Create trunk worktree at BASE_REF — the branch belongs to the
+            # plugin, not the trunk.  Detached mode avoids creating a spurious
+            # branch in the trunk repo.
+            mkdir -p "$SW_WORKTREE_ROOT"
+            if ! worktree_exists "$WORKTREE_PATH"; then
+                git -C "$PROJECT_ROOT" worktree add --detach "$WORKTREE_PATH" "$BASE_REF"
+                ok "Created trunk worktree (detached at $BASE_REF)."
             fi
-            TRAEFIK_ROUTER="$(sanitize_router_id "${plugin_slug}_${ISSUE_ID}")"
-            TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
+            sync_lock_files
 
-            # 1. Clone a separate database for this plugin issue
-            setup_plugin_database
+            # 2. Nest plugin git worktree inside trunk worktree
+            local plugin_target="${WORKTREE_PATH}/custom/plugins/${PLUGIN_NAME}"
+            PLUGIN_WORKTREE_PATH="$plugin_target"
 
-            # 2. Reuse trunk's vendor/node_modules volumes
-            VENDOR_VOLUME="$(resolve_vendor_volume "base")"
-            NODE_MODULES_VOLUME="$(resolve_node_modules_volume "base")"
-
-            # 3. Write compose env file (passes DB_NAME, APP_URL, etc. to container)
-            write_compose_env_file
-
-            # 4. Create plugin worktree from plugin repo
-            local plugin_issue_id
-            plugin_issue_id="$ISSUE_ID"
-            PLUGIN_WORKTREE_PATH="${SW_WORKTREE_ROOT}/${PLUGIN_NAME}-${plugin_issue_id}"
-
-            if [ ! -d "$PLUGIN_WORKTREE_PATH" ]; then
-                info "Creating plugin worktree: $PLUGIN_WORKTREE_PATH"
+            if [ -n "${adopt_worktree_path:-}" ]; then
+                # Adopt an existing external worktree (from Claude Code / Codex)
+                # by moving it into the trunk worktree via git worktree move.
+                # This preserves uncommitted changes and updates git's internal pointers.
+                info "Adopting external worktree: $adopt_worktree_path"
+                [ -f "$adopt_worktree_path/.git" ] || [ -d "$adopt_worktree_path/.git" ] \
+                    || die "Not a git worktree: $adopt_worktree_path"
+                mkdir -p "$(dirname "$plugin_target")"
+                rm -rf "$plugin_target" 2>/dev/null || true
+                # Copy the worktree and update git's internal pointers.
+                # (~/.codex/ and ~/.claude/ are typically on a different APFS volume,
+                # so git worktree move would fail with "Cross-device link".)
+                cp -a "$adopt_worktree_path" "$plugin_target" \
+                    || die "Failed to copy worktree from $adopt_worktree_path to $plugin_target"
+                # The .git file contains "gitdir: /path/to/repo/.git/worktrees/<name>".
+                # Update that repo entry's gitdir to point to the new location.
+                local wt_gitdir
+                wt_gitdir="$(sed 's/^gitdir: //' "$plugin_target/.git" 2>/dev/null)" || true
+                if [ -n "$wt_gitdir" ] && [ -f "$wt_gitdir/gitdir" ]; then
+                    printf '%s\n' "$plugin_target" > "$wt_gitdir/gitdir"
+                fi
+                rm -rf "$adopt_worktree_path" 2>/dev/null || true
+                ok "Adopted worktree moved to: custom/plugins/${PLUGIN_NAME}"
+            elif [ ! -d "$plugin_target/.git" ] && [ ! -f "$plugin_target/.git" ]; then
+                info "Creating plugin worktree at: $plugin_target"
+                mkdir -p "$(dirname "$plugin_target")"
+                rm -rf "$plugin_target" 2>/dev/null || true
                 git -C "$PLUGIN_REPO_PATH" fetch --all --prune 2>/dev/null || true
                 if git -C "$PLUGIN_REPO_PATH" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
-                    git -C "$PLUGIN_REPO_PATH" worktree add "$PLUGIN_WORKTREE_PATH" -b "swctl/${plugin_issue_id}" "origin/$BRANCH" 2>/dev/null \
-                        || git -C "$PLUGIN_REPO_PATH" worktree add "$PLUGIN_WORKTREE_PATH" "origin/$BRANCH" 2>/dev/null \
+                    # Try: new local branch from remote → existing local branch → detached
+                    git -C "$PLUGIN_REPO_PATH" worktree add "$plugin_target" \
+                        -b "swctl/${ISSUE_ID}" "origin/$BRANCH" 2>/dev/null \
+                        || git -C "$PLUGIN_REPO_PATH" worktree add "$plugin_target" \
+                            "$BRANCH" 2>/dev/null \
+                        || git -C "$PLUGIN_REPO_PATH" worktree add --detach "$plugin_target" \
+                            "origin/$BRANCH" 2>/dev/null \
                         || die "Failed to create plugin worktree."
                 elif git -C "$PLUGIN_REPO_PATH" rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
-                    git -C "$PLUGIN_REPO_PATH" worktree add "$PLUGIN_WORKTREE_PATH" "$BRANCH" 2>/dev/null \
+                    git -C "$PLUGIN_REPO_PATH" worktree add "$plugin_target" "$BRANCH" 2>/dev/null \
                         || die "Failed to create plugin worktree."
                 else
                     die "Branch '$BRANCH' not found in plugin repo: $PLUGIN_REPO_PATH"
                 fi
-                ok "Plugin worktree created: $PLUGIN_WORKTREE_PATH"
+                ok "Plugin worktree nested at: custom/plugins/${PLUGIN_NAME}"
             else
-                info "Plugin worktree already exists: $PLUGIN_WORKTREE_PATH"
+                info "Plugin worktree already exists at: $plugin_target"
             fi
 
-            # 5. Track plugin linkage + write compose volume override (mounts plugin)
-            LINKED_PLUGINS="$PLUGIN_NAME"
-            PLUGIN_WORKTREE_PATHS="$PLUGIN_WORKTREE_PATH"
-            write_compose_volume_override
-
-            # 6. Start container (new compose project: trunk code + plugin mount + cloned DB)
-            compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
-            wait_for_app_container "$COMPOSE_PROJECT"
-
-            # 7. No write_env_file — DATABASE_URL is passed via compose environment
-            #    (avoids clobbering trunk's .env.local when multiple plugins run)
-
-            # 8. Run install/migrations if needed on the cloned DB
-            bootstrap_dependencies "$COMPOSE_PROJECT"
-            if [ "$DB_STATE" = "fresh" ]; then
-                run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
+            # Ensure plugin worktree is on a named branch (not detached HEAD).
+            # Detached HEAD can happen when the local branch is already checked
+            # out in another worktree, so the fallback used a remote ref.
+            local plugin_head
+            plugin_head="$(git -C "$plugin_target" rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
+            if [ "$plugin_head" = "HEAD" ]; then
+                git -C "$plugin_target" checkout -b "swctl/${ISSUE_ID}" 2>/dev/null \
+                    && info "Created plugin branch: swctl/${ISSUE_ID}" \
+                    || warn "Plugin worktree is in detached HEAD."
             fi
 
-            # 9. Activate plugin
-            activate_plugin "$COMPOSE_PROJECT" "$PLUGIN_NAME"
+            # 2b. Resolve plugin dependencies (--deps flag or .swctl.deps.yaml)
+            local dep_plugins=""
+            local dep_worktree_paths=""
+            local deps
+            if [ -n "${selected_deps:-}" ]; then
+                # Deps explicitly provided via --deps flag (from UI)
+                deps="$(echo "$selected_deps" | tr ',' '\n')"
+            else
+                # Auto-read from plugin's .swctl.deps.yaml
+                deps="$(read_plugin_deps "$plugin_target")"
+            fi
+            if [ -n "$deps" ]; then
+                info "Plugin dependencies declared: $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
+                while IFS= read -r dep_name; do
+                    [ -n "$dep_name" ] || continue
+                    [ "$dep_name" = "$PLUGIN_NAME" ] && continue  # skip self
+                    if create_dep_plugin_worktree "$dep_name"; then
+                        dep_plugins="${dep_plugins:+${dep_plugins},}${dep_name}"
+                        dep_worktree_paths="${dep_worktree_paths:+${dep_worktree_paths},}${WORKTREE_PATH}/custom/plugins/${dep_name}"
+                    fi
+                done <<< "$deps"
+            fi
 
-            update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-            ensure_install_lock "$COMPOSE_PROJECT"
-            run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
+            # 3. Standard trunk flow: diff, sync, provision
+            if [ -n "${adopt_worktree_path:-}" ]; then
+                # When adopting, the trunk has no changes — the work is in the
+                # plugin worktree.  Plugin detection below forces the needed builds.
+                DIFF_FILES=""
+                count_changes ""
+            else
+                DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
+                count_changes "$DIFF_FILES"
+            fi
 
-            # 10. Write final metadata
+            # Plugin has admin/storefront extensions → force builds so the bundle
+            # includes them.  The synced JS from trunk was compiled without this
+            # plugin's source present in custom/plugins/.
+            # Check primary plugin AND dependency plugins for extensions.
+            local plugin_has_extensions=0
+            local all_plugin_dirs="$plugin_target"
+            if [ -n "$dep_worktree_paths" ]; then
+                all_plugin_dirs="$all_plugin_dirs $(echo "$dep_worktree_paths" | tr ',' ' ')"
+            fi
+            for _pdir in $all_plugin_dirs; do
+                if find "$_pdir" -maxdepth 4 -path "*/Resources/app/administration" -type d 2>/dev/null | grep -q .; then
+                    ADMIN_CHANGES=$((ADMIN_CHANGES + 1))
+                    plugin_has_extensions=1
+                    info "$(basename "$_pdir") has admin extensions — admin build will be triggered."
+                fi
+                if find "$_pdir" -maxdepth 4 -path "*/Resources/app/storefront" -type d 2>/dev/null | grep -q .; then
+                    STOREFRONT_CHANGES=$((STOREFRONT_CHANGES + 1))
+                    plugin_has_extensions=1
+                    info "$(basename "$_pdir") has storefront extensions — storefront build will be triggered."
+                fi
+            done
+
+            sync_build_artifacts
+            sync_worktree_deps
+            VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
+            NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
+
+            # Track plugin linkage in metadata (primary + dependencies)
+            LINKED_PLUGINS="${PLUGIN_NAME}${dep_plugins:+,${dep_plugins}}"
+            PLUGIN_WORKTREE_PATHS="${PLUGIN_WORKTREE_PATH}${dep_worktree_paths:+,${dep_worktree_paths}}"
+            PLATFORM_WORKTREE_PATH="$WORKTREE_PATH"
+            PLATFORM_ISSUE_ID="$ISSUE_ID"
+
+            info "Mode: ${SWCTL_MODE} | Plugin: ${PLUGIN_NAME}"
+            info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
+
+            provision_database_and_app "$COMPOSE_PROJECT"
+
+            # Ensure the nested plugin is properly registered before the admin
+            # build.  The cloned DB has the plugin record but plugin:refresh
+            # updates paths/metadata to match the current worktree filesystem.
+            # (Safe here because the plugin IS at custom/plugins/<Name>/ — the
+            # same relative path as in trunk.)
+            run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE plugin:refresh" 2>/dev/null || warn "plugin:refresh failed."
+
+            # Activate dependency plugins so they're available for testing.
+            if [ -n "$dep_plugins" ]; then
+                local _old_ifs="$IFS"
+                IFS=','
+                for _dep in $dep_plugins; do
+                    run_app_command "$COMPOSE_PROJECT" \
+                        "$SW_BIN_CONSOLE plugin:install --activate $_dep" 2>/dev/null \
+                        || warn "Failed to activate dependency: $_dep"
+                done
+                IFS="$_old_ifs"
+            fi
+
+            run_frontend_build_if_needed "$COMPOSE_PROJECT" 1 "$plugin_has_extensions"
+
+            # Publish plugin assets (admin JS, storefront JS, public files)
+            # to public/bundles/<name>/ so the browser can load them.
+            run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE assets:install" 2>/dev/null || warn "assets:install failed."
+
             STATUS="complete"
             FAILED_AT=""
             trap - EXIT
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            ok "Plugin '$PLUGIN_NAME' is ready."
+            ok "Worktree '${WORKTREE_ID}' with plugin '${PLUGIN_NAME}' is ready."
             info "URL: ${APP_URL}"
-            info "Platform: ${PLATFORM_WORKTREE_PATH} (trunk — no worktree)"
+            info "Worktree: ${WORKTREE_PATH}"
             info "Plugin: ${PLUGIN_WORKTREE_PATH}"
-            info "Database: ${DB_NAME}"
             ;;
 
         plugin-embedded)
@@ -2095,6 +2319,47 @@ cmd_create() {
             count_changes "$DIFF_FILES"
             info "[timing] count_changes: $((SECONDS - step_start))s"
 
+            # Resolve dependency plugins (--deps flag) for platform worktrees
+            local dep_plugins=""
+            local dep_worktree_paths=""
+            if [ -n "${selected_deps:-}" ]; then
+                local deps
+                deps="$(echo "$selected_deps" | tr ',' '\n')"
+                if [ -n "$deps" ]; then
+                    info "Plugin dependencies declared: $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
+                    while IFS= read -r dep_name; do
+                        [ -n "$dep_name" ] || continue
+                        if create_dep_plugin_worktree "$dep_name"; then
+                            dep_plugins="${dep_plugins:+${dep_plugins},}${dep_name}"
+                            dep_worktree_paths="${dep_worktree_paths:+${dep_worktree_paths},}${WORKTREE_PATH}/custom/plugins/${dep_name}"
+                        fi
+                    done <<< "$deps"
+                fi
+            fi
+
+            # Check dependency plugins for admin/storefront extensions
+            local plugin_has_extensions=0
+            if [ -n "$dep_worktree_paths" ]; then
+                for _pdir in $(echo "$dep_worktree_paths" | tr ',' ' '); do
+                    if find "$_pdir" -maxdepth 4 -path "*/Resources/app/administration" -type d 2>/dev/null | grep -q .; then
+                        ADMIN_CHANGES=$((ADMIN_CHANGES + 1))
+                        plugin_has_extensions=1
+                        info "$(basename "$_pdir") has admin extensions — admin build will be triggered."
+                    fi
+                    if find "$_pdir" -maxdepth 4 -path "*/Resources/app/storefront" -type d 2>/dev/null | grep -q .; then
+                        STOREFRONT_CHANGES=$((STOREFRONT_CHANGES + 1))
+                        plugin_has_extensions=1
+                        info "$(basename "$_pdir") has storefront extensions — storefront build will be triggered."
+                    fi
+                done
+            fi
+
+            # Track dependency plugin linkage in metadata
+            if [ -n "$dep_plugins" ]; then
+                LINKED_PLUGINS="${dep_plugins}"
+                PLUGIN_WORKTREE_PATHS="${dep_worktree_paths}"
+            fi
+
             step_start=$SECONDS
             sync_build_artifacts
             sync_worktree_deps
@@ -2109,8 +2374,21 @@ cmd_create() {
             provision_database_and_app "$COMPOSE_PROJECT"
             info "[timing] provision: $((SECONDS - step_start))s"
 
+            # Activate dependency plugins after provisioning
+            if [ -n "$dep_plugins" ]; then
+                run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE plugin:refresh" 2>/dev/null || warn "plugin:refresh failed."
+                local _old_ifs="$IFS"
+                IFS=','
+                for _dep in $dep_plugins; do
+                    run_app_command "$COMPOSE_PROJECT" \
+                        "$SW_BIN_CONSOLE plugin:install --activate $_dep" 2>/dev/null \
+                        || warn "Failed to activate dependency: $_dep"
+                done
+                IFS="$_old_ifs"
+            fi
+
             step_start=$SECONDS
-            run_frontend_build_if_needed "$COMPOSE_PROJECT" 1
+            run_frontend_build_if_needed "$COMPOSE_PROJECT" 1 "$plugin_has_extensions"
             info "[timing] frontend: $((SECONDS - step_start))s"
 
             # Mark complete and remove EXIT trap
@@ -2584,11 +2862,13 @@ cmd_refresh() {
     SWCTL_ACTIVE_META_FILE="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
     load_instance_metadata "$SWCTL_ACTIVE_META_FILE"
 
+    # Load project config from the instance's saved config path
+    load_project_config ${CONFIG_PATH:+"$CONFIG_PATH"}
+
     # Resume failed/interrupted creates
     if [ "${STATUS:-complete}" = "failed" ] || [ "${STATUS:-complete}" = "creating" ]; then
         info "Worktree '$ISSUE_ID' has status '${STATUS}'. Resuming provisioning..."
         STATUS="creating"
-        load_project_config ${CONFIG_PATH:+"$CONFIG_PATH"}
         ensure_infra_ready
 
         # Recompute derived variables not stored in metadata
@@ -2830,6 +3110,11 @@ cmd_switch() {
     meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No tracked worktree found for issue '$issue_input'."
     load_instance_metadata "$meta_file"
 
+    # Load project config from the instance's saved config path
+    # (needed for SW_BIN_CONSOLE, SW_BASE_BRANCH, SW_PROJECT_NETWORK, etc.)
+    load_project_config ${CONFIG_PATH:+"$CONFIG_PATH"}
+    ensure_infra_ready
+
     local current_mode="${SWCTL_MODE:-dev}"
     if [ "$current_mode" = "$target_mode" ]; then
         info "Already in '$target_mode' mode. Nothing to do."
@@ -2840,10 +3125,11 @@ cmd_switch() {
     info "Switching '$ISSUE_ID' from $current_mode → $target_mode mode."
 
     # Re-run diff analysis for the worktree
+    # For plugin-external: WORKTREE_PATH points to trunk root, use BASE_REF from metadata
     local base_ref
     base_ref="$(git_base_ref)"
     local diff_files
-    diff_files="$(git -C "$WORKTREE_PATH" diff --name-only "${base_ref}...HEAD" 2>/dev/null || true)"
+    diff_files="$(git -C "${WORKTREE_PATH:-$PROJECT_ROOT}" diff --name-only "${base_ref}...HEAD" 2>/dev/null || true)"
     count_changes "$diff_files"
 
     if [ "$target_mode" = "dev" ]; then
@@ -2888,6 +3174,11 @@ cmd_switch() {
 
         # Frontend builds that QA skipped
         run_frontend_build_if_needed "$COMPOSE_PROJECT"
+
+        # Re-activate plugin if this is a plugin instance
+        if [ -n "${PLUGIN_NAME:-}" ]; then
+            activate_plugin "$COMPOSE_PROJECT" "$PLUGIN_NAME"
+        fi
 
     else
         # Dev → QA: Dev already has everything built. Just switch to
@@ -2942,88 +3233,31 @@ cmd_clean() {
 
     load_instance_metadata "$meta_file"
 
-    # Plugin-aware cleanup
-    case "${PROJECT_TYPE:-platform}" in
-        plugin-external)
-            # Clean plugin worktree
-            if [ -n "${PLUGIN_WORKTREE_PATHS:-}" ]; then
-                local saved_ifs="$IFS"
-                IFS=','
-                local pw_arr=($PLUGIN_WORKTREE_PATHS)
-                IFS="$saved_ifs"
-                for pw_path in "${pw_arr[@]}"; do
-                    if [ -d "$pw_path" ]; then
-                        # Find the plugin's git repo to remove the worktree properly
-                        local plugin_git_dir
-                        plugin_git_dir="$(git -C "$pw_path" rev-parse --git-common-dir 2>/dev/null || true)"
-                        if [ -n "$plugin_git_dir" ]; then
-                            git -C "$(dirname "$plugin_git_dir")" worktree remove --force "$pw_path" >/dev/null 2>&1 \
-                                || rm -rf "$pw_path" 2>/dev/null || true
-                        else
-                            rm -rf "$pw_path" 2>/dev/null || true
-                        fi
-                        ok "Removed plugin worktree: $pw_path"
-                    fi
-                done
-            fi
-
-            # Update parent platform metadata to remove linkage
-            if [ -n "${PLATFORM_ISSUE_ID:-}" ] && [ -n "${SW_PROJECT_SLUG:-}" ]; then
-                local platform_meta
-                platform_meta="$(instance_dir "$SW_PROJECT_SLUG")/${PLATFORM_ISSUE_ID}.env"
-                if [ -f "$platform_meta" ]; then
-                    # Remove LINKED_PLUGINS and PLUGIN_WORKTREE_PATHS from platform metadata
-                    local tmp_meta="${platform_meta}.tmp"
-                    grep -vE '^(LINKED_PLUGINS|PLUGIN_WORKTREE_PATHS)=' "$platform_meta" > "$tmp_meta" 2>/dev/null || true
-                    mv "$tmp_meta" "$platform_meta"
+    # Plugin-aware cleanup: remove nested plugin worktrees before trunk cleanup
+    # In the new flow, plugin-external instances ARE trunk worktrees with a
+    # nested plugin git worktree inside.  We must detach that plugin worktree
+    # from its repo first, then fall through to the standard container/DB/
+    # worktree cleanup.
+    if [ -n "${PLUGIN_WORKTREE_PATHS:-}" ]; then
+        local saved_ifs="$IFS"
+        IFS=','
+        local pw_arr=($PLUGIN_WORKTREE_PATHS)
+        IFS="$saved_ifs"
+        for pw_path in "${pw_arr[@]}"; do
+            if [ -d "$pw_path" ]; then
+                # Find the plugin's git repo to remove the worktree properly
+                local plugin_git_dir
+                plugin_git_dir="$(git -C "$pw_path" rev-parse --git-common-dir 2>/dev/null || true)"
+                if [ -n "$plugin_git_dir" ]; then
+                    git -C "$(dirname "$plugin_git_dir")" worktree remove --force "$pw_path" >/dev/null 2>&1 \
+                        || rm -rf "$pw_path" 2>/dev/null || true
+                else
+                    rm -rf "$pw_path" 2>/dev/null || true
                 fi
+                ok "Removed plugin worktree: $pw_path"
             fi
-
-            # Remove plugin metadata
-            rm -f "$meta_file"
-            ok "Cleaned plugin '${PLUGIN_NAME:-$ISSUE_ID}'."
-            return 0
-            ;;
-
-        platform)
-            # If platform has linked plugins, require --force
-            if [ -n "${LINKED_PLUGINS:-}" ] && [ "$force" -eq 0 ]; then
-                die "Platform worktree has linked plugins: ${LINKED_PLUGINS}. Use --force to clean all, or clean plugins first."
-            fi
-
-            # With --force, clean linked plugin metadata
-            if [ -n "${LINKED_PLUGINS:-}" ]; then
-                info "Cleaning linked plugins: ${LINKED_PLUGINS}"
-                local saved_ifs="$IFS"
-                IFS=','
-                local pl_arr=($LINKED_PLUGINS)
-                IFS="$saved_ifs"
-                for p_name in "${pl_arr[@]}"; do
-                    local p_slug
-                    p_slug="$(sanitize_slug "$p_name")"
-                    local p_meta
-                    p_meta="$(instance_dir "$p_slug")/${ISSUE_ID}.env"
-                    if [ -f "$p_meta" ]; then
-                        rm -f "$p_meta"
-                        ok "Removed plugin metadata: $p_slug/$ISSUE_ID"
-                    fi
-                done
-
-                # Clean plugin worktrees
-                if [ -n "${PLUGIN_WORKTREE_PATHS:-}" ]; then
-                    IFS=','
-                    local pw_arr=($PLUGIN_WORKTREE_PATHS)
-                    IFS="$saved_ifs"
-                    for pw_path in "${pw_arr[@]}"; do
-                        if [ -d "$pw_path" ]; then
-                            rm -rf "$pw_path" 2>/dev/null || true
-                            ok "Removed plugin worktree: $pw_path"
-                        fi
-                    done
-                fi
-            fi
-            ;;
-    esac
+        done
+    fi
 
     # Standard cleanup (containers, volumes, networks, DB, worktree)
 

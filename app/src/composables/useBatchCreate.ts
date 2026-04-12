@@ -21,6 +21,7 @@ interface BatchJobData {
   issue: string
   branch: string
   plugin: string
+  deps: string
   status: BatchJobStatus
   progress: number  // 0-100
   progressLabel: string
@@ -61,13 +62,14 @@ export function useBatchCreate() {
   const isRunning = computed(() => jobs.value.some(j => j.status === 'running'))
   const allDone = computed(() => isStarted.value && pendingCount.value === 0 && runningCount.value === 0)
 
-  function addJob(issue: string, branch = '', plugin = '') {
+  function addJob(issue: string, branch = '', plugin = '', deps = '') {
     const id = `batch-${++jobCounter}`
     jobs.value.push({
       id,
       issue: issue.trim(),
       branch: branch.trim(),
       plugin: plugin.trim(),
+      deps: deps.trim(),
       status: 'pending',
       progress: 0,
       progressLabel: '',
@@ -143,6 +145,7 @@ export function useBatchCreate() {
       branch: branch || undefined,
       project: _project || undefined,
       plugin: nextJob.plugin || undefined,
+      deps: nextJob.deps || undefined,
     })
     stream.start(url)
 

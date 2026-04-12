@@ -15,8 +15,23 @@ const batch = useBatchCreate()
 // Shared settings
 const selectedProject = ref(activeProjectName.value || '')
 const selectedPlugin = ref('')
+const selectedDeps = ref<Set<string>>(new Set())
+const showDepsDropdown = ref(false)
 const mode = ref<'dev' | 'qa'>('dev')
 const availablePlugins = ref<string[]>([])
+
+const availableDeps = computed(() =>
+  availablePlugins.value.filter(p => p !== selectedPlugin.value)
+)
+const depsString = computed(() => [...selectedDeps.value].join(','))
+
+function toggleDep(name: string) {
+  const s = new Set(selectedDeps.value)
+  s.has(name) ? s.delete(name) : s.add(name)
+  selectedDeps.value = s
+}
+
+watch(selectedPlugin, () => { selectedDeps.value = new Set() })
 
 // Input mode: 'manual' | 'github'
 const inputMode = ref<'manual' | 'github'>('manual')
@@ -159,9 +174,10 @@ const canStart = computed(() =>
   batch.pendingCount.value > 0 && selectedProject.value !== '' && !batch.isRunning.value
 )
 
-// Load plugins when project changes
+// Load plugins when project changes (immediate: fire on initial value too)
 watch(selectedProject, async (proj) => {
   selectedPlugin.value = ''
+  selectedDeps.value = new Set()
   availablePlugins.value = []
   if (!proj) return
   try {
@@ -169,7 +185,7 @@ watch(selectedProject, async (proj) => {
   } catch {
     availablePlugins.value = []
   }
-})
+}, { immediate: true })
 
 // Auto-refresh instances when a batch finishes
 watch(() => batch.allDone.value, (done) => {
@@ -180,14 +196,14 @@ watch(() => batch.allDone.value, (done) => {
 function addFromTextarea() {
   const entries = batch.parseMultilineInput(quickAddText.value)
   for (const e of entries) {
-    batch.addJob(e.issue, e.branch, selectedPlugin.value)
+    batch.addJob(e.issue, e.branch, selectedPlugin.value, depsString.value)
   }
   quickAddText.value = ''
 }
 
 function addManual() {
   if (!manualIssue.value.trim()) return
-  batch.addJob(manualIssue.value, manualBranch.value, selectedPlugin.value)
+  batch.addJob(manualIssue.value, manualBranch.value, selectedPlugin.value, depsString.value)
   manualIssue.value = ''
   manualBranch.value = ''
 }
@@ -270,7 +286,7 @@ function addSelectedGhItems() {
     const issue = String(item.number)
     // Use linked PR branch if available, otherwise derive from issue type
     const branch = item.branch || `${branchPrefixFromType(item.issueType)}/${item.number}`
-    batch.addJob(issue, branch, selectedPlugin.value)
+    batch.addJob(issue, branch, selectedPlugin.value, depsString.value)
   }
   if (skipped > 0) {
     ghSkippedCount.value = skipped
@@ -373,6 +389,37 @@ function handleNewBatch() {
                 <option value="">{{ availablePlugins.length ? 'Platform only' : 'No plugins' }}</option>
                 <option v-for="p in availablePlugins" :key="p" :value="p">{{ p }}</option>
               </select>
+            </div>
+            <div v-if="availableDeps.length" class="w-52">
+              <label class="block text-xs text-gray-400 mb-1">Dependencies</label>
+              <div class="relative">
+                <button
+                  type="button"
+                  @click="showDepsDropdown = !showDepsDropdown"
+                  :disabled="batch.isRunning.value"
+                  class="w-full bg-surface-dark border border-border rounded px-3 py-1.5 text-sm text-white text-left focus:outline-none focus:border-blue-500 transition-colors disabled:opacity-40 truncate"
+                >
+                  {{ selectedDeps.size ? `${selectedDeps.size} selected` : 'None' }}
+                </button>
+                <div
+                  v-if="showDepsDropdown"
+                  class="absolute z-50 mt-1 w-full bg-surface-dark border border-border rounded shadow-lg max-h-48 overflow-y-auto"
+                >
+                  <label
+                    v-for="p in availableDeps"
+                    :key="p"
+                    class="flex items-center gap-2 px-3 py-1.5 hover:bg-surface text-sm text-white cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      :checked="selectedDeps.has(p)"
+                      @change="toggleDep(p)"
+                      class="accent-blue-500"
+                    />
+                    {{ p }}
+                  </label>
+                </div>
+              </div>
             </div>
             <div class="w-24">
               <label class="block text-xs text-gray-400 mb-1">Mode</label>

@@ -12,6 +12,9 @@ export interface GitWorktree {
   source: 'claude' | 'codex' | 'swctl' | 'manual'
   registered: boolean
   repoPath?: string
+  isPlugin: boolean
+  pluginName: string | null
+  parentProject: string | null
 }
 
 function classifySource(wtPath: string): GitWorktree['source'] {
@@ -65,6 +68,9 @@ export function listGitWorktrees(repoPath: string, projectSlug: string): Promise
           source: classifySource(wtPath),
           registered: true,
           repoPath,
+          isPlugin: false,
+          pluginName: null,
+          parentProject: null,
         })
       }
 
@@ -184,11 +190,27 @@ export async function discoverToolWorktrees(
       // If this repo is already registered, skip — listGitWorktrees() handles it
       if (registeredPaths.has(repoRoot)) continue
 
+      // Check if this repo is a plugin nested under a registered platform project
+      // e.g. repoRoot = /path/to/trunk/custom/plugins/SwagCustomizedProducts
+      let isPlugin = false
+      let pluginName: string | null = null
+      let parentProject: string | null = null
+
+      for (const [regPath, regSlug] of registeredSlugs.entries()) {
+        const pluginPrefix = regPath + '/custom/plugins/'
+        if (repoRoot.startsWith(pluginPrefix)) {
+          isPlugin = true
+          pluginName = repoRoot.slice(pluginPrefix.length).split('/')[0]
+          parentProject = regSlug
+          break
+        }
+      }
+
       // Check if any registered project matches (path normalization)
       const registeredSlug = registeredSlugs.get(repoRoot)
-      const isRegistered = !!registeredSlug
+      const isRegistered = !!registeredSlug || isPlugin
 
-      const slug = registeredSlug || path.basename(repoRoot)
+      const slug = isPlugin ? parentProject! : (registeredSlug || path.basename(repoRoot))
       const source = classifySource(wtPath)
       const info = getWorktreeInfo(wtPath)
 
@@ -202,6 +224,9 @@ export async function discoverToolWorktrees(
         source,
         registered: isRegistered,
         repoPath: repoRoot,
+        isPlugin,
+        pluginName,
+        parentProject,
       })
     }
   }
@@ -236,6 +261,52 @@ function findGitWorktrees(dir: string, maxDepth: number): string[] {
   } catch {}
 
   return results
+}
+
+/**
+ * Scan plugin repos under each registered platform's custom/plugins/ directory
+ * and discover their worktrees via `git worktree list`.  This catches plugin
+ * worktrees created by Claude Code, Codex, or manually — regardless of where
+ * they live on disk.
+ */
+export async function discoverPluginWorktrees(
+  projects: Array<{ name: string; path: string; type: string }>,
+): Promise<GitWorktree[]> {
+  const platformProjects = projects.filter(p => p.type === 'platform')
+  const promises: Promise<GitWorktree[]>[] = []
+
+  for (const proj of platformProjects) {
+    const pluginsDir = path.join(proj.path, 'custom', 'plugins')
+    if (!fs.existsSync(pluginsDir)) continue
+
+    try {
+      const entries = fs.readdirSync(pluginsDir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const pluginPath = path.join(pluginsDir, entry.name)
+        const gitPath = path.join(pluginPath, '.git')
+        // Only repos with a .git directory (not .git file, which is a worktree)
+        if (!fs.existsSync(gitPath)) continue
+        try { if (!fs.statSync(gitPath).isDirectory()) continue } catch { continue }
+
+        // This is a plugin repo — list its worktrees
+        const pluginName = entry.name
+        const parentProject = proj.name
+        promises.push(
+          listGitWorktrees(pluginPath, proj.name).then(wts =>
+            wts.map(wt => ({
+              ...wt,
+              isPlugin: true,
+              pluginName,
+              parentProject,
+            }))
+          )
+        )
+      }
+    } catch {}
+  }
+
+  return (await Promise.all(promises)).flat()
 }
 
 export function listBranches(repoPath: string, query?: string, limit = 50): Promise<string[]> {
