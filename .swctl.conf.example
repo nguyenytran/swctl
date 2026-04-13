@@ -54,4 +54,4 @@ SW_SHARED_DB_INSTALL_ARGS="--basic-setup --force --no-interaction"
 # API tokens for batch create from MRs/PRs (optional, requires jq).
 # SWCTL_GITLAB_TOKEN=""
 # SWCTL_GITLAB_URL="https://gitlab.com"
-# SWCTL_GITHUB_TOKEN=""
+# GitHub auth: run 'swctl auth login' (token stored in state dir)

@@ -21,6 +21,21 @@ import {
 
 const app = new Hono()
 
+// Resolve GitHub token: cookie → env var → token file (written by `swctl auth login`)
+function resolveGitHubToken(cookieToken?: string): { token: string; source: string } {
+  if (cookieToken) return { token: cookieToken, source: 'cookie' }
+  // Read token file on disk (written by `swctl auth login`, mounted via SWCTL_STATE_DIR volume)
+  const stateDir = process.env.SWCTL_STATE_DIR || ''
+  if (stateDir) {
+    const tokenFile = path.join(stateDir, 'github.token')
+    try {
+      const t = fs.readFileSync(tokenFile, 'utf-8').trim()
+      if (t) return { token: t, source: 'cli' }
+    } catch {}
+  }
+  return { token: '', source: '' }
+}
+
 // --- API routes ---
 
 app.get('/api/instances', async (c) => {
@@ -324,9 +339,7 @@ app.get('/api/settings', (c) => {
 
 // Check auth status
 app.get('/api/github/status', async (c) => {
-  // Try cookie first, then env var (from gh CLI via swctl auth login)
-  const token = getCookie(c, 'gh_token') || process.env.SWCTL_GITHUB_TOKEN || ''
-  const tokenSource = getCookie(c, 'gh_token') ? 'cookie' : process.env.SWCTL_GITHUB_TOKEN ? 'cli' : ''
+  const { token, source: tokenSource } = resolveGitHubToken(getCookie(c, 'gh_token'))
 
   if (!token) {
     return c.json({
@@ -392,7 +405,7 @@ app.get('/api/github/issues', async (c) => {
     return c.json({ items: [], error: 'Invalid repo format. Use owner/repo (e.g. shopware/shopware)' }, 400)
   }
 
-  const token = getCookie(c, 'gh_token') || process.env.SWCTL_GITHUB_TOKEN || ''
+  const { token } = resolveGitHubToken(getCookie(c, 'gh_token'))
   if (!token) {
     return c.json({ items: [], error: 'auth_required' })
   }

@@ -12,7 +12,6 @@ services:
       SW_RUNTIME: ${SW_RUNTIME:-traefik}
       SWCTL_EDITOR: ${SWCTL_EDITOR:-phpstorm}
       SWCTL_BROWSE_ROOT: ${SWCTL_BROWSE_ROOT:-}
-      SWCTL_GITHUB_TOKEN: ${SWCTL_GITHUB_TOKEN:-}
       SWCTL_GITHUB_CLIENT_ID: ${SWCTL_GITHUB_CLIENT_ID:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

@@ -161,7 +161,7 @@ Creates multiple worktrees in one command. Three input sources are supported:
 ./swctl batch create --github your-org/shopware
 ```
 
-Set `SWCTL_GITLAB_TOKEN` / `SWCTL_GITHUB_TOKEN` in your environment or `.swctl.conf`. The command presents an interactive selection list when using API sources.
+For GitHub, run `swctl auth login` to authenticate. For GitLab, set `SWCTL_GITLAB_TOKEN` in your environment or `.swctl.conf`. The command presents an interactive selection list when using API sources.
 
 **Parallel mode** creates worktrees concurrently:
 

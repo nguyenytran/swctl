@@ -2457,9 +2457,8 @@ fetch_gitlab_mrs() {
 
 fetch_github_prs() {
     local repo="$1"
-    local token="${SWCTL_GITHUB_TOKEN:-}"
-    # Load from token file if not set via env
-    if [ -z "$token" ] && [ -f "$SWCTL_GITHUB_TOKEN_FILE" ]; then
+    local token=""
+    if [ -f "$SWCTL_GITHUB_TOKEN_FILE" ]; then
         token="$(cat "$SWCTL_GITHUB_TOKEN_FILE")"
     fi
     local auth_header=""
@@ -4241,9 +4240,6 @@ cmd_auth() {
             if [ -f "$SWCTL_GITHUB_TOKEN_FILE" ]; then
                 token="$(cat "$SWCTL_GITHUB_TOKEN_FILE")"
                 token_source="token file"
-            elif [ -n "${SWCTL_GITHUB_TOKEN:-}" ]; then
-                token="$SWCTL_GITHUB_TOKEN"
-                token_source="environment variable"
             elif command -v gh >/dev/null 2>&1; then
                 token="$(gh auth token 2>/dev/null)" || true
                 token_source="gh CLI"
@@ -4357,11 +4353,6 @@ cmd_ui() {
     export SW_RUNTIME="${SW_RUNTIME:-$(detect_runtime)}"
     export SWCTL_EDITOR="${SWCTL_EDITOR:-phpstorm}"
     export SWCTL_BROWSE_ROOT="${SWCTL_BROWSE_ROOT:-$HOME}"
-    # Load GitHub token from file if not set via env
-    if [ -z "${SWCTL_GITHUB_TOKEN:-}" ] && [ -f "$SWCTL_GITHUB_TOKEN_FILE" ]; then
-        SWCTL_GITHUB_TOKEN="$(cat "$SWCTL_GITHUB_TOKEN_FILE")"
-    fi
-    export SWCTL_GITHUB_TOKEN="${SWCTL_GITHUB_TOKEN:-}"
     export SWCTL_GITHUB_CLIENT_ID="${SWCTL_GITHUB_CLIENT_ID:-}"
 
     case "$action" in

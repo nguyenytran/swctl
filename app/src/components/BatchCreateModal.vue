@@ -61,6 +61,68 @@ let pollTimer: ReturnType<typeof setTimeout> | null = null
 const ghSkippedCount = ref(0)
 let ghSkippedTimer: ReturnType<typeof setTimeout> | null = null
 
+// GitHub filter state
+const ghFilterCategories = ref<Set<string>>(new Set(['assigned', 'review-requested', 'my-pr']))
+const ghFilterTypes = ref<Set<string>>(new Set(['issue', 'pr']))
+const ghFilterIssueTypes = ref<Set<string>>(new Set()) // empty = show all
+
+// Issue type color map (matches the badge colors in the list)
+const issueTypeColors: Record<string, { active: string; label: string }> = {
+  Bug:         { active: 'bg-red-600/20 text-red-400 border-red-600/40', label: 'Bug' },
+  Improvement: { active: 'bg-emerald-600/20 text-emerald-400 border-emerald-600/40', label: 'Improvement' },
+  Story:       { active: 'bg-yellow-600/20 text-yellow-400 border-yellow-600/40', label: 'Story' },
+  Task:        { active: 'bg-blue-600/20 text-blue-400 border-blue-600/40', label: 'Task' },
+  Epic:        { active: 'bg-purple-600/20 text-purple-400 border-purple-600/40', label: 'Epic' },
+}
+
+// Distinct issue types present in the current result set
+const ghAvailableIssueTypes = computed(() => {
+  const types = new Set<string>()
+  for (const item of ghItems.value) {
+    if (item.issueType) types.add(item.issueType)
+  }
+  return Array.from(types).sort()
+})
+
+function toggleGhFilterCategory(cat: string) {
+  const s = new Set(ghFilterCategories.value)
+  if (s.has(cat)) s.delete(cat)
+  else s.add(cat)
+  ghFilterCategories.value = s
+}
+function toggleGhFilterType(t: string) {
+  const s = new Set(ghFilterTypes.value)
+  if (s.has(t)) s.delete(t)
+  else s.add(t)
+  ghFilterTypes.value = s
+}
+function toggleGhFilterIssueType(t: string) {
+  const s = new Set(ghFilterIssueTypes.value)
+  if (s.has(t)) s.delete(t)
+  else s.add(t)
+  ghFilterIssueTypes.value = s
+}
+
+const ghFilteredItems = computed(() => {
+  const catFilter = ghFilterCategories.value
+  const typeFilter = ghFilterTypes.value
+  const issueTypeFilter = ghFilterIssueTypes.value
+  return ghItems.value.filter(item => {
+    // Category filter (empty = show all)
+    if (catFilter.size > 0 && !catFilter.has(item.category)) return false
+    // Type filter: issue vs PR (empty = show all)
+    if (typeFilter.size > 0) {
+      if (item.isPR && !typeFilter.has('pr')) return false
+      if (!item.isPR && !typeFilter.has('issue')) return false
+    }
+    // Issue type filter (empty = show all)
+    if (issueTypeFilter.size > 0) {
+      if (!item.issueType || !issueTypeFilter.has(item.issueType)) return false
+    }
+    return true
+  })
+})
+
 // Load GitHub auth status on mount
 fetchGitHubStatus().then(s => { ghAuth.value = s }).catch(() => {})
 
@@ -216,6 +278,9 @@ async function fetchFromGitHub() {
   ghAuthUrl.value = ''
   ghItems.value = []
   ghSelected.value = new Set()
+  ghFilterIssueTypes.value = new Set()
+  ghFilterCategories.value = new Set(['assigned', 'review-requested', 'my-pr'])
+  ghFilterTypes.value = new Set(['issue', 'pr'])
 
   try {
     const result = await fetchGitHubIssues(ghRepo.value.trim())
@@ -246,8 +311,9 @@ function toggleGhItem(num: number) {
 
 function selectableGhItems() {
   // In QA mode, only items with a linked PR branch are selectable
-  if (mode.value === 'qa') return ghItems.value.filter(i => i.branch)
-  return ghItems.value
+  const items = ghFilteredItems.value
+  if (mode.value === 'qa') return items.filter(i => i.branch)
+  return items
 }
 
 function toggleAllGh() {
@@ -589,6 +655,62 @@ function handleNewBatch() {
 
               <!-- Results -->
               <div v-if="ghItems.length > 0" class="space-y-2">
+                <!-- Filter bar -->
+                <div class="flex items-center gap-2 flex-wrap">
+                  <button
+                    class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
+                    :class="ghFilterTypes.has('issue')
+                      ? 'bg-emerald-600/20 text-emerald-400 border-emerald-600/40'
+                      : 'bg-transparent text-gray-500 border-gray-700 hover:border-gray-500'"
+                    @click="toggleGhFilterType('issue')"
+                  >Issues</button>
+                  <button
+                    class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
+                    :class="ghFilterTypes.has('pr')
+                      ? 'bg-purple-600/20 text-purple-400 border-purple-600/40'
+                      : 'bg-transparent text-gray-500 border-gray-700 hover:border-gray-500'"
+                    @click="toggleGhFilterType('pr')"
+                  >Pull Requests</button>
+
+                  <span class="text-gray-700">|</span>
+                  <button
+                    class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
+                    :class="ghFilterCategories.has('assigned')
+                      ? 'bg-blue-600/20 text-blue-400 border-blue-600/40'
+                      : 'bg-transparent text-gray-500 border-gray-700 hover:border-gray-500'"
+                    @click="toggleGhFilterCategory('assigned')"
+                  >Assigned</button>
+                  <button
+                    class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
+                    :class="ghFilterCategories.has('review-requested')
+                      ? 'bg-yellow-600/20 text-yellow-400 border-yellow-600/40'
+                      : 'bg-transparent text-gray-500 border-gray-700 hover:border-gray-500'"
+                    @click="toggleGhFilterCategory('review-requested')"
+                  >Review</button>
+                  <button
+                    class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
+                    :class="ghFilterCategories.has('my-pr')
+                      ? 'bg-purple-600/20 text-purple-400 border-purple-600/40'
+                      : 'bg-transparent text-gray-500 border-gray-700 hover:border-gray-500'"
+                    @click="toggleGhFilterCategory('my-pr')"
+                  >My PRs</button>
+
+                  <template v-if="ghAvailableIssueTypes.length > 0">
+                    <span class="text-gray-700">|</span>
+                    <button
+                      v-for="itype in ghAvailableIssueTypes"
+                      :key="itype"
+                      class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
+                      :class="ghFilterIssueTypes.has(itype)
+                        ? (issueTypeColors[itype]?.active || 'bg-gray-600/20 text-gray-400 border-gray-600/40')
+                        : 'bg-transparent text-gray-500 border-gray-700 hover:border-gray-500'"
+                      @click="toggleGhFilterIssueType(itype)"
+                    >{{ itype }}</button>
+                  </template>
+
+                  <span class="ml-auto text-[10px] text-gray-600">{{ ghFilteredItems.length }}/{{ ghItems.length }}</span>
+                </div>
+
                 <div class="flex items-center justify-between">
                   <button
                     class="text-xs text-gray-400 hover:text-white transition-colors"
@@ -607,7 +729,7 @@ function handleNewBatch() {
                 </div>
                 <div class="overflow-y-auto border border-border rounded bg-surface-dark">
                   <div
-                    v-for="item in ghItems"
+                    v-for="item in ghFilteredItems"
                     :key="item.number"
                     class="flex items-start gap-2 px-3 py-2 border-b border-border last:border-b-0 hover:bg-surface-hover transition-colors"
                     :class="{ 'opacity-40': mode === 'qa' && !item.branch }"
@@ -642,9 +764,9 @@ function handleNewBatch() {
                             'bg-purple-600/20 text-purple-400 border border-purple-600/30': item.category === 'my-pr',
                           }"
                         >{{ item.category === 'assigned' ? 'assigned' : item.category === 'review-requested' ? 'review' : 'my PR' }}</span>
-                        <span
+                        <button
                           v-if="item.issueType"
-                          class="text-[10px] px-1 py-0 rounded shrink-0"
+                          class="text-[10px] px-1 py-0 rounded shrink-0 hover:ring-1 hover:ring-white/20 transition-all cursor-pointer"
                           :class="{
                             'bg-red-600/20 text-red-400 border border-red-600/30': item.issueType === 'Bug',
                             'bg-emerald-600/20 text-emerald-400 border border-emerald-600/30': item.issueType === 'Improvement',
@@ -652,7 +774,9 @@ function handleNewBatch() {
                             'bg-blue-600/20 text-blue-400 border border-blue-600/30': item.issueType === 'Task',
                             'bg-purple-600/20 text-purple-400 border border-purple-600/30': item.issueType === 'Epic',
                           }"
-                        >{{ item.issueType }}</span>
+                          @click.stop="toggleGhFilterIssueType(item.issueType!)"
+                          :title="`Filter by type: ${item.issueType}`"
+                        >{{ item.issueType }}</button>
                         <span class="text-xs text-white truncate">{{ item.title }}</span>
                       </div>
                       <div class="flex items-center gap-2 mt-0.5 flex-wrap">
