@@ -1,3 +1,7 @@
+# Workflow: defines platform-specific provisioning, builds, and templates.
+# Built-in: "shopware6". Custom workflows: ~/.config/swctl/workflows/<name>/
+# SWCTL_WORKFLOW="shopware6"
+
 # Runtime mode: "orbstack" or "traefik". Auto-detected if not set.
 # OrbStack mode uses *.orb.local domains (no Traefik needed).
 # Traefik mode uses Traefik reverse proxy with custom domain suffix.

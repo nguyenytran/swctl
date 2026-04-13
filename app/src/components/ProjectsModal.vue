@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useProjects } from '@/composables/useProjects'
-import { fetchDirectories, initProjectConfig } from '@/api'
+import { fetchDirectories, initProjectConfig, fetchWorkflows } from '@/api'
+import type { Workflow } from '@/types'
 
 const emit = defineEmits<{ close: [] }>()
 const { projects, refresh, add, remove, discover } = useProjects()
@@ -25,6 +26,19 @@ const projectNameInput = ref('')
 
 // Init form state
 const showInitForm = ref(false)
+// Workflow state
+const workflows = ref<Workflow[]>([])
+const selectedWorkflow = ref('shopware6')
+
+onMounted(async () => {
+  try {
+    workflows.value = await fetchWorkflows()
+    if (workflows.value.length > 0 && !workflows.value.find(w => w.id === selectedWorkflow.value)) {
+      selectedWorkflow.value = workflows.value[0].id
+    }
+  } catch {}
+})
+
 const initForm = ref({
   name: '',
   baseBranch: 'trunk',
@@ -100,6 +114,7 @@ async function handleInit() {
   try {
     const res = await initProjectConfig({
       path: browsePath.value,
+      workflow: selectedWorkflow.value,
       ...initForm.value,
     })
     if (!res.ok) {
@@ -229,6 +244,17 @@ function pathSegments(p: string) {
           <!-- Init form -->
           <div v-if="showInitForm" class="px-3 py-3 border-b border-blue-600/30 bg-blue-600/5 space-y-3">
             <div class="text-xs text-blue-400 font-medium">Initialize swctl project</div>
+            <div v-if="workflows.length > 0">
+              <label class="block text-xs text-gray-500 mb-0.5">Workflow</label>
+              <select
+                v-model="selectedWorkflow"
+                class="w-full bg-surface border border-border rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-blue-500"
+              >
+                <option v-for="wf in workflows" :key="wf.id" :value="wf.id">
+                  {{ wf.name }}{{ wf.description ? ` — ${wf.description}` : '' }}
+                </option>
+              </select>
+            </div>
             <div class="grid grid-cols-2 gap-2">
               <div>
                 <label class="block text-xs text-gray-500 mb-0.5">Project name</label>

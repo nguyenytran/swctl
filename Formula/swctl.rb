@@ -15,6 +15,7 @@ class Swctl < Formula
     pkgshare.install ".swctl.conf.example",
                      "docker-compose.swctl.yml",
                      "docker-compose.swctl.orbstack.yml",
+                     "workflows",
                      "app",
                      "README.md"
 

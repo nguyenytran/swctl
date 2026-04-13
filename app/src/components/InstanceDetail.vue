@@ -22,6 +22,7 @@ const availableTabs = computed<Array<{ id: TabName; label: string }>>(() => {
 const logStream = useStream()
 const execStream = useStream()
 const wtStream = useStream()
+const isRefreshing = ref(false)
 const cmdInput = ref('')
 const cmdHistory = ref<Array<{ command: string; lines: StreamEvent[]; exitCode: number | null }>>([])
 const terminalEl = ref<HTMLElement | null>(null)
@@ -174,6 +175,22 @@ async function handleRestart() {
   emit('refresh')
 }
 
+function handleRefresh() {
+  if (isRefreshing.value) return
+  isRefreshing.value = true
+  activeTab.value = 'logs'
+  logStream.stop()
+  logStream.start(buildStreamUrl('refresh', { issueId: props.instance.issueId }))
+}
+
+// Watch logStream completion to reset refreshing state and reload instance data
+watch(() => logStream.result.value, (r) => {
+  if (r && isRefreshing.value) {
+    isRefreshing.value = false
+    emit('refresh')
+  }
+})
+
 function close() {
   logStream.stop()
   if (execStream.running.value) {
@@ -253,6 +270,12 @@ function formatDate(iso: string) {
           class="px-3 py-1 text-xs bg-blue-600/20 text-blue-400 border border-blue-600/30 rounded hover:bg-blue-600/30 transition-colors"
           @click="handleRestart"
         >Restart</button>
+        <button
+          v-if="instance.containerStatus === 'running' && instance.status === 'complete'"
+          class="px-3 py-1 text-xs bg-purple-600/20 text-purple-400 border border-purple-600/30 rounded hover:bg-purple-600/30 transition-colors disabled:opacity-50"
+          :disabled="isRefreshing"
+          @click="handleRefresh"
+        >{{ isRefreshing ? 'Refreshing...' : 'Refresh' }}</button>
       </div>
     </div>
 
