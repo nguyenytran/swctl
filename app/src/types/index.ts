@@ -23,6 +23,7 @@ export interface Instance {
   status: 'creating' | 'failed' | 'complete'
   failedAt: string
   changes: Changes
+  checkedOut?: boolean
 }
 
 export interface Changes {

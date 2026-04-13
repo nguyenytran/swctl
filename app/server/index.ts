@@ -46,9 +46,21 @@ app.get('/api/instances', async (c) => {
     Promise.resolve(readProjects()),
   ])
 
+  // Read checkout state to annotate checked-out instance
+  let checkoutIssueId = ''
+  try {
+    const stateDir = process.env.SWCTL_STATE_DIR || path.join(process.env.HOME || '/root', '.local/state/swctl')
+    const checkoutContent = fs.readFileSync(path.join(stateDir, 'checkout.state'), 'utf-8')
+    const m = checkoutContent.match(/CHECKOUT_ACTIVE_ISSUE=(?:'([^']*)'|"([^"]*)"|(\S+))/)
+    checkoutIssueId = m?.[1] || m?.[2] || m?.[3] || ''
+  } catch {}
+
   // Enrich managed instances with Docker container status
   for (const inst of instances) {
     inst.kind = 'managed'
+    if (checkoutIssueId && inst.issueId === checkoutIssueId) {
+      inst.checkedOut = true
+    }
     const cs = statuses[inst.composeProject]
     if (cs) {
       inst.containerStatus = cs.state === 'running' ? 'running' : 'exited'
@@ -485,6 +497,33 @@ app.get('/api/stream/switch-mode', (c) => {
   const mode = c.req.query('mode') || ''
   if (!issueId || !mode) return c.json({ error: 'Missing parameters' }, 400)
   return streamSwctl(c, ['switch', issueId, `--${mode}`], `switch:${issueId}`)
+})
+
+app.get('/api/stream/checkout', (c) => {
+  const issueId = c.req.query('issueId') || ''
+  if (!issueId) return c.json({ error: 'Missing issueId parameter' }, 400)
+  return streamSwctl(c, ['checkout', issueId], `checkout:${issueId}`)
+})
+
+app.get('/api/stream/checkout-return', (c) => {
+  return streamSwctl(c, ['checkout', '--return'], 'checkout:return')
+})
+
+app.get('/api/checkout-state', (c) => {
+  const stateDir = process.env.SWCTL_STATE_DIR || path.join(process.env.HOME || '/root', '.local/state/swctl')
+  const stateFile = path.join(stateDir, 'checkout.state')
+  try {
+    const content = fs.readFileSync(stateFile, 'utf-8')
+    const issueMatch = content.match(/CHECKOUT_ACTIVE_ISSUE=(?:'([^']*)'|"([^"]*)"|(\S+))/)
+    const branchMatch = content.match(/CHECKOUT_PREVIOUS_BRANCH=(?:'([^']*)'|"([^"]*)"|(\S+))/)
+    return c.json({
+      active: true,
+      issueId: issueMatch?.[1] || issueMatch?.[2] || issueMatch?.[3] || '',
+      previousBranch: branchMatch?.[1] || branchMatch?.[2] || branchMatch?.[3] || '',
+    })
+  } catch {
+    return c.json({ active: false, issueId: '', previousBranch: '' })
+  }
 })
 
 app.post('/api/instances/:issueId/restart', async (c) => {

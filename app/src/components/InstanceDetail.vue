@@ -23,6 +23,7 @@ const logStream = useStream()
 const execStream = useStream()
 const wtStream = useStream()
 const isRefreshing = ref(false)
+const isCheckingOut = ref(false)
 const cmdInput = ref('')
 const cmdHistory = ref<Array<{ command: string; lines: StreamEvent[]; exitCode: number | null }>>([])
 const terminalEl = ref<HTMLElement | null>(null)
@@ -183,10 +184,26 @@ function handleRefresh() {
   logStream.start(buildStreamUrl('refresh', { issueId: props.instance.issueId }))
 }
 
-// Watch logStream completion to reset refreshing state and reload instance data
+function handleCheckout() {
+  if (isCheckingOut.value) return
+  isCheckingOut.value = true
+  activeTab.value = 'logs'
+  logStream.stop()
+  if (props.instance.checkedOut) {
+    logStream.start(buildStreamUrl('checkout-return', {}))
+  } else {
+    logStream.start(buildStreamUrl('checkout', { issueId: props.instance.issueId }))
+  }
+}
+
+// Watch logStream completion to reset state and reload instance data
 watch(() => logStream.result.value, (r) => {
   if (r && isRefreshing.value) {
     isRefreshing.value = false
+    emit('refresh')
+  }
+  if (r && isCheckingOut.value) {
+    isCheckingOut.value = false
     emit('refresh')
   }
 })
@@ -276,6 +293,15 @@ function formatDate(iso: string) {
           :disabled="isRefreshing"
           @click="handleRefresh"
         >{{ isRefreshing ? 'Refreshing...' : 'Refresh' }}</button>
+        <button
+          v-if="instance.status === 'complete'"
+          class="px-3 py-1 text-xs border rounded transition-colors disabled:opacity-50"
+          :class="instance.checkedOut
+            ? 'bg-orange-600/20 text-orange-400 border-orange-600/30 hover:bg-orange-600/30'
+            : 'bg-cyan-600/20 text-cyan-400 border-cyan-600/30 hover:bg-cyan-600/30'"
+          :disabled="isCheckingOut"
+          @click="handleCheckout"
+        >{{ isCheckingOut ? 'Switching...' : instance.checkedOut ? 'Return Branch' : 'Checkout' }}</button>
       </div>
     </div>
 

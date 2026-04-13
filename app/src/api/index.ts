@@ -229,3 +229,8 @@ export function buildRefreshExternalUrl(worktreePath: string, project: string): 
   u.searchParams.set('project', project)
   return u.pathname + u.search
 }
+
+export async function fetchCheckoutState(): Promise<{ active: boolean; issueId: string; previousBranch: string }> {
+  const res = await fetch(`${BASE}/checkout-state`)
+  return res.json()
+}

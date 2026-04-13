@@ -1130,6 +1130,48 @@ print('sync_dirs=\"{}\"'.format(' '.join(dirs)))
             fi
         fi
     done
+
+    # Mark synced artifacts as git-excluded so they don't pollute worktree git status.
+    # Two mechanisms needed:
+    #   1. info/exclude — hides untracked synced files
+    #   2. assume-unchanged — hides tracked synced files that differ from branch
+    local git_dir
+    git_dir="$(git -C "$WORKTREE_PATH" rev-parse --git-dir 2>/dev/null)" || true
+    if [ -n "$git_dir" ]; then
+        # Make path absolute if relative
+        case "$git_dir" in
+            /*) ;;
+            *)  git_dir="$WORKTREE_PATH/$git_dir" ;;
+        esac
+        local exclude_file="$git_dir/info/exclude"
+        mkdir -p "$(dirname "$exclude_file")"
+        # Add exclude entries for untracked synced artifacts
+        if ! grep -q '# swctl synced artifacts' "$exclude_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# swctl synced artifacts"
+                for f in $sync_files; do
+                    echo "/$f"
+                done
+                for dir in $sync_dirs; do
+                    echo "/$dir/"
+                done
+            } >> "$exclude_file"
+        fi
+
+        # Mark tracked synced files as assume-unchanged
+        for dir in $sync_dirs; do
+            if [ -d "$WORKTREE_PATH/$dir" ]; then
+                git -C "$WORKTREE_PATH" ls-files -z "$dir" 2>/dev/null \
+                    | xargs -0 git -C "$WORKTREE_PATH" update-index --assume-unchanged 2>/dev/null || true
+            fi
+        done
+        for f in $sync_files; do
+            if [ -f "$WORKTREE_PATH/$f" ]; then
+                git -C "$WORKTREE_PATH" update-index --assume-unchanged "$f" 2>/dev/null || true
+            fi
+        done
+    fi
 }
 
 count_changes() {
@@ -3205,6 +3247,87 @@ cmd_refresh() {
     info "URL: ${APP_URL}"
 }
 
+cmd_checkout() {
+    local issue_input="${1:-}"
+    local state_file="$SWCTL_STATE_DIR/checkout.state"
+
+    # --- Return mode: restore main repo to base branch, re-attach worktree ---
+    if [ "$issue_input" = "--return" ] || [ "$issue_input" = "-r" ]; then
+        [ -f "$state_file" ] || die "No active checkout to return from."
+        # shellcheck disable=SC1090
+        . "$state_file"
+        [ -n "${CHECKOUT_ACTIVE_ISSUE:-}" ] || die "Invalid checkout state file."
+
+        local meta_file
+        meta_file="$(resolve_instance_file_by_issue "$CHECKOUT_ACTIVE_ISSUE")" \
+            || die "No tracked worktree found for issue '$CHECKOUT_ACTIVE_ISSUE'."
+        load_instance_metadata "$meta_file"
+        load_project_config ${CONFIG_PATH:+"$CONFIG_PATH"}
+
+        info "Returning main repo to '${CHECKOUT_PREVIOUS_BRANCH}' and re-attaching worktree."
+
+        # Return main repo to previous branch
+        git -C "$PROJECT_ROOT" checkout "$CHECKOUT_PREVIOUS_BRANCH" \
+            || die "Failed to checkout '$CHECKOUT_PREVIOUS_BRANCH' in main repo."
+
+        # Re-attach worktree to its branch
+        git -C "$WORKTREE_PATH" checkout "$BRANCH" \
+            || die "Failed to re-attach worktree to branch '$BRANCH'."
+
+        rm -f "$state_file"
+        ok "Returned main repo to '$CHECKOUT_PREVIOUS_BRANCH'. Worktree '$ISSUE_ID' re-attached to '$BRANCH'."
+        return
+    fi
+
+    # --- Checkout mode: detach worktree, checkout branch in main repo ---
+    [ -n "$issue_input" ] || die "Usage: swctl checkout <issue>  or  swctl checkout --return"
+
+    # Warn if there's already an active checkout
+    if [ -f "$state_file" ]; then
+        # shellcheck disable=SC1090
+        . "$state_file"
+        warn "There is already an active checkout for issue '${CHECKOUT_ACTIVE_ISSUE:-unknown}'."
+        warn "Run 'swctl checkout --return' first, or this will override it."
+    fi
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" \
+        || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+    load_project_config ${CONFIG_PATH:+"$CONFIG_PATH"}
+
+    [ -n "${BRANCH:-}" ] || die "Instance '$issue_input' has no branch set."
+    [ -n "${WORKTREE_PATH:-}" ] || die "Instance '$issue_input' has no worktree path."
+
+    # Save current main repo branch
+    local current_branch
+    current_branch="$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null)" || true
+    [ -n "$current_branch" ] || current_branch="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
+    [ -n "$current_branch" ] || die "Could not determine current branch of main repo."
+
+    info "Checking out branch '$BRANCH' (from worktree '$ISSUE_ID') into main repo."
+
+    # 1. Detach worktree HEAD (releases the branch)
+    git -C "$WORKTREE_PATH" checkout --detach HEAD 2>/dev/null \
+        || die "Failed to detach worktree HEAD."
+    ok "Detached worktree '$ISSUE_ID' from branch '$BRANCH'."
+
+    # 2. Checkout branch in main repo
+    git -C "$PROJECT_ROOT" checkout "$BRANCH" \
+        || { git -C "$WORKTREE_PATH" checkout "$BRANCH" 2>/dev/null || true; die "Failed to checkout '$BRANCH' in main repo."; }
+    ok "Main repo now on branch '$BRANCH'."
+
+    # 3. Save state for --return
+    mkdir -p "$SWCTL_STATE_DIR"
+    {
+        printf 'CHECKOUT_ACTIVE_ISSUE=%q\n' "$ISSUE_ID"
+        printf 'CHECKOUT_PREVIOUS_BRANCH=%q\n' "$current_branch"
+    } > "$state_file"
+
+    info "To return: swctl checkout --return"
+}
+
 cmd_open() {
     local issue_input="${1:-}"
     local meta_file=""
@@ -4507,6 +4630,7 @@ Commands:
   logs        Show or follow container logs for a worktree.
   restart     Restart the app container for a worktree without full recreate.
   refresh     Pull latest changes, detect what changed, rebuild only the delta.
+  checkout    Detach worktree and checkout its branch in main repo. --return to undo.
   open        Open the worktree URL in the default browser.
   code        Open worktree in an editor: --phpstorm (default), --claude, --codex, --code, --cursor.
   switch      Switch a worktree between QA and Dev mode (rebuilds only what's needed).
@@ -4647,6 +4771,11 @@ main() {
             ensure_state_dirs
             shift
             cmd_open "${1:-}"
+            ;;
+        checkout)
+            ensure_state_dirs
+            shift
+            cmd_checkout "${1:-}"
             ;;
         code)
             ensure_state_dirs

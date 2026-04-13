@@ -66,6 +66,7 @@ function provisionBadge(status: string) {
     </td>
     <td class="px-4 py-3 text-gray-400 max-w-[200px] truncate" :title="instance.branch">
       {{ instance.branch || '—' }}
+      <span v-if="instance.checkedOut" class="ml-1 text-[10px] px-1.5 py-0.5 rounded border border-orange-500/40 text-orange-400 bg-orange-500/10">checked out</span>
     </td>
     <td class="px-4 py-3">
       <button
