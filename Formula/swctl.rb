@@ -18,8 +18,13 @@ class Swctl < Formula
                      "app",
                      "README.md"
 
+    # Also copy swctl into pkgshare so the Docker container can find it
+    # at /swctl/swctl (SWCTL_SCRIPT_DIR is mounted at /swctl).
+    cp libexec/"swctl", pkgshare/"swctl"
+    chmod 0755, pkgshare/"swctl"
+
     # Create a wrapper that sets SWCTL_TEMPLATE_DIR so swctl can find
-    # the compose templates and ui/ directory installed into pkgshare.
+    # the compose templates and app/ directory installed into pkgshare.
     (bin/"swctl").write <<~SH
       #!/bin/bash
       export SWCTL_TEMPLATE_DIR="#{pkgshare}"
