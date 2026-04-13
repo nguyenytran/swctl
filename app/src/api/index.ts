@@ -93,6 +93,11 @@ export async function initProjectConfig(data: {
   return res.json()
 }
 
+export async function fetchDiff(issueId: string): Promise<{ stat: string; diff: string }> {
+  const res = await fetch(`${BASE}/diff?issueId=${encodeURIComponent(issueId)}`)
+  return res.json()
+}
+
 export async function fetchPlugins(project: string): Promise<string[]> {
   const res = await fetch(`${BASE}/plugins?project=${encodeURIComponent(project)}`)
   return res.json()

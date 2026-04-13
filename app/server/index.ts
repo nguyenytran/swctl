@@ -527,6 +527,42 @@ app.post('/api/instances/:issueId/kill-worktree-exec', async (c) => {
   return c.json({ ok: cancelled })
 })
 
+// Git diff for worktree (dev mode) — returns stat summary + unified diff
+app.get('/api/diff', async (c) => {
+  const issueId = c.req.query('issueId') || ''
+  if (!issueId) return c.json({ error: 'Missing issueId' }, 400)
+
+  const instances = await readAllInstances()
+  const inst = instances.find((i: { issueId: string }) => i.issueId === issueId)
+  if (!inst?.worktreePath) return c.json({ error: 'Instance not found' }, 404)
+
+  const baseRef = inst.baseRef || 'HEAD~1'
+  const branch = inst.branch || 'HEAD'
+
+  // Try HEAD first, then origin/$BRANCH as fallback.
+  // HEAD may equal baseRef if the worktree was created before the
+  // remote-tracking fix — in that case origin/$BRANCH has the real changes.
+  let ref = 'HEAD'
+  try {
+    const stat = execSync(`git diff --stat "${baseRef}...HEAD"`, { cwd: inst.worktreePath, encoding: 'utf-8', timeout: 10000 }).trim()
+    if (!stat && branch && branch !== 'HEAD') {
+      // HEAD has no changes vs base — check if origin/branch has them
+      const remoteStat = execSync(`git diff --stat "${baseRef}...origin/${branch}"`, { cwd: inst.worktreePath, encoding: 'utf-8', timeout: 10000 }).trim()
+      if (remoteStat) ref = `origin/${branch}`
+    }
+  } catch {}
+
+  let stat = '', diff = ''
+  try {
+    stat = execSync(`git diff --stat "${baseRef}...${ref}"`, { cwd: inst.worktreePath, encoding: 'utf-8', timeout: 10000 })
+  } catch {}
+  try {
+    diff = execSync(`git diff "${baseRef}...${ref}"`, { cwd: inst.worktreePath, encoding: 'utf-8', timeout: 30000 })
+  } catch {}
+
+  return c.json({ stat, diff, ref })
+})
+
 app.get('/api/stream/status', (c) => {
   const id = c.req.query('id') || ''
   return c.json({ active: isStreamActive(id) })

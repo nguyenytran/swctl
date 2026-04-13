@@ -870,6 +870,9 @@ create_worktree() {
     if git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
         git -C "$PROJECT_ROOT" worktree add "$WORKTREE_PATH" "$BRANCH"
         ok "Attached existing branch '$BRANCH' at '$WORKTREE_PATH'."
+    elif git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+        git -C "$PROJECT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "origin/$BRANCH"
+        ok "Created worktree tracking 'origin/$BRANCH' at '$WORKTREE_PATH'."
     else
         git -C "$PROJECT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "$BASE_REF"
         ok "Created worktree '$WORKTREE_PATH' from '$BASE_REF'."

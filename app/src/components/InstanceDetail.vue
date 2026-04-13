@@ -1,13 +1,24 @@
 <script setup lang="ts">
-import { ref, watch, onUnmounted } from 'vue'
+import { ref, computed, watch, onUnmounted } from 'vue'
 import type { Instance, StreamEvent } from '@/types'
 import { useStream } from '@/composables/useStream'
-import { stopInstance, startInstance, restartInstance, buildStreamUrl, killExec, killWorktreeExec } from '@/api'
+import { stopInstance, startInstance, restartInstance, buildStreamUrl, killExec, killWorktreeExec, fetchDiff } from '@/api'
 
 const props = defineProps<{ instance: Instance }>()
 const emit = defineEmits<{ close: []; refresh: [] }>()
 
-const activeTab = ref<'logs' | 'exec' | 'worktree' | 'info'>('logs')
+type TabName = 'logs' | 'exec' | 'worktree' | 'diff' | 'info'
+const activeTab = ref<TabName>('logs')
+const availableTabs = computed<Array<{ id: TabName; label: string }>>(() => {
+  const tabs: Array<{ id: TabName; label: string }> = [
+    { id: 'logs', label: 'Logs' },
+    { id: 'exec', label: 'Console' },
+  ]
+  if (props.instance.worktreePath) tabs.push({ id: 'worktree', label: 'Worktree' })
+  if (props.instance.worktreePath) tabs.push({ id: 'diff', label: 'Diff' })
+  tabs.push({ id: 'info', label: 'Info' })
+  return tabs
+})
 const logStream = useStream()
 const execStream = useStream()
 const wtStream = useStream()
@@ -18,6 +29,37 @@ const wtCmdInput = ref('')
 const wtCmdHistory = ref<Array<{ command: string; lines: StreamEvent[]; exitCode: number | null }>>([])
 const wtTerminalEl = ref<HTMLElement | null>(null)
 
+
+// Diff state
+const diffStat = ref('')
+const diffContent = ref('')
+const diffLoading = ref(false)
+const diffLoaded = ref(false)
+
+async function loadDiff() {
+  if (diffLoaded.value || diffLoading.value) return
+  diffLoading.value = true
+  try {
+    const result = await fetchDiff(props.instance.issueId)
+    diffStat.value = result.stat || ''
+    diffContent.value = result.diff || ''
+    diffLoaded.value = true
+  } catch {
+    diffContent.value = ''
+    diffStat.value = ''
+  } finally {
+    diffLoading.value = false
+  }
+}
+
+function classForDiffLine(line: string): string {
+  if (line.startsWith('+++') || line.startsWith('---')) return 'text-gray-500'
+  if (line.startsWith('+')) return 'bg-emerald-900/30 text-emerald-300'
+  if (line.startsWith('-')) return 'bg-red-900/30 text-red-300'
+  if (line.startsWith('@@')) return 'text-blue-400 bg-blue-900/20'
+  if (line.startsWith('diff --git')) return 'text-white font-bold mt-4 pt-2 border-t border-border'
+  return 'text-gray-400'
+}
 
 // Start log streaming immediately
 function startLogs() {
@@ -217,15 +259,15 @@ function formatDate(iso: string) {
     <!-- Tabs -->
     <div class="flex border-b border-border bg-surface">
       <button
-        v-for="tab in (['logs', 'exec', ...(instance.worktreePath ? ['worktree'] : []), 'info'] as const)"
-        :key="tab"
+        v-for="t in availableTabs"
+        :key="t.id"
         class="px-4 py-2 text-sm transition-colors"
-        :class="activeTab === tab
+        :class="activeTab === t.id
           ? 'text-white border-b-2 border-blue-500'
           : 'text-gray-500 hover:text-gray-300'"
-        @click="activeTab = tab as typeof activeTab; tab === 'logs' && !logStream.running.value && startLogs()"
+        @click="activeTab = t.id; t.id === 'logs' && !logStream.running.value && startLogs(); t.id === 'diff' && loadDiff()"
       >
-        {{ tab === 'logs' ? 'Logs' : tab === 'exec' ? 'Console' : tab === 'worktree' ? 'Worktree' : 'Info' }}
+        {{ t.label }}
       </button>
     </div>
 
@@ -284,6 +326,27 @@ function formatDate(iso: string) {
             placeholder="git status, git commit -m '...', git push..."
             autofocus spellcheck="false" autocomplete="off" />
         </form>
+      </div>
+
+      <!-- Diff tab -->
+      <div v-if="activeTab === 'diff'" class="flex-1 overflow-y-auto font-mono text-xs leading-5">
+        <div v-if="diffLoading" class="p-4 text-gray-500">Loading diff...</div>
+        <div v-else-if="diffLoaded && !diffContent" class="p-4 text-gray-500">No changes between {{ instance.baseRef }} and {{ instance.branch }}</div>
+        <template v-else-if="diffLoaded">
+          <!-- Stat summary -->
+          <div v-if="diffStat" class="p-4 border-b border-border bg-surface">
+            <pre class="text-gray-300 whitespace-pre-wrap">{{ diffStat }}</pre>
+          </div>
+          <!-- Unified diff -->
+          <div class="p-4">
+            <div
+              v-for="(line, i) in diffContent.split('\n')"
+              :key="i"
+              class="px-2 whitespace-pre-wrap break-all"
+              :class="classForDiffLine(line)"
+            >{{ line || ' ' }}</div>
+          </div>
+        </template>
       </div>
 
       <!-- Info tab -->
