@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SWCTL_VERSION="0.3.1"
+SWCTL_VERSION="0.3.2"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
