@@ -192,6 +192,136 @@ detect_runtime() {
     printf 'traefik\n'
 }
 
+# --- Workflow system ---
+
+SWCTL_WORKFLOW_DIR=""       # Resolved path to active workflow directory
+WORKFLOW_CONSOLE=""         # Console binary from workflow.yaml
+WORKFLOW_PLUGIN_DIR=""      # Plugin directory from workflow.yaml
+WORKFLOW_STATIC_PLUGIN_DIR="" # Static plugin directory
+WORKFLOW_ENV_FILE=""        # Env file name from workflow.yaml
+
+resolve_workflow_dir() {
+    local workflow_name="${1:-shopware6}"
+
+    # 1. Project-local workflows/
+    if [ -n "${PROJECT_ROOT:-}" ] && [ -d "$PROJECT_ROOT/workflows/$workflow_name" ]; then
+        printf '%s\n' "$PROJECT_ROOT/workflows/$workflow_name"
+        return 0
+    fi
+
+    # 2. Bundled with swctl (pkgshare or script dir)
+    if [ -d "$SWCTL_TEMPLATE_DIR/workflows/$workflow_name" ]; then
+        printf '%s\n' "$SWCTL_TEMPLATE_DIR/workflows/$workflow_name"
+        return 0
+    fi
+
+    # 3. User custom dir
+    local user_dir="${XDG_CONFIG_HOME:-$HOME/.config}/swctl/workflows/$workflow_name"
+    if [ -d "$user_dir" ]; then
+        printf '%s\n' "$user_dir"
+        return 0
+    fi
+
+    return 1
+}
+
+load_workflow() {
+    local workflow_name="${SWCTL_WORKFLOW:-shopware6}"
+
+    SWCTL_WORKFLOW_DIR="$(resolve_workflow_dir "$workflow_name")" \
+        || die "Workflow '$workflow_name' not found. Searched: project workflows/, $SWCTL_TEMPLATE_DIR/workflows/, ~/.config/swctl/workflows/"
+
+    local yaml_file="$SWCTL_WORKFLOW_DIR/workflow.yaml"
+    if [ ! -f "$yaml_file" ]; then
+        warn "No workflow.yaml in '$SWCTL_WORKFLOW_DIR'. Using defaults."
+        WORKFLOW_CONSOLE="${SW_BIN_CONSOLE:-bin/console}"
+        WORKFLOW_PLUGIN_DIR="custom/plugins"
+        WORKFLOW_STATIC_PLUGIN_DIR="custom/static-plugins"
+        WORKFLOW_ENV_FILE=".env.local"
+        return
+    fi
+
+    # Parse workflow.yaml via python3 (same approach as read_plugin_deps)
+    eval "$(python3 -c "
+import yaml, sys
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+print('WORKFLOW_CONSOLE=\"{}\"'.format(data.get('console', 'bin/console')))
+plugins = data.get('plugins', {})
+print('WORKFLOW_PLUGIN_DIR=\"{}\"'.format(plugins.get('directory', 'custom/plugins')))
+print('WORKFLOW_STATIC_PLUGIN_DIR=\"{}\"'.format(plugins.get('static_directory', 'custom/static-plugins')))
+print('WORKFLOW_ENV_FILE=\"{}\"'.format(data.get('env_file', '.env.local')))
+" "$yaml_file" 2>/dev/null)" || {
+        warn "Failed to parse $yaml_file. Using defaults."
+        WORKFLOW_CONSOLE="${SW_BIN_CONSOLE:-bin/console}"
+        WORKFLOW_PLUGIN_DIR="custom/plugins"
+        WORKFLOW_STATIC_PLUGIN_DIR="custom/static-plugins"
+        WORKFLOW_ENV_FILE=".env.local"
+    }
+
+    # Allow .swctl.conf to override workflow defaults
+    [ -n "${SW_BIN_CONSOLE:-}" ] && WORKFLOW_CONSOLE="$SW_BIN_CONSOLE"
+    [ -n "${SW_ENV_FILE_NAME:-}" ] && WORKFLOW_ENV_FILE="$SW_ENV_FILE_NAME"
+
+    export WORKFLOW_CONSOLE
+}
+
+run_workflow_hook() {
+    local hook_name="$1"
+    shift
+
+    if [ -z "${SWCTL_WORKFLOW_DIR:-}" ]; then
+        warn "No workflow loaded. Skipping hook '$hook_name'."
+        return 0
+    fi
+
+    local hook_file="$SWCTL_WORKFLOW_DIR/hooks/${hook_name}.sh"
+    if [ ! -f "$hook_file" ]; then
+        # Hook not defined — skip silently
+        return 0
+    fi
+
+    # Source the hook so it has access to all swctl functions and variables
+    . "$hook_file"
+}
+
+list_available_workflows() {
+    local -a dirs=()
+
+    # Bundled workflows
+    if [ -d "$SWCTL_TEMPLATE_DIR/workflows" ]; then
+        dirs+=("$SWCTL_TEMPLATE_DIR/workflows")
+    fi
+
+    # User custom workflows
+    local user_dir="${XDG_CONFIG_HOME:-$HOME/.config}/swctl/workflows"
+    if [ -d "$user_dir" ]; then
+        dirs+=("$user_dir")
+    fi
+
+    local seen=""
+    for d in "${dirs[@]}"; do
+        for wf in "$d"/*/workflow.yaml; do
+            [ -f "$wf" ] || continue
+            local name
+            name="$(basename "$(dirname "$wf")")"
+            # Deduplicate (bundled takes priority)
+            if ! printf '%s\n' "$seen" | grep -qxF "$name"; then
+                seen="$seen
+$name"
+                local desc=""
+                desc="$(python3 -c "
+import yaml, sys
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+print(data.get('description', ''))
+" "$wf" 2>/dev/null)" || desc=""
+                printf '%s\t%s\n' "$name" "$desc"
+            fi
+        done
+    done
+}
+
 detect_template_path() {
     local runtime="${SW_RUNTIME:-traefik}"
     local orbstack_suffix=".orbstack"
@@ -212,6 +342,11 @@ detect_template_path() {
             printf '%s/docker-compose.swctl.orbstack.yml\n' "$PROJECT_ROOT"
             return 0
         fi
+        # Workflow dir
+        if [ -n "${SWCTL_WORKFLOW_DIR:-}" ] && [ -f "$SWCTL_WORKFLOW_DIR/docker-compose.orbstack.yml" ]; then
+            printf '%s/docker-compose.orbstack.yml\n' "$SWCTL_WORKFLOW_DIR"
+            return 0
+        fi
         if [ -f "$SWCTL_TEMPLATE_DIR/docker-compose.swctl.orbstack.yml" ]; then
             printf '%s/docker-compose.swctl.orbstack.yml\n' "$SWCTL_TEMPLATE_DIR"
             return 0
@@ -220,6 +355,12 @@ detect_template_path() {
 
     if [ -f "$PROJECT_ROOT/docker-compose.swctl.yml" ]; then
         printf '%s/docker-compose.swctl.yml\n' "$PROJECT_ROOT"
+        return 0
+    fi
+
+    # Workflow dir
+    if [ -n "${SWCTL_WORKFLOW_DIR:-}" ] && [ -f "$SWCTL_WORKFLOW_DIR/docker-compose.yml" ]; then
+        printf '%s/docker-compose.yml\n' "$SWCTL_WORKFLOW_DIR"
         return 0
     fi
 
@@ -291,7 +432,11 @@ load_project_config() {
     if [ "$SW_RUNTIME" = "orbstack" ]; then
         SW_SERVICE_NAME="web"
     fi
-    SW_COMPOSE_TEMPLATE="$(detect_template_path)" || die "Could not find docker-compose.swctl.yml. Put it in the project root or export SWCTL_TEMPLATE_DIR."
+    # Load workflow (must be after PROJECT_ROOT and SW_BIN_CONSOLE are set)
+    SWCTL_WORKFLOW="${SWCTL_WORKFLOW:-shopware6}"
+    load_workflow
+
+    SW_COMPOSE_TEMPLATE="$(detect_template_path)" || die "Could not find docker-compose template. Put it in the project root, workflow dir, or export SWCTL_TEMPLATE_DIR."
 
     # Project-level compose override (optional)
     # Project-level compose override (optional, swctl-namespaced to avoid
@@ -457,6 +602,7 @@ read_project_field() {
         path)       printf '%s' "$entry" | cut -f3 ;;
         parent)     printf '%s' "$entry" | cut -f4 ;;
         plugin_dir) printf '%s' "$entry" | cut -f5 ;;
+        workflow)   local wf; wf="$(printf '%s' "$entry" | cut -f6)"; printf '%s' "${wf:--}" ;;
     esac
 }
 
@@ -466,7 +612,7 @@ list_projects() {
 }
 
 add_project_entry() {
-    local name="$1" type="$2" proj_path="$3" parent="${4:--}" plugin_dir="${5:--}"
+    local name="$1" type="$2" proj_path="$3" parent="${4:--}" plugin_dir="${5:--}" workflow="${6:--}"
     ensure_projects_file
     if grep -qE "^${name}	" "$SWCTL_PROJECTS_FILE" 2>/dev/null; then
         die "Project '$name' already registered. Use 'swctl project remove $name' first."
@@ -485,7 +631,7 @@ add_project_entry() {
     if [ "$type" = "plugin-embedded" ] && [ "$plugin_dir" = "-" ]; then
         die "Embedded plugins require --plugin-dir <relative-path>."
     fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$type" "$proj_path" "$parent" "$plugin_dir" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$type" "$proj_path" "$parent" "$plugin_dir" "$workflow" \
         >> "$SWCTL_PROJECTS_FILE"
     ok "Registered project '$name' ($type)."
 }
@@ -867,6 +1013,29 @@ create_worktree() {
         fi
     fi
 
+    # Clean up stale .git/config.lock if present (from interrupted git operations)
+    local config_lock="$PROJECT_ROOT/.git/config.lock"
+    if [ -f "$config_lock" ]; then
+        # Remove if older than 5 seconds (stale from a crashed process)
+        if find "$config_lock" -mmin +0.08 -print -quit 2>/dev/null | grep -q .; then
+            warn "Removing stale lock file: $config_lock"
+            rm -f "$config_lock"
+        else
+            # Lock is fresh — another git process may be active, wait briefly
+            info "Waiting for git config lock to release..."
+            local _wait=0
+            while [ -f "$config_lock" ] && [ "$_wait" -lt 10 ]; do
+                sleep 1
+                _wait=$((_wait + 1))
+            done
+            # If still present after 10s, force remove
+            if [ -f "$config_lock" ]; then
+                warn "Force-removing git config lock after 10s timeout."
+                rm -f "$config_lock"
+            fi
+        fi
+    fi
+
     if git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
         git -C "$PROJECT_ROOT" worktree add "$WORKTREE_PATH" "$BRANCH"
         ok "Attached existing branch '$BRANCH' at '$WORKTREE_PATH'."
@@ -895,24 +1064,41 @@ sync_build_artifacts() {
     # Called AFTER count_changes so ADMIN_CHANGES/STOREFRONT_CHANGES are set.
     # Diff-driven: only sync what's needed. Use APFS clones when available.
 
-    # Instead of syncing all of var/ (719MB, mostly stale cache), copy only the
-    # 2 small JSON files that theme:compile and bundle:dump actually need.
-    mkdir -p "$WORKTREE_PATH/var"
-    for f in var/theme-files.json var/plugins.json; do
-        [ -f "$PROJECT_ROOT/$f" ] && cp "$PROJECT_ROOT/$f" "$WORKTREE_PATH/$f" 2>/dev/null || true
-    done
+    # Read artifact lists from workflow.yaml if available
+    local sync_files="" sync_dirs=""
+    if [ -n "${SWCTL_WORKFLOW_DIR:-}" ] && [ -f "$SWCTL_WORKFLOW_DIR/workflow.yaml" ]; then
+        eval "$(python3 -c "
+import yaml, sys
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+sa = data.get('sync_artifacts', {})
+files = sa.get('files', [])
+dirs = sa.get('directories', [])
+print('sync_files=\"{}\"'.format(' '.join(files)))
+print('sync_dirs=\"{}\"'.format(' '.join(dirs)))
+" "$SWCTL_WORKFLOW_DIR/workflow.yaml" 2>/dev/null)" || true
+    fi
 
-    # Build sync list — always include node_modules so watch:admin / watch:storefront
-    # work even when the branch has no JS changes (APFS clones are instant).
-    local sync_dirs="public/theme public/bundles"
-    sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/vendor"
-    sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/dist"
-    # Vite build output read by ViteFileAccessorDecorator (entrypoints.json + assets)
-    sync_dirs="$sync_dirs src/Administration/Resources/public"
-    sync_dirs="$sync_dirs src/Storefront/Resources/public"
-    # node_modules — always sync so watch:admin / watch:storefront work out of the box
-    sync_dirs="$sync_dirs src/Administration/Resources/app/administration/node_modules"
-    sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/node_modules"
+    # Defaults (Shopware 6)
+    sync_files="${sync_files:-var/theme-files.json var/plugins.json}"
+    if [ -z "$sync_dirs" ]; then
+        sync_dirs="public/theme public/bundles"
+        sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/vendor"
+        sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/dist"
+        sync_dirs="$sync_dirs src/Administration/Resources/public"
+        sync_dirs="$sync_dirs src/Storefront/Resources/public"
+        sync_dirs="$sync_dirs src/Administration/Resources/app/administration/node_modules"
+        sync_dirs="$sync_dirs src/Storefront/Resources/app/storefront/node_modules"
+    fi
+
+    # Sync individual files
+    local f
+    for f in $sync_files; do
+        if [ -f "$PROJECT_ROOT/$f" ]; then
+            mkdir -p "$WORKTREE_PATH/$(dirname "$f")"
+            cp "$PROJECT_ROOT/$f" "$WORKTREE_PATH/$f" 2>/dev/null || true
+        fi
+    done
 
     local dir
     for dir in $sync_dirs; do
@@ -948,13 +1134,41 @@ sync_build_artifacts() {
 
 count_changes() {
     local diff_files="$1"
-    MIGRATION_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)Migrations?/' || true)"
-    ENTITY_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)Entity/' || true)"
-    ADMIN_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec 'Resources/app/administration/.*\.(js|ts|vue|scss)$' || true)"
-    STOREFRONT_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(Resources/app/storefront/.*\.(js|ts|vue|scss)$|\.twig$)' || true)"
-    COMPOSER_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)composer\.(json|lock)$' || true)"
-    PACKAGE_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec '(^|/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$' || true)"
-    BACKEND_CHANGES="$(printf '%s\n' "$diff_files" | grep -E '\.php$' | grep -Evc '(^|/)Migrations?/|/Entity/' || true)"
+
+    # Read patterns from workflow.yaml if available, otherwise use Shopware defaults
+    local pat_migration pat_entity pat_admin pat_storefront pat_composer pat_package pat_backend
+    if [ -n "${SWCTL_WORKFLOW_DIR:-}" ] && [ -f "$SWCTL_WORKFLOW_DIR/workflow.yaml" ]; then
+        eval "$(python3 -c "
+import yaml, sys
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+d = data.get('detect', {})
+print('pat_migration=\"{}\"'.format(d.get('migration', '(^|/)Migrations?/')))
+print('pat_entity=\"{}\"'.format(d.get('entity', '(^|/)Entity/')))
+print('pat_admin=\"{}\"'.format(d.get('admin', 'Resources/app/administration/.*\\\\.(js|ts|vue|scss)\$')))
+print('pat_storefront=\"{}\"'.format(d.get('storefront', '(Resources/app/storefront/.*\\\\.(js|ts|vue|scss)\$|\\\\.twig\$)')))
+print('pat_composer=\"{}\"'.format(d.get('composer', '(^|/)composer\\\\.(json|lock)\$')))
+print('pat_package=\"{}\"'.format(d.get('package', '(^|/)(package\\\\.json|package-lock\\\\.json|pnpm-lock\\\\.yaml|yarn\\\\.lock)\$')))
+print('pat_backend=\"{}\"'.format(d.get('backend', '\\\\.php\$')))
+" "$SWCTL_WORKFLOW_DIR/workflow.yaml" 2>/dev/null)" || true
+    fi
+
+    # Defaults (Shopware 6 patterns)
+    pat_migration="${pat_migration:-(^|/)Migrations?/}"
+    pat_entity="${pat_entity:-(^|/)Entity/}"
+    pat_admin="${pat_admin:-Resources/app/administration/.*\.(js|ts|vue|scss)$}"
+    pat_storefront="${pat_storefront:-(Resources/app/storefront/.*\.(js|ts|vue|scss)$|\.twig$)}"
+    pat_composer="${pat_composer:-(^|/)composer\.(json|lock)$}"
+    pat_package="${pat_package:-(^|/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$}"
+    pat_backend="${pat_backend:-\.php$}"
+
+    MIGRATION_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec "$pat_migration" || true)"
+    ENTITY_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec "$pat_entity" || true)"
+    ADMIN_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec "$pat_admin" || true)"
+    STOREFRONT_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec "$pat_storefront" || true)"
+    COMPOSER_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec "$pat_composer" || true)"
+    PACKAGE_CHANGES="$(printf '%s\n' "$diff_files" | grep -Ec "$pat_package" || true)"
+    BACKEND_CHANGES="$(printf '%s\n' "$diff_files" | grep -E "$pat_backend" | grep -Evc "$pat_migration|$pat_entity" || true)"
     # Backward compat: FRONTEND_CHANGES = ADMIN + STOREFRONT
     FRONTEND_CHANGES="$((ADMIN_CHANGES + STOREFRONT_CHANGES))"
 }
@@ -1506,6 +1720,12 @@ run_frontend_build_if_needed() {
     local is_first_create="${2:-0}"
     local force_plugin_build="${3:-0}"
 
+    # Delegate to workflow build hook if available
+    if [ -n "${SWCTL_WORKFLOW_DIR:-}" ] && [ -f "$SWCTL_WORKFLOW_DIR/hooks/build.sh" ]; then
+        FORCE_PLUGIN_BUILD="$force_plugin_build" run_workflow_hook "build"
+        return
+    fi
+
     # QA mode: all frontend assets are synced from project root. No builds needed
     # UNLESS a plugin has admin/storefront extensions that weren't in the synced
     # assets (force_plugin_build=1).
@@ -1647,52 +1867,20 @@ provision_database_and_app() {
     fi
     wait_for_app_container "$COMPOSE_PROJECT"
 
-    if [ "$SWCTL_MODE" = "qa" ]; then
-        # QA mode: no console operations. Vendor, node_modules, and theme
-        # files are all synced/mounted from the project root. Just set up
-        # the domain and install lock so the app responds correctly.
-        update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-        ensure_install_lock "$COMPOSE_PROJECT"
-        return
-    fi
+    # Export helpers so workflow hooks can call them
+    export -f update_sales_channel_domain ensure_install_lock bootstrap_dependencies \
+             run_install_command run_app_command clone_database mysql_db_has_tables \
+             install_admin_deps_if_needed ensure_jwt_keys fix_volume_ownership \
+             info warn ok die sanitize_db_identifier detect_package_install_command 2>/dev/null || true
+    # Aliases for hooks
+    _swctl_update_sales_channel_domain() { update_sales_channel_domain "$@"; }
+    _swctl_ensure_install_lock() { ensure_install_lock "$@"; }
+    _swctl_bootstrap_dependencies() { bootstrap_dependencies "$@"; }
+    _swctl_install_admin_deps_if_needed() { install_admin_deps_if_needed "$@"; }
 
-    # Dev mode: fully automatic provisioning based on diff analysis.
-    bootstrap_dependencies "$COMPOSE_PROJECT"
-
-    if [ "$DB_STATE" = "fresh" ]; then
-        run_install_command "$COMPOSE_PROJECT" "$SW_INSTALL_ARGS"
-        # Populate the shared DB so future worktrees can clone from it
-        # instead of running a full install every time.
-        if ! mysql_db_has_tables "$source_db"; then
-            info "Populating shared database '$source_db' from fresh install."
-            clone_database "$DB_NAME" "$source_db"
-        fi
-    elif [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
-        info "Schema changes detected. Running migrations on cloned database."
-        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE database:migrate --all && $SW_BIN_CONSOLE database:migrate-destructive --all" || warn "Migrations failed."
-    fi
-
-    update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-    ensure_install_lock "$COMPOSE_PROJECT"
-
-    # Batch post-provision commands to reduce docker exec overhead.
-    # - Fresh installs: system:install already runs theme:compile → just refresh + cache:clear
-    # - Cloned DB, no storefront changes: synced theme files are sufficient → refresh + cache:clear
-    # - Cloned DB, with storefront changes: run_frontend_build_if_needed handles rebuild → refresh + cache:clear
-    # - Only run full theme:compile when DB was cloned AND there are storefront changes AND
-    #   we need the compiled output before run_frontend_build_if_needed (edge case safety)
-    if [ "$DB_STATE" = "fresh" ]; then
-        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE theme:refresh 2>/dev/null; $SW_BIN_CONSOLE cache:clear" \
-            || warn "Post-provision commands failed."
-    elif [ "${STOREFRONT_CHANGES:-0}" -gt 0 ]; then
-        run_app_command "$COMPOSE_PROJECT" \
-            "$SW_BIN_CONSOLE theme:refresh 2>/dev/null; $SW_BIN_CONSOLE theme:compile --sync || echo '[WARN] theme:compile failed.'; $SW_BIN_CONSOLE cache:clear || echo '[WARN] cache:clear failed.'" \
-            || warn "Post-provision commands failed."
-    else
-        # Cloned DB, no storefront changes — synced theme files are correct.
-        run_app_command "$COMPOSE_PROJECT" "$SW_BIN_CONSOLE theme:refresh 2>/dev/null; $SW_BIN_CONSOLE cache:clear" \
-            || warn "Post-provision commands failed."
-    fi
+    # Delegate to workflow hooks (provision → post-provision)
+    run_workflow_hook "provision"
+    run_workflow_hook "post-provision"
 
     # Restart PHP-FPM workers to flush OPcache.  OrbStack probes the container
     # right after "compose up", which can pollute the FPM OPcache with bytecode
@@ -1718,11 +1906,16 @@ resolve_project_context() {
     entry="$(read_project "$project_name")" || die "Project '$project_name' not registered. Run 'swctl project list' to see available projects."
 
     PROJECT_TYPE="$(read_project_field "$entry" type)"
-    local proj_path parent plugin_dir
+    local proj_path parent plugin_dir proj_workflow
     proj_path="$(read_project_field "$entry" path)"
     SELECTED_PROJECT_PATH="$proj_path"
     parent="$(read_project_field "$entry" parent)"
     plugin_dir="$(read_project_field "$entry" plugin_dir)"
+    proj_workflow="$(read_project_field "$entry" workflow)"
+    # Set workflow from project registration (overridden by .swctl.conf if present)
+    if [ "$proj_workflow" != "-" ] && [ -n "$proj_workflow" ]; then
+        SWCTL_WORKFLOW="$proj_workflow"
+    fi
 
     case "$PROJECT_TYPE" in
         plugin-external)
@@ -1742,11 +1935,19 @@ resolve_project_context() {
 
 activate_plugin() {
     local compose_project="$1" plugin_name="$2"
+
+    # Delegate to workflow hook if available
+    if [ -n "${SWCTL_WORKFLOW_DIR:-}" ] && [ -f "$SWCTL_WORKFLOW_DIR/hooks/activate-plugin.sh" ]; then
+        PLUGIN_NAME="$plugin_name" run_workflow_hook "activate-plugin"
+        return
+    fi
+
+    # Fallback: inline Shopware commands
     info "Activating plugin: $plugin_name"
     run_app_command "$compose_project" \
-        "$SW_BIN_CONSOLE plugin:refresh" || warn "plugin:refresh failed."
+        "$WORKFLOW_CONSOLE plugin:refresh" || warn "plugin:refresh failed."
     run_app_command "$compose_project" \
-        "$SW_BIN_CONSOLE plugin:install --activate $plugin_name" \
+        "$WORKFLOW_CONSOLE plugin:install --activate $plugin_name" \
         || warn "Plugin activation failed for '$plugin_name'."
 }
 
@@ -2939,11 +3140,14 @@ cmd_refresh() {
     local old_head
     old_head="$(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null)"
 
-    # Pull latest changes
+    # Fetch latest changes from the main repo (worktrees share the same git object store,
+    # and PROJECT_ROOT is more likely to have SSH/credentials configured)
     info "Pulling latest changes for '$ISSUE_ID' (branch: $BRANCH)."
-    git -C "$WORKTREE_PATH" pull --ff-only origin "$BRANCH" 2>/dev/null \
-        || git -C "$WORKTREE_PATH" fetch origin "$BRANCH" && git -C "$WORKTREE_PATH" reset --hard "origin/$BRANCH" 2>/dev/null \
-        || warn "Could not pull latest changes. Continuing with current state."
+    git -C "$PROJECT_ROOT" fetch origin "$BRANCH" 2>/dev/null \
+        || warn "Could not fetch latest changes. Continuing with current state."
+    # Update worktree to match the fetched remote branch
+    git -C "$WORKTREE_PATH" reset --hard "origin/$BRANCH" 2>/dev/null \
+        || warn "Could not reset worktree to origin/$BRANCH."
 
     local new_head
     new_head="$(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null)"
@@ -2970,7 +3174,7 @@ cmd_refresh() {
     # Run migrations if schema changed
     if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected. Running migrations."
-        run_app_command "$compose_project" "$SW_BIN_CONSOLE database:migrate --all && $SW_BIN_CONSOLE database:migrate-destructive --all" || warn "Migrations failed."
+        run_app_command "$compose_project" "$WORKFLOW_CONSOLE database:migrate --all && $WORKFLOW_CONSOLE database:migrate-destructive --all" || warn "Migrations failed."
     fi
 
     # Composer install if dependencies changed (dev mode only)
@@ -2991,7 +3195,7 @@ cmd_refresh() {
     fi
 
     # Always clear cache after any update
-    run_app_command "$compose_project" "$SW_BIN_CONSOLE cache:clear" || warn "cache:clear failed."
+    run_app_command "$compose_project" "$WORKFLOW_CONSOLE cache:clear" || warn "cache:clear failed."
 
     # Update metadata with new HEAD
     STATUS="complete"

@@ -1,0 +1,57 @@
+name: Shopware 6
+description: Shopware 6 platform development with Docker
+version: "1.0"
+
+# Console binary (exported as WORKFLOW_CONSOLE for hooks)
+console: bin/console
+
+# Plugin system
+plugins:
+  directory: custom/plugins
+  static_directory: custom/static-plugins
+
+# Env file name (Symfony convention)
+env_file: .env.local
+
+# Change detection patterns (regex, matched against git diff --name-only output)
+detect:
+  migration: "(^|/)Migrations?/"
+  entity: "(^|/)Entity/"
+  admin: "Resources/app/administration/.*\\.(js|ts|vue|scss)$"
+  storefront: "(Resources/app/storefront/.*\\.(js|ts|vue|scss)$|\\.twig$)"
+  composer: "(^|/)composer\\.(json|lock)$"
+  package: "(^|/)(package\\.json|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock)$"
+  backend: "\\.php$"
+
+# Build artifact directories to sync from trunk to worktree (APFS clones when available)
+sync_artifacts:
+  files:
+    - var/theme-files.json
+    - var/plugins.json
+  directories:
+    - public/theme
+    - public/bundles
+    - src/Storefront/Resources/app/storefront/vendor
+    - src/Storefront/Resources/app/storefront/dist
+    - src/Administration/Resources/public
+    - src/Storefront/Resources/public
+    - src/Administration/Resources/app/administration/node_modules
+    - src/Storefront/Resources/app/storefront/node_modules
+
+# Frontend extension detection paths (for plugins)
+extension_paths:
+  admin: Resources/app/administration
+  storefront: Resources/app/storefront
+
+# Default config values (overridden by SW_* vars in .swctl.conf)
+defaults:
+  php_image: "ghcr.io/shopware/docker-dev:php8.4-node24-caddy"
+  install_args: "--basic-setup --force --no-interaction"
+  http_port: "8000"
+  db_host: database
+  db_port: "3306"
+  db_root_user: root
+  db_root_password: root
+  redis_url: "redis://valkey:6379"
+  mailer_dsn: "smtp://mailer:1025"
+  opensearch_url: "http://opensearch:9200"

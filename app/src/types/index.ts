@@ -42,6 +42,13 @@ export interface Project {
   path: string
   parent: string | null
   pluginDir: string | null
+  workflow: string | null
+}
+
+export interface Workflow {
+  id: string
+  name: string
+  description: string
 }
 
 export interface ProjectConfig {

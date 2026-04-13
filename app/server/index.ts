@@ -8,6 +8,7 @@ import path from 'path'
 import { readAllInstances } from './lib/metadata.js'
 import { getContainerStatuses } from './lib/docker.js'
 import { readProjects, readProjectConfig, addProjectEntry, removeProjectEntry } from './lib/projects.js'
+import { listWorkflows } from './lib/workflows.js'
 import { streamSwctl, spawnSwctl, isStreamActive, cancelStream, streamCommand } from './lib/stream.js'
 import { listBranches, listGitWorktrees, discoverToolWorktrees, discoverPluginWorktrees } from './lib/git.js'
 import {
@@ -117,6 +118,10 @@ app.delete('/api/projects/:name', (c) => {
   return c.json(result, result.ok ? 200 : 400)
 })
 
+app.get('/api/workflows', (c) => {
+  return c.json(listWorkflows())
+})
+
 app.post('/api/projects/init', async (c) => {
   const result = await spawnSwctl(['project', 'init'])
   if (!result.ok) return c.json({ ok: false, projects: [] })
@@ -136,6 +141,7 @@ app.post('/api/projects/init-config', async (c) => {
     dbRootPassword: string
     dbNamePrefix: string
     dbSharedName: string
+    workflow: string
   }>()
 
   if (!body.path || !body.name) {
@@ -162,7 +168,10 @@ app.post('/api/projects/init-config', async (c) => {
     if (match) composerRootVersion = match[1]
   } catch {}
 
+  const workflow = body.workflow || 'shopware6'
+
   const conf = `# swctl config for ${body.name}
+SWCTL_WORKFLOW="${workflow}"
 SW_PROJECT="${slug}"
 SW_BASE_BRANCH="${baseBranch}"
 SW_DOMAIN_SUFFIX="${slug}.localhost"
@@ -205,6 +214,7 @@ SW_SHARED_DB_INSTALL_ARGS="--basic-setup --force --no-interaction"
     name: slug,
     path: body.path,
     type: 'platform',
+    workflow,
   })
 
   if (!result.ok) {

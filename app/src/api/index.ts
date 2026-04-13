@@ -1,4 +1,4 @@
-import type { Instance, Project, ProjectConfig, GitHubResult, GitHubAuthStatus, ExternalWorktree, WorktreeItem } from '@/types'
+import type { Instance, Project, ProjectConfig, GitHubResult, GitHubAuthStatus, ExternalWorktree, WorktreeItem, Workflow } from '@/types'
 
 const BASE = '/api'
 
@@ -14,6 +14,11 @@ export async function fetchConfig(): Promise<ProjectConfig> {
 
 export async function fetchProjects(): Promise<Project[]> {
   const res = await fetch(`${BASE}/projects`)
+  return res.json()
+}
+
+export async function fetchWorkflows(): Promise<Workflow[]> {
+  const res = await fetch(`${BASE}/workflows`)
   return res.json()
 }
 
@@ -75,6 +80,7 @@ export async function fetchDirectories(dirPath?: string): Promise<{
 export async function initProjectConfig(data: {
   path: string
   name: string
+  workflow: string
   baseBranch: string
   phpImage: string
   shareNetwork: string

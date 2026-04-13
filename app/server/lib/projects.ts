@@ -10,6 +10,7 @@ export interface Project {
   path: string
   parent: string | null
   pluginDir: string | null
+  workflow: string | null
 }
 
 export function readProjects(): Project[] {
@@ -19,13 +20,16 @@ export function readProjects(): Project[] {
     .split('\n')
     .filter((line) => line.trim() && !line.startsWith('#'))
     .map((line) => {
-      const [name, type, projPath, parent, pluginDir] = line.split('\t')
+      const parts = line.split('\t')
+      const [name, type, projPath, parent, pluginDir] = parts
+      const workflow = parts[5] || '-'
       return {
         name,
         type,
         path: projPath,
         parent: parent === '-' ? null : parent,
         pluginDir: pluginDir === '-' ? null : pluginDir,
+        workflow: workflow === '-' ? null : workflow,
       }
     })
     .filter((p) => p.name)
@@ -37,6 +41,7 @@ export function addProjectEntry(entry: {
   path: string
   parent?: string
   pluginDir?: string
+  workflow?: string
 }): { ok: boolean; error?: string } {
   const projects = readProjects()
   if (projects.some((p) => p.name === entry.name)) {
@@ -61,6 +66,7 @@ export function addProjectEntry(entry: {
     entry.path,
     entry.parent || '-',
     entry.pluginDir || '-',
+    entry.workflow || '-',
   ].join('\t')
   fs.appendFileSync(PROJECTS_FILE, line + '\n')
   return { ok: true }
