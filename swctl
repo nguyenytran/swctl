@@ -4327,7 +4327,9 @@ cmd_ui() {
     local ui_compose="$SWCTL_TEMPLATE_DIR/app/docker-compose.ui.yml"
     [ -f "$ui_compose" ] || die "UI compose file not found: $ui_compose"
 
-    # Try loading config from current dir, or fall back to first registered platform project
+    # Try loading config from current dir, or fall back to first registered platform project.
+    # If neither exists (fresh install), use minimal defaults so the UI can start
+    # and let the user add projects from the dashboard.
     if ! maybe_load_project_config >/dev/null 2>&1; then
         ensure_projects_file
         local platform_entry
@@ -4337,7 +4339,11 @@ cmd_ui() {
             platform_path="$(printf '%s' "$platform_entry" | cut -f3)"
             load_project_config "$platform_path/.swctl.conf"
         else
-            die "No .swctl.conf found and no platform project registered. Run 'swctl project add' first."
+            # Fresh install — no projects yet. Set minimal defaults.
+            PROJECT_ROOT="${HOME}"
+            SW_WORKTREE_ROOT="${HOME}"
+            SW_RUNTIME="$(detect_runtime)"
+            info "No projects registered yet. The UI will start with an empty dashboard."
         fi
     fi
 
