@@ -1,0 +1,261 @@
+const API_BASE = process.env.SWCTL_UI_URL || `http://localhost:${process.env.SWCTL_UI_PORT || '3000'}`
+
+type ToolResult = { content: Array<{ type: 'text'; text: string }> } & { isError?: boolean }
+
+function text(msg: string): ToolResult {
+  return { content: [{ type: 'text', text: msg }] }
+}
+
+function error(msg: string): ToolResult {
+  return { content: [{ type: 'text', text: msg }], isError: true }
+}
+
+// --- HTTP helpers ---
+
+async function apiGet(path: string): Promise<any> {
+  const res = await fetch(`${API_BASE}${path}`)
+  return res.json()
+}
+
+async function apiPost(path: string, body?: any): Promise<any> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  return res.json()
+}
+
+// Consume an SSE stream endpoint, collect log lines, return when 'done' event fires
+async function callStream(path: string): Promise<{ ok: boolean; output: string; exitCode: number }> {
+  const separator = path.includes('?') ? '&' : '?'
+  const url = `${API_BASE}${path}${separator}source=mcp`
+
+  return new Promise((resolve) => {
+    const lines: string[] = []
+    let resolved = false
+
+    // Use native EventSource-like parsing over fetch
+    fetch(url).then(async (res) => {
+      if (!res.ok || !res.body) {
+        // Non-streaming response (e.g. 409 conflict)
+        const body = await res.text()
+        resolve({ ok: false, output: body, exitCode: 1 })
+        return
+      }
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop() || ''
+
+        for (const part of parts) {
+          const eventMatch = part.match(/^event:\s*(.+)$/m)
+          const dataMatch = part.match(/^data:\s*(.+)$/m)
+          if (!eventMatch || !dataMatch) continue
+
+          const event = eventMatch[1]
+          try {
+            const data = JSON.parse(dataMatch[1])
+            if (event === 'log' && data.line) {
+              lines.push(data.line)
+            } else if (event === 'done') {
+              resolved = true
+              resolve({
+                ok: (data.exitCode || 0) === 0,
+                output: lines.join('\n'),
+                exitCode: data.exitCode || 0,
+              })
+            } else if (event === 'error') {
+              resolved = true
+              resolve({ ok: false, output: data.message || 'Stream error', exitCode: 1 })
+            }
+          } catch {}
+        }
+      }
+
+      if (!resolved) {
+        resolve({ ok: lines.length > 0, output: lines.join('\n'), exitCode: 0 })
+      }
+    }).catch((err) => {
+      resolve({ ok: false, output: `Connection error: ${err.message}`, exitCode: 1 })
+    })
+  })
+}
+
+// --- Tool implementations ---
+
+export async function listInstances(args: { project?: string }): Promise<ToolResult> {
+  try {
+    const items = await apiGet('/api/instances')
+    if (!Array.isArray(items)) return error('Unexpected response from server.')
+
+    // Filter managed instances (not external worktrees)
+    let instances = items.filter((i: any) => i.kind !== 'external')
+    if (args.project) {
+      instances = instances.filter((i: any) => i.project === args.project || i.projectSlug === args.project)
+    }
+
+    if (instances.length === 0) return text('No instances found.')
+
+    const lines = instances.map((i: any) => {
+      const status = i.containerStatus === 'running' ? 'running' : i.containerStatus === 'exited' ? 'stopped' : 'missing'
+      const checkout = i.checkedOut ? ' [checked out]' : ''
+      const changes = []
+      if (i.changes?.migration > 0) changes.push(`migration:${i.changes.migration}`)
+      if (i.changes?.admin > 0) changes.push(`admin:${i.changes.admin}`)
+      if (i.changes?.storefront > 0) changes.push(`storefront:${i.changes.storefront}`)
+      if (i.changes?.backend > 0) changes.push(`backend:${i.changes.backend}`)
+      if (i.changes?.composer > 0) changes.push(`composer:${i.changes.composer}`)
+      const changesStr = changes.length > 0 ? ` (${changes.join(', ')})` : ''
+      return `- #${i.issueId} [${status}] ${i.branch} → ${i.domain || 'no domain'}${checkout}${changesStr} (${i.mode}, ${i.project})`
+    })
+
+    return text(`**${instances.length} instance(s):**\n${lines.join('\n')}`)
+  } catch (err: any) {
+    return error(`Failed to list instances: ${err.message}`)
+  }
+}
+
+export async function createWorktree(args: {
+  issue: string
+  branch?: string
+  project?: string
+  mode?: string
+  plugin?: string
+  deps?: string
+}): Promise<ToolResult> {
+  const params = new URLSearchParams({ issue: args.issue, mode: args.mode || 'dev' })
+  if (args.branch) params.set('branch', args.branch)
+  if (args.project) params.set('project', args.project)
+  if (args.plugin) params.set('plugin', args.plugin)
+  if (args.deps) params.set('deps', args.deps)
+
+  const result = await callStream(`/api/stream/create?${params}`)
+  if (result.ok) {
+    return text(`Worktree created successfully.\n\n${result.output}`)
+  }
+  return error(`Worktree creation failed.\n\n${result.output}`)
+}
+
+export async function viewDiff(args: { issueId: string; statOnly?: boolean }): Promise<ToolResult> {
+  try {
+    const data = await apiGet(`/api/diff?issueId=${encodeURIComponent(args.issueId)}`)
+    if (data.error) return error(data.error)
+
+    const stat = data.stat || ''
+    if (args.statOnly) return text(stat || 'No changes detected.')
+
+    const diff = data.diff || ''
+    if (!stat && !diff) return text('No changes detected.')
+    return text(`**Diff stat:**\n\`\`\`\n${stat}\`\`\`\n\n**Full diff:**\n\`\`\`diff\n${diff}\`\`\``)
+  } catch (err: any) {
+    return error(`Failed to get diff: ${err.message}`)
+  }
+}
+
+export async function execCommand(args: { issueId: string; command: string }): Promise<ToolResult> {
+  try {
+    const data = await apiPost(`/api/instances/${encodeURIComponent(args.issueId)}/exec`, { command: args.command })
+    if (data.ok) return text(data.output || '(no output)')
+    return error(`Command failed:\n${data.output || data.error || 'Unknown error'}`)
+  } catch (err: any) {
+    return error(`Failed to execute command: ${err.message}`)
+  }
+}
+
+export async function startStop(args: { issueId: string; action: string }): Promise<ToolResult> {
+  const action = args.action
+  if (!['start', 'stop', 'restart'].includes(action)) {
+    return error(`Invalid action '${action}'. Use: start, stop, restart`)
+  }
+  try {
+    const data = await apiPost(`/api/instances/${encodeURIComponent(args.issueId)}/${action}`)
+    if (data.ok) {
+      return text(`Instance ${args.issueId} ${action}ed successfully.`)
+    }
+    return error(`Failed to ${action} instance ${args.issueId}: ${data.error || 'Unknown error'}`)
+  } catch (err: any) {
+    return error(`Failed to ${action}: ${err.message}`)
+  }
+}
+
+export async function clean(args: { issueId: string }): Promise<ToolResult> {
+  const result = await callStream(`/api/stream/clean?issueId=${encodeURIComponent(args.issueId)}&force=1`)
+  if (result.ok) {
+    return text(`Instance ${args.issueId} cleaned successfully.\n${result.output}`)
+  }
+  return error(`Failed to clean instance ${args.issueId}:\n${result.output}`)
+}
+
+export async function refresh(args: { issueId: string }): Promise<ToolResult> {
+  const result = await callStream(`/api/stream/refresh?issueId=${encodeURIComponent(args.issueId)}`)
+  if (result.ok) {
+    return text(`Instance ${args.issueId} refreshed successfully.\n${result.output}`)
+  }
+  return error(`Failed to refresh instance ${args.issueId}:\n${result.output}`)
+}
+
+export async function githubIssues(args: { org?: string }): Promise<ToolResult> {
+  try {
+    const params = args.org ? `?org=${encodeURIComponent(args.org)}` : ''
+    const data = await apiGet(`/api/github/issues${params}`)
+
+    if (data.error) {
+      if (data.error === 'auth_required') {
+        return error('GitHub authentication required. Run `swctl auth login` first.')
+      }
+      return error(`GitHub API error: ${data.error}`)
+    }
+
+    const items = data.items || []
+    if (items.length === 0) return text('No open issues or PRs found.')
+
+    const categories: Record<string, any[]> = {
+      'review-requested': [],
+      'my-pr': [],
+      'assigned': [],
+    }
+    for (const item of items) {
+      categories[item.category]?.push(item)
+    }
+
+    const sections: string[] = []
+
+    if (categories['review-requested'].length > 0) {
+      const lines = categories['review-requested'].map((i: any) =>
+        `  - PR #${i.number}: ${i.title} (${i.repo}) [${i.branch || 'no branch'}]`
+      )
+      sections.push(`**Review Requested (${lines.length}):**\n${lines.join('\n')}`)
+    }
+
+    if (categories['my-pr'].length > 0) {
+      const lines = categories['my-pr'].map((i: any) =>
+        `  - PR #${i.number}: ${i.title} (${i.repo}) [${i.branch || 'no branch'}]`
+      )
+      sections.push(`**My PRs (${lines.length}):**\n${lines.join('\n')}`)
+    }
+
+    if (categories['assigned'].length > 0) {
+      const lines = categories['assigned'].map((i: any) => {
+        const type = i.isPR ? 'PR' : 'Issue'
+        const linked = i.linkedPRs?.length ? ` → PR #${i.linkedPRs[0].number}` : ''
+        return `  - ${type} #${i.number}: ${i.title} (${i.repo})${linked} [${i.branch || 'no branch'}]`
+      })
+      sections.push(`**Assigned (${lines.length}):**\n${lines.join('\n')}`)
+    }
+
+    const rl = data.rateLimit
+    const rateInfo = rl ? `\n\n_Rate limit: ${rl.remaining}/${rl.limit}_` : ''
+    return text(sections.join('\n\n') + rateInfo)
+  } catch (err: any) {
+    return error(`Failed to fetch GitHub issues: ${err.message}`)
+  }
+}

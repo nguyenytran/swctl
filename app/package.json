@@ -7,14 +7,17 @@
     "dev": "concurrently \"vite\" \"tsx watch server/index.ts\"",
     "build": "vite build",
     "server": "tsx server/index.ts",
-    "start": "node dist-server/index.js"
+    "start": "node dist-server/index.js",
+    "mcp": "tsx mcp/index.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "hono": "^4.7.0",
     "tsx": "^4.19.0",
     "vue": "^3.5.0",
-    "vue-router": "^4.6.4"
+    "vue-router": "^4.6.4",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
