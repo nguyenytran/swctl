@@ -2,7 +2,9 @@ import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
+import { streamSSE } from 'hono/streaming'
 import { execSync } from 'child_process'
+import os from 'os'
 import fs from 'fs'
 import path from 'path'
 import { readAllInstances } from './lib/metadata.js'
@@ -10,6 +12,7 @@ import { getContainerStatuses } from './lib/docker.js'
 import { readProjects, readProjectConfig, addProjectEntry, removeProjectEntry } from './lib/projects.js'
 import { listWorkflows } from './lib/workflows.js'
 import { streamSwctl, spawnSwctl, isStreamActive, cancelStream, streamCommand } from './lib/stream.js'
+import { subscribe } from './lib/events.js'
 import { listBranches, listGitWorktrees, discoverToolWorktrees, discoverPluginWorktrees } from './lib/git.js'
 import {
   fetchGitHubIssues,
@@ -38,6 +41,32 @@ function resolveGitHubToken(cookieToken?: string): { token: string; source: stri
 }
 
 // --- API routes ---
+
+// Global SSE event stream — dashboard subscribes for real-time notifications
+app.get('/api/events', (c) => {
+  return streamSSE(c, async (stream) => {
+    const unsubscribe = subscribe((event) => {
+      try {
+        stream.writeSSE({ event: event.type, data: JSON.stringify(event) })
+      } catch {}
+    })
+
+    // Keep connection alive with periodic pings
+    const pingInterval = setInterval(() => {
+      try { stream.writeSSE({ event: 'ping', data: '{}' }) } catch {}
+    }, 30000)
+
+    stream.onAbort(() => {
+      unsubscribe()
+      clearInterval(pingInterval)
+    })
+
+    // Hold the stream open indefinitely
+    await new Promise<void>((resolve) => {
+      stream.onAbort(resolve)
+    })
+  })
+})
 
 app.get('/api/instances', async (c) => {
   const [instances, statuses, projects] = await Promise.all([
@@ -102,6 +131,244 @@ app.get('/api/instances', async (c) => {
   )
 
   return c.json([...instances, ...fromRegistered, ...pluginFiltered, ...toolFiltered])
+})
+
+// --- Pre-flight validation ---
+app.get('/api/preflight', async (c) => {
+  const issue = c.req.query('issue') || ''
+  const project = c.req.query('project') || ''
+  const branch = c.req.query('branch') || ''
+  const mode = c.req.query('mode') || 'dev'
+
+  const errors: string[] = []
+  const warnings: string[] = []
+
+  if (!issue) {
+    errors.push('Issue ID is required')
+    return c.json({ ok: false, errors, warnings })
+  }
+
+  // Check if issue already has an instance
+  try {
+    const instances = await readAllInstances()
+    const existing = instances.find((i: any) => i.issueId === issue)
+    if (existing) {
+      errors.push(`Instance #${issue} already exists (${existing.branch})`)
+    }
+  } catch {}
+
+  // Check if branch already exists in repo
+  if (branch && project) {
+    try {
+      const projects = readProjects()
+      const proj = projects.find((p: any) => p.name === project)
+      if (proj) {
+        const result = execSync(
+          `git -C "${proj.path}" rev-parse --verify "refs/heads/${branch}" 2>/dev/null`,
+          { encoding: 'utf8', timeout: 5000 },
+        ).trim()
+        if (result) {
+          warnings.push(`Branch '${branch}' already exists in ${project}`)
+        }
+      }
+    } catch {
+      // Branch doesn't exist — that's fine
+    }
+  }
+
+  // Check Docker health
+  try {
+    const dockerStatus = execSync('docker info --format "{{.ContainersRunning}}"', {
+      encoding: 'utf8',
+      timeout: 5000,
+    }).trim()
+    if (dockerStatus === '') {
+      warnings.push('Docker may not be running')
+    }
+  } catch {
+    warnings.push('Docker is not available or not running')
+  }
+
+  // Check disk space (warn if < 5GB free)
+  try {
+    const stats = fs.statfsSync(process.env.PROJECT_ROOT || process.env.HOME || '/')
+    const freeGB = (stats.bfree * stats.bsize) / (1024 * 1024 * 1024)
+    if (freeGB < 5) {
+      warnings.push(`Low disk space: ${freeGB.toFixed(1)}GB free`)
+    }
+  } catch {}
+
+  return c.json({ ok: errors.length === 0, errors, warnings })
+})
+
+// --- System info (for smart concurrency) ---
+app.get('/api/system-info', (c) => {
+  const cpuCores = os.cpus().length
+  const freeMemoryGB = +(os.freemem() / (1024 * 1024 * 1024)).toFixed(1)
+  const totalMemoryGB = +(os.totalmem() / (1024 * 1024 * 1024)).toFixed(1)
+  const suggestedConcurrency = Math.min(Math.max(1, Math.floor(cpuCores / 2)), 4)
+  return c.json({ cpuCores, freeMemoryGB, totalMemoryGB, suggestedConcurrency })
+})
+
+// --- Shared diff-gathering helper for preview-create and analyze-branch ---
+
+interface BranchDiffResult {
+  files: string[]
+  baseBranch: string
+  effectiveBranch: string
+  diffCwd: string
+}
+
+function getBranchDiff(params: {
+  issue: string; branch: string; project: string; mode: string; plugin: string
+}): BranchDiffResult | { error: string } {
+  const projects = readProjects()
+  const proj = projects.find(p => p.name === params.project) || projects.find(p => p.type === 'platform')
+  if (!proj) return { error: 'No project found' }
+
+  // Read base branch from .swctl.conf
+  let baseBranch = 'trunk'
+  try {
+    const confPath = path.join(proj.path, '.swctl.conf')
+    const conf = fs.readFileSync(confPath, 'utf8')
+    const m = conf.match(/SW_BASE_BRANCH="([^"]+)"/)
+    if (m) baseBranch = m[1]
+  } catch {}
+
+  const effectiveBranch = params.branch || (params.mode === 'dev' ? `feature/${params.issue}` : params.branch)
+  let diffCwd = proj.path
+  let diffRef = effectiveBranch
+
+  // For plugin-external, diff the plugin repo
+  if (params.plugin && proj.type === 'platform') {
+    const pluginProj = projects.find(p => p.name === params.plugin && p.parent === proj.name)
+    if (pluginProj) {
+      diffCwd = pluginProj.path
+      try {
+        const defaultBranch = execSync(
+          'git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed "s@^refs/remotes/origin/@@"',
+          { cwd: pluginProj.path, encoding: 'utf-8', timeout: 5000 },
+        ).trim()
+        baseBranch = defaultBranch || 'main'
+      } catch { baseBranch = 'main' }
+    }
+  }
+
+  // Get diff files — try remote branch first, fall back to local
+  let diffFiles = ''
+  let resolvedRef = ''
+  for (const ref of [`origin/${diffRef}`, diffRef]) {
+    try {
+      diffFiles = execSync(
+        `git diff --name-only "${baseBranch}...${ref}"`,
+        { cwd: diffCwd, encoding: 'utf-8', timeout: 10000 },
+      ).trim()
+      if (diffFiles) { resolvedRef = ref; break }
+    } catch {}
+  }
+
+  const files = diffFiles ? diffFiles.split('\n') : []
+  return { files, baseBranch, effectiveBranch, diffCwd }
+}
+
+// --- Smart create preview: analyze branch diff to predict which steps are needed ---
+app.get('/api/preview-create', (c) => {
+  const issue = c.req.query('issue') || ''
+  const branch = c.req.query('branch') || ''
+  const project = c.req.query('project') || ''
+  const mode = c.req.query('mode') || 'dev'
+  const plugin = c.req.query('plugin') || ''
+
+  if (!issue) return c.json({ error: 'Missing issue' }, 400)
+
+  const diffResult = getBranchDiff({ issue, branch, project, mode, plugin })
+  if ('error' in diffResult) return c.json({ error: diffResult.error }, 400)
+
+  const { files, effectiveBranch } = diffResult
+  const count = (pattern: RegExp) => files.filter(f => pattern.test(f)).length
+
+  const changes = {
+    migration: count(/(^|\/)Migrations?\//),
+    entity: count(/(^|\/)Entity\//),
+    admin: count(/Resources\/app\/administration\/.*\.(js|ts|vue|scss)$/),
+    storefront: count(/(Resources\/app\/storefront\/.*\.(js|ts|vue|scss)$|\.twig$)/),
+    composer: count(/(^|\/)composer\.(json|lock)$/),
+    package: count(/(^\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/),
+    backend: files.filter(f => /\.php$/.test(f) && !/(^|\/)Migrations?\//.test(f) && !/(^|\/)Entity\//.test(f)).length,
+  }
+
+  const isQa = mode === 'qa'
+  const hasDependencyChanges = changes.migration + changes.entity + changes.composer > 0
+  const hasPackageChanges = changes.migration + changes.entity + changes.package > 0
+
+  // Build step plan
+  interface Step {
+    id: string
+    label: string
+    enabled: boolean
+    reason: string
+  }
+
+  const steps: Step[] = [
+    { id: 'worktree', label: 'Create git worktree', enabled: true, reason: 'Always required' },
+    { id: 'sync', label: 'Sync build artifacts', enabled: true, reason: 'Copy baseline assets from trunk' },
+    { id: 'containers', label: 'Start Docker containers', enabled: true, reason: 'Always required' },
+    { id: 'database', label: 'Clone database', enabled: true, reason: 'Always required' },
+    {
+      id: 'composer',
+      label: 'Composer install',
+      enabled: !isQa && hasDependencyChanges,
+      reason: isQa ? 'QA mode uses shared vendor' : hasDependencyChanges ? `${changes.composer} composer file(s) changed` : 'No composer changes — reuse shared vendor',
+    },
+    {
+      id: 'npm',
+      label: 'NPM install',
+      enabled: !isQa && hasPackageChanges,
+      reason: isQa ? 'QA mode uses shared node_modules' : hasPackageChanges ? `${changes.package} package file(s) changed` : 'No package changes — reuse shared node_modules',
+    },
+    {
+      id: 'admin',
+      label: 'Build admin JS',
+      enabled: !isQa && changes.admin > 0,
+      reason: isQa ? 'QA mode skips builds' : changes.admin > 0 ? `${changes.admin} admin file(s) changed` : 'No admin changes — use synced assets',
+    },
+    {
+      id: 'storefront',
+      label: 'Build storefront JS',
+      enabled: !isQa && changes.storefront > 0,
+      reason: isQa ? 'QA mode skips builds' : changes.storefront > 0 ? `${changes.storefront} storefront file(s) changed` : 'No storefront changes — use synced assets',
+    },
+    {
+      id: 'migration',
+      label: 'Run migrations',
+      enabled: changes.migration > 0,
+      reason: changes.migration > 0 ? `${changes.migration} migration file(s) detected` : 'No migrations',
+    },
+    {
+      id: 'cache',
+      label: 'Clear cache',
+      enabled: changes.backend + changes.admin + changes.storefront + changes.composer + changes.package > 0,
+      reason: changes.backend > 0 ? `${changes.backend} PHP file(s) changed` : 'Code changes detected',
+    },
+  ]
+
+  // Estimate time saved
+  const skipped = steps.filter(s => !s.enabled)
+  const timeSaved = skipped.reduce((sum, s) => {
+    const est: Record<string, number> = { composer: 30, npm: 20, admin: 60, storefront: 60, migration: 5, cache: 5 }
+    return sum + (est[s.id] || 0)
+  }, 0)
+
+  return c.json({
+    issue,
+    branch: effectiveBranch,
+    mode,
+    totalFiles: files.length,
+    changes,
+    steps,
+    skippedCount: skipped.length,
+    estimatedTimeSaved: timeSaved > 0 ? `~${timeSaved}s` : null,
+  })
 })
 
 app.get('/api/config', (c) => {
@@ -439,6 +706,8 @@ app.get('/api/github/issues', async (c) => {
 
 // --- Streaming endpoints ---
 
+function getSource(c: any): 'mcp' | 'ui' { return c.req.query('source') === 'mcp' ? 'mcp' : 'ui' }
+
 app.get('/api/stream/create', (c) => {
   const issue = c.req.query('issue') || ''
   const mode = c.req.query('mode') || 'dev'
@@ -466,7 +735,7 @@ app.get('/api/stream/create', (c) => {
   if (branch) args.push(issue, branch)
   else args.push(issue)
 
-  return streamSwctl(c, args, `create:${issue}`)
+  return streamSwctl(c, args, `create:${issue}`, undefined, getSource(c))
 })
 
 app.get('/api/stream/clean', (c) => {
@@ -476,7 +745,7 @@ app.get('/api/stream/clean', (c) => {
 
   const args = ['clean', issueId]
   if (force) args.push('--force')
-  return streamSwctl(c, args, `clean:${issueId}`)
+  return streamSwctl(c, args, `clean:${issueId}`, undefined, getSource(c))
 })
 
 app.get('/api/stream/refresh', (c) => {
@@ -485,14 +754,14 @@ app.get('/api/stream/refresh', (c) => {
   // Cancel any previous create/refresh streams for this issue
   cancelStream(`create:${issueId}`)
   cancelStream(`refresh:${issueId}`)
-  return streamSwctl(c, ['refresh', issueId], `refresh:${issueId}`)
+  return streamSwctl(c, ['refresh', issueId], `refresh:${issueId}`, undefined, getSource(c))
 })
 
 app.get('/api/stream/switch-mode', (c) => {
   const issueId = c.req.query('issueId') || ''
   const mode = c.req.query('mode') || ''
   if (!issueId || !mode) return c.json({ error: 'Missing parameters' }, 400)
-  return streamSwctl(c, ['switch', issueId, `--${mode}`], `switch:${issueId}`)
+  return streamSwctl(c, ['switch', issueId, `--${mode}`], `switch:${issueId}`, undefined, getSource(c))
 })
 
 app.get('/api/stream/checkout', (c) => {
@@ -867,7 +1136,7 @@ app.use('/*', serveStatic({ root: './dist', path: '/index.html' }))
 
 // --- Start ---
 
-const port = parseInt(process.env.PORT || '3000', 10)
+const port = parseInt(process.env.SWCTL_UI_PORT || '3000', 10)
 serve({ fetch: app.fetch, port }, () => {
   console.log(`swctl-ui server listening on http://localhost:${port}`)
 })

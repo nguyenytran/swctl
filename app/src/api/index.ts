@@ -1,4 +1,4 @@
-import type { Instance, Project, ProjectConfig, GitHubResult, GitHubAuthStatus, ExternalWorktree, WorktreeItem, Workflow } from '@/types'
+import type { Instance, Project, ProjectConfig, GitHubResult, GitHubAuthStatus, ExternalWorktree, WorktreeItem, Workflow, PreviewCreateResult } from '@/types'
 
 const BASE = '/api'
 
@@ -136,7 +136,10 @@ export async function killWorktreeExec(issueId: string): Promise<{ ok: boolean }
   return res.json()
 }
 
-export async function fetchSettings(): Promise<{ editor: string; editorName: string; editorUrl: string }> {
+export async function fetchSettings(): Promise<{
+  editor: string; editorName: string; editorUrl: string
+
+}> {
   const res = await fetch(`${BASE}/settings`)
   return res.json()
 }
@@ -235,3 +238,44 @@ export async function fetchCheckoutState(): Promise<{ active: boolean; issueId: 
   const res = await fetch(`${BASE}/checkout-state`)
   return res.json()
 }
+
+export async function previewCreate(params: {
+  issue: string
+  branch?: string
+  project?: string
+  mode?: string
+  plugin?: string
+}): Promise<PreviewCreateResult> {
+  const q = new URLSearchParams({ issue: params.issue })
+  if (params.branch) q.set('branch', params.branch)
+  if (params.project) q.set('project', params.project)
+  if (params.mode) q.set('mode', params.mode)
+  if (params.plugin) q.set('plugin', params.plugin)
+  const res = await fetch(`${BASE}/preview-create?${q}`)
+  return res.json()
+}
+
+export async function preflight(params: {
+  issue: string
+  project?: string
+  branch?: string
+  mode?: string
+}): Promise<{ ok: boolean; errors: string[]; warnings: string[] }> {
+  const q = new URLSearchParams({ issue: params.issue })
+  if (params.project) q.set('project', params.project)
+  if (params.branch) q.set('branch', params.branch)
+  if (params.mode) q.set('mode', params.mode)
+  const res = await fetch(`${BASE}/preflight?${q}`)
+  return res.json()
+}
+
+export async function fetchSystemInfo(): Promise<{
+  cpuCores: number
+  freeMemoryGB: number
+  totalMemoryGB: number
+  suggestedConcurrency: number
+}> {
+  const res = await fetch(`${BASE}/system-info`)
+  return res.json()
+}
+

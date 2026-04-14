@@ -3,6 +3,7 @@ import { ref, computed, watch, nextTick, onUnmounted } from 'vue'
 import { useProjects } from '@/composables/useProjects'
 import { useActiveProject } from '@/composables/useActiveProject'
 import { useBatchCreate } from '@/composables/useBatchCreate'
+import { useInstances } from '@/composables/useInstances'
 import { fetchPlugins, fetchGitHubIssues, fetchGitHubStatus, githubLogout, requestDeviceCode, pollDeviceAuth } from '@/api'
 import type { GitHubItem, GitHubAuthStatus } from '@/types'
 
@@ -10,6 +11,7 @@ const emit = defineEmits<{ close: []; refresh: [] }>()
 
 const { projects } = useProjects()
 const { activeProjectName } = useActiveProject()
+const { instances } = useInstances()
 const batch = useBatchCreate()
 
 // Shared settings
@@ -212,7 +214,6 @@ async function handleGhLogout() {
 // Log auto-scroll
 const logContainer = ref<HTMLElement | null>(null)
 const userScrolledUp = ref(false)
-
 function onLogScroll() {
   if (!logContainer.value) return
   const el = logContainer.value
@@ -240,7 +241,7 @@ watch(() => batch.selectedJobId.value, () => {
 
 const platformProjects = computed(() => projects.value.filter(p => p.type === 'platform'))
 const canStart = computed(() =>
-  batch.pendingCount.value > 0 && selectedProject.value !== '' && !batch.isRunning.value
+  batch.pendingCount.value > 0 && selectedProject.value !== '' && !batch.isRunning.value && !batch.isValidating.value
 )
 
 // Load plugins when project changes (immediate: fire on initial value too)
@@ -316,11 +317,26 @@ function toggleGhItem(num: number) {
   ghSelected.value = s
 }
 
+// Set of issue numbers that already have an existing worktree
+const existingIssueNumbers = computed(() => {
+  const nums = new Set<number>()
+  for (const inst of instances.value) {
+    const n = Number(inst.issue)
+    if (n) nums.add(n)
+  }
+  return nums
+})
+
+function hasExistingWorktree(issueNumber: number): boolean {
+  return existingIssueNumbers.value.has(issueNumber)
+}
+
+function isGhItemDisabled(item: GitHubItem): boolean {
+  return hasExistingWorktree(item.number) || (mode.value === 'qa' && !item.branch)
+}
+
 function selectableGhItems() {
-  // In QA mode, only items with a linked PR branch are selectable
-  const items = ghFilteredItems.value
-  if (mode.value === 'qa') return items.filter(i => i.branch)
-  return items
+  return ghFilteredItems.value.filter(i => !isGhItemDisabled(i))
 }
 
 function toggleAllGh() {
@@ -351,6 +367,11 @@ function addSelectedGhItems() {
   let skipped = 0
   for (const item of ghItems.value) {
     if (!ghSelected.value.has(item.number)) continue
+    // Skip issues that already have a worktree
+    if (hasExistingWorktree(item.number)) {
+      skipped++
+      continue
+    }
     // QA mode: skip issues with no linked PR branch — nothing to test
     if (mode.value === 'qa' && !item.branch) {
       skipped++
@@ -409,6 +430,10 @@ function handleNewBatch() {
               <span v-if="batch.runningCount.value"> &middot; </span>
               {{ batch.pendingCount.value }} pending
               <span v-if="batch.failedCount.value" class="text-red-400">&middot; {{ batch.failedCount.value }} failed</span>
+              <span v-if="batch.batchElapsed.value" class="text-gray-600">&middot; {{ batch.batchElapsed.value }}s</span>
+            </p>
+            <p class="text-xs text-gray-400 mt-0.5" v-else-if="batch.isValidating.value">
+              <span class="text-yellow-400 animate-pulse">Validating jobs...</span>
             </p>
             <p class="text-xs text-gray-400 mt-0.5" v-else>
               {{ batch.totalCount.value }} job{{ batch.totalCount.value !== 1 ? 's' : '' }} queued
@@ -416,6 +441,13 @@ function handleNewBatch() {
           </div>
         </div>
         <div class="flex items-center gap-2">
+          <button
+            v-if="batch.allDone.value && batch.failedCount.value > 0"
+            class="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm rounded transition-colors"
+            @click="batch.retryFailed()"
+          >
+            Retry Failed ({{ batch.failedCount.value }})
+          </button>
           <button
             v-if="batch.allDone.value"
             class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors"
@@ -508,14 +540,30 @@ function handleNewBatch() {
                 <option value="qa">QA</option>
               </select>
             </div>
-            <div class="w-32">
-              <label class="block text-xs text-gray-400 mb-1">Concurrency ({{ batch.concurrency.value }})</label>
+            <div class="w-36">
+              <label class="block text-xs text-gray-400 mb-1">
+                Concurrency ({{ batch.concurrency.value }})
+                <span v-if="batch.concurrencyAutoDetected.value" class="text-gray-600">auto</span>
+              </label>
               <input
                 type="range"
                 v-model.number="batch.concurrency.value"
                 min="1" max="4"
                 :disabled="batch.isRunning.value"
                 class="w-full accent-blue-500"
+              />
+            </div>
+            <div v-if="batch.concurrency.value > 1" class="w-32">
+              <label class="block text-xs text-gray-400 mb-1">
+                Stagger ({{ batch.staggerDelay.value }}s)
+              </label>
+              <input
+                type="range"
+                v-model.number="batch.staggerDelay.value"
+                min="0" max="60" step="10"
+                :disabled="batch.isRunning.value"
+                class="w-full accent-blue-500"
+                title="Delay between job starts to avoid resource contention. Set to 0 for simultaneous starts."
               />
             </div>
             <!-- Tab switcher -->
@@ -738,13 +786,13 @@ function handleNewBatch() {
                     v-for="item in ghFilteredItems"
                     :key="item.number"
                     class="flex items-start gap-2 px-3 py-2 border-b border-border last:border-b-0 hover:bg-surface-hover transition-colors"
-                    :class="{ 'opacity-40': mode === 'qa' && !item.branch }"
+                    :class="{ 'opacity-40': isGhItemDisabled(item) }"
                   >
                     <input
                       type="checkbox"
                       :checked="ghSelected.has(item.number)"
                       class="mt-0.5 accent-blue-500 cursor-pointer shrink-0"
-                      :disabled="mode === 'qa' && !item.branch"
+                      :disabled="isGhItemDisabled(item)"
                       @change="toggleGhItem(item.number)"
                     />
                     <div class="flex-1 min-w-0">
@@ -810,6 +858,11 @@ function handleNewBatch() {
                           v-else-if="mode === 'qa'"
                           class="text-[10px] px-1 py-0 rounded bg-red-600/20 text-red-400 border border-red-600/30 shrink-0"
                         >No PR</span>
+                        <span
+                          v-if="hasExistingWorktree(item.number)"
+                          class="text-[10px] px-1 py-0 rounded bg-gray-600/20 text-gray-400 border border-gray-600/30 shrink-0"
+                          title="A worktree already exists for this issue"
+                        >Worktree exists</span>
                         <span v-if="item.user" class="text-[10px] text-gray-600">@{{ item.user }}</span>
                         <span
                           v-for="label in item.labels.slice(0, 3)"
@@ -879,11 +932,57 @@ function handleNewBatch() {
                       <span class="text-gray-600 mx-1">&middot;</span>
                       <span>{{ job.progress }}%</span>
                     </template>
+                    <template v-else-if="job.preflightStatus === 'error'">
+                      <span class="text-red-400">{{ job.preflightErrors[0] }}</span>
+                    </template>
+                    <template v-else-if="job.preflightStatus === 'warning'">
+                      <span class="text-yellow-400">{{ job.preflightWarnings[0] }}</span>
+                    </template>
+                    <template v-else-if="job.status === 'success' && job.finishedAt && job.startedAt">
+                      <span class="text-emerald-500">{{ Math.floor((job.finishedAt - job.startedAt) / 1000) }}s</span>
+                      <span class="text-gray-600 mx-1">&middot;</span>
+                      {{ job.branch || 'no branch' }}
+                    </template>
+                    <template v-else-if="job.status === 'failed' && job.finishedAt && job.startedAt">
+                      <span class="text-red-400">{{ Math.floor((job.finishedAt - job.startedAt) / 1000) }}s</span>
+                      <span class="text-gray-600 mx-1">&middot;</span>
+                      {{ job.branch || 'no branch' }}
+                    </template>
                     <template v-else>
                       {{ job.branch || 'no branch' }}
                     </template>
                   </div>
+                  <!-- Smart create: step preview (auto-skipped steps) -->
+                  <div v-if="job.preview && job.preview.skippedCount > 0" class="text-xs text-gray-600 mt-0.5 truncate">
+                    <span class="text-emerald-600">{{ job.preview.skippedCount }} step{{ job.preview.skippedCount > 1 ? 's' : '' }} auto-skipped</span>
+                    <template v-if="job.preview.estimatedTimeSaved">
+                      <span class="mx-1">&middot;</span>
+                      <span>saves {{ job.preview.estimatedTimeSaved }}</span>
+                    </template>
+                    <span class="mx-1">&middot;</span>
+                    <span>{{ job.preview.steps.filter(s => !s.enabled).map(s => s.label).join(', ') }}</span>
+                  </div>
                 </div>
+                <!-- Preflight status -->
+                <span
+                  v-if="job.preflightStatus === 'checking'"
+                  class="text-xs text-yellow-400 animate-pulse flex-shrink-0"
+                  title="Validating..."
+                >...</span>
+                <span
+                  v-else-if="job.preflightStatus === 'error'"
+                  class="text-xs text-red-400 flex-shrink-0"
+                  :title="job.preflightErrors.join(', ')"
+                >&#9888;</span>
+                <span
+                  v-else-if="job.preflightStatus === 'warning'"
+                  class="text-xs text-yellow-400 flex-shrink-0"
+                  :title="job.preflightWarnings.join(', ')"
+                >&#9888;</span>
+                <span
+                  v-else-if="job.preflightStatus === 'valid'"
+                  class="text-xs text-emerald-400 flex-shrink-0"
+                >&#10003;</span>
                 <!-- Remove button (only pending) -->
                 <button
                   v-if="job.status === 'pending'"
@@ -901,10 +1000,30 @@ function handleNewBatch() {
             </div>
           </div>
 
+          <!-- Batch summary (shown when all jobs complete) -->
+          <div v-if="batch.allDone.value" class="px-4 py-3 border-t border-border bg-surface-dark">
+            <div class="flex items-center gap-3 text-xs">
+              <span class="text-gray-400 font-medium">Batch complete</span>
+              <span class="text-emerald-400">{{ batch.successCount.value }} succeeded</span>
+              <span v-if="batch.failedCount.value" class="text-red-400">{{ batch.failedCount.value }} failed</span>
+              <span class="text-gray-600">{{ batch.batchElapsed.value }}s total</span>
+            </div>
+          </div>
+          <!-- Pre-flight errors banner -->
+          <div v-if="batch.hasPreflightErrors.value && !batch.isStarted.value" class="px-4 py-2 border-t border-red-600/30 bg-red-600/10">
+            <p class="text-xs text-red-400">Some jobs have validation errors. Remove or fix them before starting.</p>
+          </div>
           <!-- Footer actions -->
           <div class="p-4 border-t border-border bg-surface flex items-center gap-2">
             <button
-              v-if="!batch.isRunning.value"
+              v-if="batch.isValidating.value"
+              disabled
+              class="flex-1 px-4 py-2 bg-yellow-600/40 text-yellow-300 text-sm rounded cursor-wait"
+            >
+              Validating...
+            </button>
+            <button
+              v-else-if="!batch.isRunning.value"
               :disabled="!canStart"
               class="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm rounded transition-colors"
               @click="startBatch"
@@ -949,6 +1068,26 @@ function handleNewBatch() {
               }">
                 {{ batch.selectedStatus.value }}
               </span>
+            </div>
+            <!-- Step preview banner -->
+            <div v-if="batch.selectedJob.value?.preview" class="px-4 py-2 bg-surface-dark border-b border-border">
+              <div class="flex flex-wrap gap-1.5">
+                <span
+                  v-for="step in batch.selectedJob.value.preview.steps"
+                  :key="step.id"
+                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium"
+                  :class="step.enabled
+                    ? 'bg-emerald-600/20 text-emerald-400 border border-emerald-600/30'
+                    : 'bg-gray-700/30 text-gray-600 border border-gray-700/40 line-through'"
+                  :title="step.reason"
+                >
+                  <span>{{ step.enabled ? '&#10003;' : '&#10007;' }}</span>
+                  {{ step.label }}
+                </span>
+              </div>
+              <div v-if="batch.selectedJob.value.preview.estimatedTimeSaved" class="text-[10px] text-gray-600 mt-1">
+                Saves {{ batch.selectedJob.value.preview.estimatedTimeSaved }} by skipping {{ batch.selectedJob.value.preview.skippedCount }} step{{ batch.selectedJob.value.preview.skippedCount > 1 ? 's' : '' }}
+              </div>
             </div>
             <div class="flex-1 relative overflow-hidden">
               <div

@@ -11,6 +11,7 @@ import {
 import {
   listInstances,
   createWorktree,
+  smartCreate,
   viewDiff,
   execCommand,
   startStop,
@@ -120,6 +121,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'swctl_smart_create',
+      description: 'Smart worktree creation with automatic optimization: runs pre-flight validation, analyzes branch diff to preview which steps will run or be skipped (composer install, frontend builds, database setup), creates the worktree, and reports estimated time saved. Shows a detailed create plan before execution.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          issue: { type: 'string', description: 'Issue number or identifier (e.g. "15847")' },
+          branch: { type: 'string', description: 'Git branch name (auto-detected if omitted)' },
+          project: { type: 'string', description: 'Project name (uses default if omitted)' },
+          mode: { type: 'string', enum: ['qa', 'dev'], description: 'Mode: "qa" or "dev". Default: dev' },
+          plugin: { type: 'string', description: 'Plugin name for plugin-external projects' },
+          deps: { type: 'string', description: 'Comma-separated dependency plugin names' },
+          context: { type: 'string', description: 'Additional context about what this issue is for (helps with suggestions)' },
+        },
+        required: ['issue'],
+      },
+    },
+    {
       name: 'swctl_github_issues',
       description: 'Fetch GitHub issues and PRs assigned to you, requested for your review, or authored by you across the organization.',
       inputSchema: {
@@ -150,6 +168,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return clean(args as any)
     case 'swctl_refresh':
       return refresh(args as any)
+    case 'swctl_smart_create':
+      return smartCreate(args as any)
     case 'swctl_github_issues':
       return githubIssues(args as any || {})
     default:

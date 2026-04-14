@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'child_process'
 import type { Context } from 'hono'
 import { streamSSE } from 'hono/streaming'
+import { emit } from './events.js'
 
 const SWCTL_PATH = process.env.SWCTL_PATH || '/swctl/swctl'
 const PROJECT_ROOT = process.env.PROJECT_ROOT || '/project'
@@ -20,7 +21,7 @@ export function cancelStream(streamId: string): boolean {
   return true
 }
 
-export function streamSwctl(c: Context, args: string[], streamId: string, onAbort?: () => void) {
+export function streamSwctl(c: Context, args: string[], streamId: string, onAbort?: () => void, source?: 'mcp' | 'ui') {
   // If a previous stream exists, check if it's still alive
   const existing = activeStreams.get(streamId)
   if (existing) {
@@ -44,9 +45,14 @@ export function streamSwctl(c: Context, args: string[], streamId: string, onAbor
   const child = spawn('bash', [SWCTL_PATH, ...args], {
     cwd: PROJECT_ROOT,
     env: { ...process.env, SWCTL_STATE_DIR: STATE_DIR, TERM: 'dumb' },
+    // Explicitly set stdio to prevent inheriting all parent FDs.
+    // Without this, each child inherits the node server's open FDs (SSE connections,
+    // HTTP sockets, file watchers), causing FD exhaustion when running 4+ creates in parallel.
+    stdio: ['ignore', 'pipe', 'pipe'],
   })
 
   activeStreams.set(streamId, child)
+  emit({ type: 'stream-start', streamId, source })
 
   const cleanup = () => { activeStreams.delete(streamId) }
 
@@ -75,7 +81,10 @@ export function streamSwctl(c: Context, args: string[], streamId: string, onAbor
     await new Promise<void>((resolve) => {
       child.on('close', (code) => {
         cleanup()
-        sendEvent('done', { exitCode: code || 0, elapsed: Date.now() - startTime })
+        const exitCode = code || 0
+        emit({ type: 'stream-done', streamId, source, exitCode })
+        emit({ type: 'instance-changed' })
+        sendEvent('done', { exitCode, elapsed: Date.now() - startTime })
           .then(resolve)
       })
 
@@ -107,6 +116,7 @@ export function streamCommand(c: Context, cwd: string, command: string, streamId
   const child = spawn('bash', ['-c', command], {
     cwd,
     env: { ...process.env, TERM: 'dumb', GIT_TERMINAL_PROMPT: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
   })
 
   activeStreams.set(streamId, child)
@@ -155,10 +165,11 @@ export function spawnSwctl(args: string[]): Promise<{ ok: boolean; output: strin
     const child = spawn('bash', [SWCTL_PATH, ...args], {
       cwd: PROJECT_ROOT,
       env: { ...process.env, SWCTL_STATE_DIR: STATE_DIR, TERM: 'dumb' },
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     let output = ''
-    child.stdout.on('data', (d) => { output += d })
-    child.stderr.on('data', (d) => { output += d })
+    child.stdout!.on('data', (d: Buffer) => { output += d })
+    child.stderr!.on('data', (d: Buffer) => { output += d })
     child.on('close', (code) => {
       resolve({ ok: code === 0, output: output.trim() })
     })

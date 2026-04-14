@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Raise FD limit for parallel worktree creation.
+# Each create spawns many subprocesses (docker compose, docker exec, git, mysql).
+# Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
+ulimit -n 10240 2>/dev/null || true
+
 SWCTL_VERSION="0.3.3"
 
 _swctl_resolve_script() {
@@ -77,6 +82,44 @@ ensure_state_dirs() {
 require_cmd() {
     local cmd="$1"
     command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
+}
+
+# Cooperative lock for parallel-safe operations.
+# Usage: swctl_lock <name> <command...>
+# Serializes concurrent access using mkdir (atomic on all filesystems, works on macOS + Linux).
+swctl_lock() {
+    local name="$1"; shift
+    local lockdir="$SWCTL_TMP_DIR/.lock-${name}"
+    mkdir -p "$SWCTL_TMP_DIR"
+
+    local waited=0
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        # Check for stale locks (process that created it crashed)
+        if [ -f "$lockdir/pid" ]; then
+            local lock_pid
+            lock_pid="$(cat "$lockdir/pid" 2>/dev/null)" || true
+            if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                warn "Removing stale lock '$name' (pid $lock_pid is dead)"
+                rm -rf "$lockdir"
+                continue
+            fi
+        fi
+        if [ "$waited" -ge 120 ]; then
+            warn "Lock timeout for '$name' after 120s — proceeding anyway"
+            rm -rf "$lockdir"
+            continue
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    # Record our PID for stale lock detection
+    echo $$ > "$lockdir/pid"
+
+    # Run the command, then release lock
+    local rc=0
+    "$@" || rc=$?
+    rm -rf "$lockdir"
+    return $rc
 }
 
 compose() {
@@ -998,59 +1041,97 @@ worktree_exists() {
 create_worktree() {
     mkdir -p "$SW_WORKTREE_ROOT"
 
-    if worktree_exists "$WORKTREE_PATH"; then
-        ok "Git worktree already exists at '$WORKTREE_PATH'."
-        return 0
-    fi
-
-    if [ -d "$WORKTREE_PATH" ]; then
-        # Check if this is a leftover from a failed/interrupted create
-        if [ "${STATUS:-}" = "creating" ] || [ "${STATUS:-}" = "failed" ]; then
-            warn "Cleaning up leftover directory from previous failed create: $WORKTREE_PATH"
-            git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || rm -rf "$WORKTREE_PATH"
-        else
-            die "Target worktree path already exists and is not a registered Git worktree: $WORKTREE_PATH"
+    # All git worktree operations (check, remove, add, reset) are serialized per repo.
+    # Concurrent `git worktree add/remove/list` on the same repo race on internal locks
+    # (.git/config.lock, index.lock) causing "Could not reset index file" errors.
+    _do_worktree_create() {
+        if worktree_exists "$WORKTREE_PATH"; then
+            ok "Git worktree already exists at '$WORKTREE_PATH'."
+            return 0
         fi
-    fi
 
-    # Clean up stale .git/config.lock if present (from interrupted git operations)
-    local config_lock="$PROJECT_ROOT/.git/config.lock"
-    if [ -f "$config_lock" ]; then
-        # Remove if older than 5 seconds (stale from a crashed process)
-        if find "$config_lock" -mmin +0.08 -print -quit 2>/dev/null | grep -q .; then
-            warn "Removing stale lock file: $config_lock"
-            rm -f "$config_lock"
-        else
-            # Lock is fresh — another git process may be active, wait briefly
-            info "Waiting for git config lock to release..."
-            local _wait=0
-            while [ -f "$config_lock" ] && [ "$_wait" -lt 10 ]; do
-                sleep 1
-                _wait=$((_wait + 1))
-            done
-            # If still present after 10s, force remove
-            if [ -f "$config_lock" ]; then
-                warn "Force-removing git config lock after 10s timeout."
-                rm -f "$config_lock"
+        if [ -d "$WORKTREE_PATH" ]; then
+            # Check if this is a leftover from a failed/interrupted create
+            if [ "${STATUS:-}" = "creating" ] || [ "${STATUS:-}" = "failed" ]; then
+                warn "Cleaning up leftover directory from previous failed create: $WORKTREE_PATH"
+                git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || rm -rf "$WORKTREE_PATH"
+            else
+                die "Target worktree path already exists and is not a registered Git worktree: $WORKTREE_PATH"
             fi
         fi
-    fi
 
-    if git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
-        git -C "$PROJECT_ROOT" worktree add "$WORKTREE_PATH" "$BRANCH"
-        ok "Attached existing branch '$BRANCH' at '$WORKTREE_PATH'."
-    elif git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
-        git -C "$PROJECT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "origin/$BRANCH"
-        ok "Created worktree tracking 'origin/$BRANCH' at '$WORKTREE_PATH'."
-    else
-        git -C "$PROJECT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "$BASE_REF"
-        ok "Created worktree '$WORKTREE_PATH' from '$BASE_REF'."
-    fi
+        # Retry loop: git worktree add can fail transiently due to concurrent git
+        # operations holding locks (config.lock, index.lock). We retry up to 3 times
+        # with cleanup between attempts.
+        local _wt_attempt=0
+        local _wt_max=3
+        local _wt_ok=0
+
+        while [ "$_wt_attempt" -lt "$_wt_max" ] && [ "$_wt_ok" -eq 0 ]; do
+            _wt_attempt=$((_wt_attempt + 1))
+
+            # Clean up stale git lock files before each attempt
+            local config_lock="$PROJECT_ROOT/.git/config.lock"
+            if [ -f "$config_lock" ]; then
+                if find "$config_lock" -mmin +0.08 -print -quit 2>/dev/null | grep -q .; then
+                    warn "Removing stale lock file: $config_lock"
+                    rm -f "$config_lock"
+                fi
+            fi
+
+            # Attempt git worktree add (capture exit code, don't abort on failure)
+            local _wt_rc=0
+            if git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+                git -C "$PROJECT_ROOT" worktree add "$WORKTREE_PATH" "$BRANCH" 2>&1 || _wt_rc=$?
+            elif git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+                git -C "$PROJECT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "origin/$BRANCH" 2>&1 || _wt_rc=$?
+            else
+                git -C "$PROJECT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "$BASE_REF" 2>&1 || _wt_rc=$?
+            fi
+
+            # Verify: directory exists AND has checked-out files
+            if [ -f "$WORKTREE_PATH/composer.json" ]; then
+                _wt_ok=1
+            elif [ -d "$WORKTREE_PATH" ] && [ -f "$WORKTREE_PATH/.git" ]; then
+                # Directory exists but checkout incomplete (e.g. "Could not reset index file").
+                # The worktree is registered in git but files weren't checked out. Recover.
+                warn "Worktree checkout incomplete (attempt $_wt_attempt/$_wt_max) — recovering with git reset."
+                local gitdir=""
+                gitdir="$(sed -n 's/^gitdir: //p' "$WORKTREE_PATH/.git" 2>/dev/null)" || true
+                [ -n "$gitdir" ] && rm -f "$gitdir/index.lock" 2>/dev/null || true
+                if git -C "$WORKTREE_PATH" reset --hard HEAD 2>&1; then
+                    _wt_ok=1
+                    ok "Worktree checkout recovered."
+                else
+                    warn "Recovery failed. Cleaning up for retry."
+                    git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || rm -rf "$WORKTREE_PATH"
+                fi
+            else
+                # Directory not created at all — git failed completely
+                if [ "$_wt_attempt" -lt "$_wt_max" ]; then
+                    warn "git worktree add failed (attempt $_wt_attempt/$_wt_max, rc=$_wt_rc). Retrying in 2s..."
+                    git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
+                    rm -rf "$WORKTREE_PATH" 2>/dev/null || true
+                    sleep 2
+                fi
+            fi
+        done
+
+        if [ "$_wt_ok" -eq 0 ]; then
+            die "Failed to create worktree at '$WORKTREE_PATH' after $_wt_max attempts."
+        fi
+
+        ok "Worktree ready at '$WORKTREE_PATH'."
+    }
+    local repo_slug
+    repo_slug="$(echo "$PROJECT_ROOT" | tr '/' '-')"
+    swctl_lock "git-worktree${repo_slug}" _do_worktree_create
 
     sync_lock_files
 }
 
 sync_lock_files() {
+    [ -d "$WORKTREE_PATH" ] || return 0
     local file=""
     for file in composer.lock pnpm-lock.yaml yarn.lock package-lock.json; do
         if [ -f "$PROJECT_ROOT/$file" ] && [ ! -f "$WORKTREE_PATH/$file" ]; then
@@ -1100,35 +1181,43 @@ print('sync_dirs=\"{}\"'.format(' '.join(dirs)))
         fi
     done
 
+    # Sync directories in parallel — each is independent (APFS clone or rsync)
+    local _sync_pids=()
     local dir
     for dir in $sync_dirs; do
-        local src_dir="$PROJECT_ROOT/$dir"
-        local dst_dir="$WORKTREE_PATH/$dir"
-        if [ -d "$src_dir" ]; then
-            local src_count dst_count
-            src_count="$(find "$src_dir" -mindepth 1 -maxdepth 1 -not -name '.gitkeep' 2>/dev/null | wc -l | tr -d ' ')"
-            dst_count="$( (find "$dst_dir" -mindepth 1 -maxdepth 1 -not -name '.gitkeep' 2>/dev/null || true) | wc -l | tr -d ' ')"
-            if [ "$src_count" -gt 0 ] && [ "${dst_count:-0}" -lt "$src_count" ]; then
-                mkdir -p "$dst_dir"
-                # APFS clone (cp -c): instant copy-on-write. Clone to temp, swap in.
-                local tmp_clone="${dst_dir}.swctl-clone"
-                rm -rf "$tmp_clone"
-                if cp -cR "$src_dir" "$tmp_clone" 2>/dev/null; then
-                    rm -rf "$dst_dir"
-                    mv "$tmp_clone" "$dst_dir"
-                else
-                    rm -rf "$tmp_clone" 2>/dev/null || true
-                    # Fallback: rsync or regular copy
+        (
+            src_dir="$PROJECT_ROOT/$dir"
+            dst_dir="$WORKTREE_PATH/$dir"
+            if [ -d "$src_dir" ]; then
+                src_count="$(find "$src_dir" -mindepth 1 -maxdepth 1 -not -name '.gitkeep' 2>/dev/null | wc -l | tr -d ' ')"
+                dst_count="$( (find "$dst_dir" -mindepth 1 -maxdepth 1 -not -name '.gitkeep' 2>/dev/null || true) | wc -l | tr -d ' ')"
+                if [ "$src_count" -gt 0 ] && [ "${dst_count:-0}" -lt "$src_count" ]; then
                     mkdir -p "$dst_dir"
-                    if command -v rsync >/dev/null 2>&1; then
-                        rsync -a "$src_dir/" "$dst_dir/" 2>/dev/null || true
+                    # APFS clone (cp -c): instant copy-on-write. Clone to temp, swap in.
+                    tmp_clone="${dst_dir}.swctl-clone"
+                    rm -rf "$tmp_clone"
+                    if cp -cR "$src_dir" "$tmp_clone" 2>/dev/null; then
+                        rm -rf "$dst_dir"
+                        mv "$tmp_clone" "$dst_dir"
                     else
-                        cp -R "$src_dir"/* "$dst_dir"/ 2>/dev/null || true
+                        rm -rf "$tmp_clone" 2>/dev/null || true
+                        # Fallback: rsync or regular copy
+                        mkdir -p "$dst_dir"
+                        if command -v rsync >/dev/null 2>&1; then
+                            rsync -a "$src_dir/" "$dst_dir/" 2>/dev/null || true
+                        else
+                            cp -R "$src_dir"/* "$dst_dir"/ 2>/dev/null || true
+                        fi
                     fi
+                    echo "  ✓ Synced '$dir/'."
                 fi
-                ok "Synced '$dir/'."
             fi
-        fi
+        ) &
+        _sync_pids+=($!)
+    done
+    # Wait for all parallel syncs to complete
+    for pid in "${_sync_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
     done
 
     # Mark synced artifacts as git-excluded so they don't pollute worktree git status.
@@ -1354,14 +1443,18 @@ write_compose_volume_override() {
     case "$VENDOR_VOLUME" in vendor-base-*) vendor_is_shared=1 ;; esac
     case "$NODE_MODULES_VOLUME" in node_modules-base-*) node_is_shared=1 ;; esac
 
-    # Ensure shared base volumes exist before marking them external
+    # Ensure shared base volumes exist before marking them external.
+    # Locked to prevent TOCTOU race when multiple creates run in parallel:
+    # without the lock, all check "volume doesn't exist", all try to create it.
+    _ensure_volume() {
+        docker volume inspect "$1" >/dev/null 2>&1 || \
+            docker volume create "$1" >/dev/null
+    }
     if [ "$vendor_is_shared" -eq 1 ]; then
-        docker volume inspect "$VENDOR_VOLUME" >/dev/null 2>&1 || \
-            docker volume create "$VENDOR_VOLUME" >/dev/null
+        swctl_lock "volume-$VENDOR_VOLUME" _ensure_volume "$VENDOR_VOLUME"
     fi
     if [ "$node_is_shared" -eq 1 ]; then
-        docker volume inspect "$NODE_MODULES_VOLUME" >/dev/null 2>&1 || \
-            docker volume create "$NODE_MODULES_VOLUME" >/dev/null
+        swctl_lock "volume-$NODE_MODULES_VOLUME" _ensure_volume "$NODE_MODULES_VOLUME"
     fi
 
     {
@@ -1513,6 +1606,7 @@ exec_in_container() {
     else
         # Non-interactive: wrap command to track PID so it can be killed remotely.
         # docker exec does NOT kill the container process when the client dies.
+        # Close stdin (<&-) to avoid holding the pipe FD from the server process.
         docker exec "$container_id" bash -c '
             bash -lc "$1" &
             child=$!
@@ -1521,7 +1615,7 @@ exec_in_container() {
             code=$?
             rm -f /tmp/.swctl-exec.pid
             exit $code
-        ' _ "$command_string"
+        ' _ "$command_string" <&-
     fi
 }
 
@@ -1892,17 +1986,19 @@ provision_database_and_app() {
     write_compose_env_file
     write_compose_volume_override
 
-    # Clone DB and start container
+    # Clone DB and start container.
+    # Database operations are serialized per DB host to prevent concurrent
+    # CREATE/DROP/DUMP from overloading MariaDB (parallel dumps cause lock contention).
     if [ "$DB_STATE" = "fresh" ]; then
         info "Source database '$source_db' is empty. Will run fresh install."
-        create_database "$DB_NAME"
+        swctl_lock "db-$SW_DB_HOST" create_database "$DB_NAME"
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     elif mysql_db_has_tables "$DB_NAME"; then
         info "Database '$DB_NAME' already exists. Reusing."
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     else
         # Clone DB in background while container starts
-        clone_database "$source_db" "$DB_NAME" &
+        swctl_lock "db-$SW_DB_HOST" clone_database "$source_db" "$DB_NAME" &
         local clone_pid=$!
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait "$clone_pid" || die "Database clone failed."

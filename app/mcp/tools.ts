@@ -203,6 +203,87 @@ export async function refresh(args: { issueId: string }): Promise<ToolResult> {
   return error(`Failed to refresh instance ${args.issueId}:\n${result.output}`)
 }
 
+export async function smartCreate(args: {
+  issue: string
+  branch?: string
+  project?: string
+  mode?: string
+  plugin?: string
+  deps?: string
+  context?: string
+}): Promise<ToolResult> {
+  const mode = args.mode || 'dev'
+  const project = args.project || ''
+
+  // Step 1: Run preflight checks
+  const preflightParams = new URLSearchParams({ issue: args.issue })
+  if (project) preflightParams.set('project', project)
+  if (args.branch) preflightParams.set('branch', args.branch)
+  preflightParams.set('mode', mode)
+
+  let preflightResult: { ok: boolean; errors: string[]; warnings: string[] }
+  try {
+    preflightResult = await apiGet(`/api/preflight?${preflightParams}`)
+  } catch (err: any) {
+    return error(`Pre-flight check failed: ${err.message}`)
+  }
+
+  if (!preflightResult.ok) {
+    return error(
+      `Pre-flight validation failed for #${args.issue}:\n` +
+      preflightResult.errors.map(e => `  - ${e}`).join('\n') +
+      (preflightResult.warnings.length > 0
+        ? '\n\nWarnings:\n' + preflightResult.warnings.map(w => `  - ${w}`).join('\n')
+        : '')
+    )
+  }
+
+  const warningNote = preflightResult.warnings.length > 0
+    ? `\n\n**Warnings:**\n${preflightResult.warnings.map(w => `- ${w}`).join('\n')}`
+    : ''
+
+  // Step 2: Preview create — analyze branch diff to show what will happen
+  let previewNote = ''
+  try {
+    const previewParams = new URLSearchParams({ issue: args.issue, mode })
+    if (project) previewParams.set('project', project)
+    if (args.branch) previewParams.set('branch', args.branch)
+    if (args.plugin) previewParams.set('plugin', args.plugin)
+
+    const preview = await apiGet(`/api/preview-create?${previewParams}`)
+    if (preview.steps) {
+      const enabled = preview.steps.filter((s: any) => s.enabled)
+      const skipped = preview.steps.filter((s: any) => !s.enabled)
+      const lines: string[] = []
+      lines.push(`**Create plan** (${preview.totalFiles} files changed):`)
+      for (const s of enabled) lines.push(`  - [run] ${s.label}: ${s.reason}`)
+      for (const s of skipped) lines.push(`  - [skip] ${s.label}: ${s.reason}`)
+      if (preview.estimatedTimeSaved) lines.push(`  Time saved: ${preview.estimatedTimeSaved}`)
+      previewNote = '\n\n' + lines.join('\n')
+    }
+  } catch {
+    // Preview is informational — don't block creation
+  }
+
+  // Step 3: Create the worktree
+  const createResult = await createWorktree({
+    issue: args.issue,
+    branch: args.branch,
+    project: args.project,
+    mode,
+    plugin: args.plugin,
+    deps: args.deps,
+  })
+
+  if (createResult.isError) {
+    return error(createResult.content[0].text + previewNote)
+  }
+
+  return text(
+    createResult.content[0].text + warningNote + previewNote
+  )
+}
+
 export async function githubIssues(args: { org?: string }): Promise<ToolResult> {
   try {
     const params = args.org ? `?org=${encodeURIComponent(args.org)}` : ''

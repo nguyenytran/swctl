@@ -130,6 +130,24 @@ export function isExternalWorktree(item: WorktreeItem): item is ExternalWorktree
   return item.kind === 'external'
 }
 
+export interface CreateStep {
+  id: string
+  label: string
+  enabled: boolean
+  reason: string
+}
+
+export interface PreviewCreateResult {
+  issue: string
+  branch: string
+  mode: string
+  totalFiles: number
+  changes: Changes
+  steps: CreateStep[]
+  skippedCount: number
+  estimatedTimeSaved: string | null
+}
+
 export type BatchJobStatus = 'pending' | 'running' | 'success' | 'failed'
 
 export interface BatchJob {

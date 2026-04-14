@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useInstances } from '@/composables/useInstances'
 import { useProjects } from '@/composables/useProjects'
 import { useStream } from '@/composables/useStream'
+import { useEvents } from '@/composables/useEvents'
 import InstanceRow from './InstanceRow.vue'
 import BatchCreateModal from './BatchCreateModal.vue'
 import BatchDeleteModal from './BatchDeleteModal.vue'
@@ -20,6 +21,7 @@ const router = useRouter()
 const { filteredInstances, filteredExternalWorktrees, instances, loading, refresh, grouped } = useInstances()
 const { projects } = useProjects()
 const stream = useStream()
+const { lastEvent } = useEvents()
 
 // Route-driven modal state
 const showBatchCreate = computed(() => route.meta.modal === 'batch-create')
@@ -209,6 +211,11 @@ function onStreamDone() {
 // Auto-refresh when any stream completes (create, delete, switch-mode, refresh)
 watch(() => stream.result.value, (val) => {
   if (val) refresh()
+})
+
+// Auto-refresh when MCP or external actions modify instances (via event bus)
+watch(lastEvent, (event) => {
+  if (event?.type === 'instance-changed') refresh()
 })
 </script>
 
