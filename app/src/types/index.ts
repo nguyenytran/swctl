@@ -75,6 +75,11 @@ export interface LinkedPR {
   state: string  // 'open' | 'draft' | 'closed' | 'merged'
 }
 
+export interface LinkedIssue {
+  number: number
+  title: string
+}
+
 export interface GitHubItem {
   number: number
   title: string
@@ -84,8 +89,10 @@ export interface GitHubItem {
   isPR: boolean
   url: string
   category: 'assigned' | 'review-requested' | 'my-pr'
+  repo?: string
   issueType?: string | null
   linkedPRs?: LinkedPR[]
+  linkedIssues?: LinkedIssue[]
 }
 
 export interface GitHubResult {

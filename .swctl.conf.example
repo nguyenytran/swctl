@@ -59,3 +59,5 @@ SW_SHARED_DB_INSTALL_ARGS="--basic-setup --force --no-interaction"
 # SWCTL_GITLAB_TOKEN=""
 # SWCTL_GITLAB_URL="https://gitlab.com"
 # GitHub auth: run 'swctl auth login' (token stored in state dir)
+# GitHub organization for fetching issues/PRs (default: shopware)
+# SWCTL_GITHUB_ORG="shopware"

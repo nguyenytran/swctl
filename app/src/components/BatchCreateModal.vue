@@ -36,14 +36,21 @@ watch(selectedPlugin, () => { selectedDeps.value = new Set() })
 // Input mode: 'manual' | 'github'
 const inputMode = ref<'manual' | 'github'>('manual')
 
+// Auto-fetch when switching to GitHub tab
+watch(inputMode, (mode) => {
+  if (mode === 'github' && !ghFetched.value && !ghLoading.value) {
+    fetchFromGitHub()
+  }
+})
+
 // Manual input state
 const quickAddText = ref('')
 const manualIssue = ref('')
 const manualBranch = ref('')
 
 // GitHub import state
-const ghRepo = ref('shopware/shopware')
 const ghLoading = ref(false)
+const ghFetched = ref(false)
 const ghError = ref('')
 const ghAuthUrl = ref('')
 const ghItems = ref<GitHubItem[]>([])
@@ -272,7 +279,6 @@ function addManual() {
 
 // --- GitHub import ---
 async function fetchFromGitHub() {
-  if (!ghRepo.value.trim()) return
   ghLoading.value = true
   ghError.value = ''
   ghAuthUrl.value = ''
@@ -283,13 +289,14 @@ async function fetchFromGitHub() {
   ghFilterTypes.value = new Set(['issue', 'pr'])
 
   try {
-    const result = await fetchGitHubIssues(ghRepo.value.trim())
+    const result = await fetchGitHubIssues()
+    ghFetched.value = true
     if (result.rateLimit) ghRateLimit.value = result.rateLimit
     if (result.error) {
       ghError.value = result.error === 'rate_limited'
-        ? `Rate limited. ${result.rateLimit?.remaining ?? 0}/${result.rateLimit?.limit ?? 0} requests remaining. Add a GitHub token for higher limits.`
+        ? `Rate limited. ${result.rateLimit?.remaining ?? 0}/${result.rateLimit?.limit ?? 0} requests remaining.`
         : result.error === 'auth_required'
-          ? 'Authentication required for this repository.'
+          ? 'Authentication required.'
           : result.error
       ghAuthUrl.value = result.authUrl || ''
     } else {
@@ -349,7 +356,10 @@ function addSelectedGhItems() {
       skipped++
       continue
     }
-    const issue = String(item.number)
+    // For PRs, use the first linked issue number if available
+    const issue = item.isPR && item.linkedIssues?.length
+      ? String(item.linkedIssues[0].number)
+      : String(item.number)
     // Use linked PR branch if available, otherwise derive from issue type
     const branch = item.branch || `${branchPrefixFromType(item.issueType)}/${item.number}`
     batch.addJob(issue, branch, selectedPlugin.value, depsString.value)
@@ -623,24 +633,20 @@ function handleNewBatch() {
                 </template>
               </div>
 
-              <form @submit.prevent="fetchFromGitHub" class="flex gap-2">
-                <input
-                  v-model="ghRepo"
-                  class="flex-1 bg-surface-dark border border-border rounded px-3 py-1.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-colors"
-                  placeholder="owner/repo"
-                />
+              <!-- Rate limit + refresh -->
+              <div class="flex items-center gap-2">
+                <div v-if="ghRateLimit" class="text-[10px] text-gray-600">
+                  API: {{ ghRateLimit.remaining }}/{{ ghRateLimit.limit }} requests remaining
+                </div>
                 <button
-                  type="submit"
-                  :disabled="ghLoading || !ghRepo.trim()"
-                  class="px-4 bg-surface hover:bg-surface-hover text-gray-300 text-sm rounded border border-border transition-colors disabled:opacity-40"
+                  class="ml-auto text-gray-500 hover:text-gray-300 transition-colors"
+                  :disabled="ghLoading"
+                  :class="{ 'animate-spin': ghLoading }"
+                  @click="fetchFromGitHub"
+                  title="Refresh"
                 >
-                  {{ ghLoading ? 'Loading...' : 'Fetch' }}
+                  <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
                 </button>
-              </form>
-
-              <!-- Rate limit info -->
-              <div v-if="ghRateLimit" class="text-[10px] text-gray-600">
-                API: {{ ghRateLimit.remaining }}/{{ ghRateLimit.limit }} requests remaining
               </div>
 
               <!-- Error state -->
@@ -756,6 +762,7 @@ function handleNewBatch() {
                         >
                           {{ item.isPR ? 'PR' : '#' }}{{ item.number }}
                         </a>
+                        <span v-if="item.repo" class="text-[10px] text-gray-600 shrink-0">{{ item.repo }}</span>
                         <span
                           class="text-[10px] px-1 py-0 rounded shrink-0"
                           :class="{
@@ -782,7 +789,7 @@ function handleNewBatch() {
                       <div class="flex items-center gap-2 mt-0.5 flex-wrap">
                         <template v-if="item.linkedPRs?.length">
                           <a
-                            :href="`https://github.com/${ghRepo}/pull/${item.linkedPRs[0].number}`"
+                            :href="`https://github.com/${item.repo || 'shopware/shopware'}/pull/${item.linkedPRs[0].number}`"
                             target="_blank"
                             class="text-[10px] text-emerald-500 hover:underline font-mono shrink-0"
                             @click.stop
@@ -817,8 +824,8 @@ function handleNewBatch() {
               </div>
 
               <!-- Empty state -->
-              <div v-else-if="!ghLoading && !ghError && ghRepo" class="text-xs text-gray-600 text-center py-2">
-                {{ ghAuth?.authenticated ? 'Enter a repo and click Fetch to load your issues/PRs' : 'Login with GitHub to fetch your assigned issues and PRs' }}
+              <div v-else-if="!ghLoading && !ghError && !ghFetched" class="text-xs text-gray-600 text-center py-2">
+                {{ ghAuth?.authenticated ? 'Loading your issues and PRs...' : 'Login with GitHub to fetch your assigned issues and PRs' }}
               </div>
             </div>
           </div>

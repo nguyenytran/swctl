@@ -5,6 +5,11 @@ export interface LinkedPR {
   state: string  // 'open' | 'draft' | 'closed' | 'merged'
 }
 
+export interface LinkedIssue {
+  number: number
+  title: string
+}
+
 export interface GitHubItem {
   number: number
   title: string
@@ -14,8 +19,10 @@ export interface GitHubItem {
   isPR: boolean
   url: string
   category: 'assigned' | 'review-requested' | 'my-pr'
+  repo?: string
   issueType?: string | null
   linkedPRs?: LinkedPR[]
+  linkedIssues?: LinkedIssue[]
 }
 
 export interface GitHubResult {
@@ -206,87 +213,70 @@ function extractLinkedPRs(timelineNodes: any[]): LinkedPR[] {
   return prs
 }
 
-// --- Main: fetch issues + PRs via single GraphQL query ---
+// --- Main: fetch issues + PRs via org-wide GraphQL search ---
 
-const GRAPHQL_ISSUES_QUERY = `
-query ($owner: String!, $name: String!, $username: String!, $perPage: Int!) {
-  repository(owner: $owner, name: $name) {
-    # Issues assigned to user
-    assignedIssues: issues(
-      first: $perPage
-      filterBy: { assignee: $username, states: OPEN }
-      orderBy: { field: UPDATED_AT, direction: DESC }
-    ) {
+const ISSUE_FRAGMENT = `
+  ... on Issue {
+    number title url state
+    repository { nameWithOwner }
+    author { login }
+    labels(first: 5) { nodes { name color } }
+    issueType { name }
+    timelineItems(first: 20, itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]) {
       nodes {
-        number
-        title
-        url
-        state
-        author { login avatarUrl }
-        labels(first: 5) { nodes { name color } }
-        issueType { name }
-        timelineItems(first: 20, itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]) {
-          nodes {
-            __typename
-            ... on CrossReferencedEvent {
-              source {
-                ... on PullRequest { number title state isDraft headRefName }
-              }
-            }
-            ... on ConnectedEvent {
-              subject {
-                ... on PullRequest { number title state isDraft headRefName }
-              }
-            }
-          }
+        __typename
+        ... on CrossReferencedEvent {
+          source { ... on PullRequest { number title state isDraft headRefName } }
+        }
+        ... on ConnectedEvent {
+          subject { ... on PullRequest { number title state isDraft headRefName } }
         }
       }
     }
-    # Open PRs (filter by author + reviewer client-side)
-    openPRs: pullRequests(
-      first: $perPage
-      states: OPEN
-      orderBy: { field: UPDATED_AT, direction: DESC }
-    ) {
-      nodes {
-        number
-        title
-        url
-        state
-        isDraft
-        headRefName
-        author { login avatarUrl }
-        labels(first: 5) { nodes { name color } }
-        reviewRequests(first: 10) {
-          nodes {
-            requestedReviewer {
-              ... on User { login }
-              ... on Team { name }
-            }
-          }
-        }
-      }
-    }
+  }
+`
+
+const PR_FRAGMENT = `
+  ... on PullRequest {
+    number title url state isDraft headRefName
+    repository { nameWithOwner }
+    author { login }
+    labels(first: 5) { nodes { name color } }
+    closingIssuesReferences(first: 5) { nodes { number title } }
+  }
+`
+
+const GRAPHQL_ORG_SEARCH_QUERY = `
+query ($assignedQ: String!, $reviewQ: String!, $authorQ: String!, $perPage: Int!) {
+  assigned: search(query: $assignedQ, type: ISSUE, first: $perPage) {
+    nodes { ${ISSUE_FRAGMENT} ${PR_FRAGMENT} }
+  }
+  reviewRequested: search(query: $reviewQ, type: ISSUE, first: $perPage) {
+    nodes { ${PR_FRAGMENT} }
+  }
+  myPRs: search(query: $authorQ, type: ISSUE, first: $perPage) {
+    nodes { ${PR_FRAGMENT} }
   }
   rateLimit { remaining limit resetAt }
 }
 `
 
 export async function fetchGitHubIssues(
-  repo: string,
+  org: string,
   username: string,
   token: string,
-  _state = 'open',
   perPage = 50,
 ): Promise<GitHubResult> {
-  const [owner, name] = repo.split('/')
-  if (!owner || !name) {
-    return { items: [], error: 'Invalid repo format. Use owner/repo.' }
+  if (!org) {
+    return { items: [], error: 'No GitHub organization configured.' }
   }
 
   try {
-    const res = await graphqlRequest(token, GRAPHQL_ISSUES_QUERY, {
-      owner, name, username, perPage,
+    const res = await graphqlRequest(token, GRAPHQL_ORG_SEARCH_QUERY, {
+      assignedQ: `org:${org} is:open assignee:${username} sort:updated-desc`,
+      reviewQ: `org:${org} is:open is:pr review-requested:${username} sort:updated-desc`,
+      authorQ: `org:${org} is:open is:pr author:${username} sort:updated-desc`,
+      perPage,
     })
 
     const body = await res.json() as any
@@ -299,66 +289,97 @@ export async function fetchGitHubIssues(
 
     if (body?.errors?.length) {
       const errMsg = body.errors.map((e: any) => e.message).join('; ')
-      // Check for auth errors in GraphQL response
       if (errMsg.includes('401') || errMsg.includes('Bad credentials')) {
         return { items: [], error: 'auth_required' }
       }
       return { items: [], error: errMsg }
     }
 
-    const repoData = body?.data?.repository
-    if (!repoData) {
-      return { items: [], error: `Repository '${repo}' not found or no access` }
+    const data = body?.data
+    if (!data) {
+      return { items: [], error: 'Unexpected response from GitHub' }
     }
 
     const rateLimit = extractGraphQLRateLimit(body)
     const items: GitHubItem[] = []
-    const seen = new Set<number>()
+    // Deduplicate by repo+number (same item can appear in multiple search results)
+    const seen = new Set<string>()
+    const key = (node: any) => `${node.repository?.nameWithOwner}#${node.number}`
 
-    // --- Process assigned issues ---
-    for (const issue of repoData.assignedIssues?.nodes || []) {
-      if (!issue || seen.has(issue.number)) continue
-      seen.add(issue.number)
+    // --- Assigned issues/PRs ---
+    for (const node of data.assigned?.nodes || []) {
+      if (!node?.number) continue
+      const k = key(node)
+      if (seen.has(k)) continue
+      seen.add(k)
 
-      const linkedPRs = extractLinkedPRs(issue.timelineItems?.nodes || [])
+      const isPR = !!node.headRefName || node.isDraft !== undefined
+      const linkedPRs = !isPR ? extractLinkedPRs(node.timelineItems?.nodes || []) : []
+      const linkedIssues: LinkedIssue[] = isPR
+        ? (node.closingIssuesReferences?.nodes || []).filter((i: any) => i?.number).map((i: any) => ({ number: i.number, title: i.title || '' }))
+        : []
 
       items.push({
-        number: issue.number,
-        title: issue.title,
-        labels: (issue.labels?.nodes || []).map((l: any) => ({ name: l.name, color: l.color })),
-        user: issue.author?.login || '',
-        branch: linkedPRs.length > 0 ? linkedPRs[0].branch : null,
-        isPR: false,
-        url: issue.url,
+        number: node.number,
+        title: node.title,
+        labels: (node.labels?.nodes || []).map((l: any) => ({ name: l.name, color: l.color })),
+        user: node.author?.login || '',
+        branch: isPR ? (node.headRefName || null) : (linkedPRs.length > 0 ? linkedPRs[0].branch : null),
+        isPR,
+        url: node.url,
         category: 'assigned',
-        issueType: issue.issueType?.name || null,
+        repo: node.repository?.nameWithOwner || '',
+        issueType: node.issueType?.name || null,
         linkedPRs: linkedPRs.length > 0 ? linkedPRs : undefined,
+        linkedIssues: linkedIssues.length > 0 ? linkedIssues : undefined,
       })
     }
 
-    // --- Process PRs (review-requested + my-pr) ---
-    for (const pr of repoData.openPRs?.nodes || []) {
-      if (!pr || seen.has(pr.number)) continue
+    // --- Review-requested PRs ---
+    for (const node of data.reviewRequested?.nodes || []) {
+      if (!node?.number) continue
+      const k = key(node)
+      if (seen.has(k)) continue
+      seen.add(k)
 
-      const isAuthor = pr.author?.login === username
-      const isReviewer = (pr.reviewRequests?.nodes || []).some(
-        (rr: any) => rr.requestedReviewer?.login === username,
-      )
-
-      if (!isAuthor && !isReviewer) continue
-      seen.add(pr.number)
-
-      const category = isReviewer ? 'review-requested' as const : 'my-pr' as const
+      const linkedIssues: LinkedIssue[] = (node.closingIssuesReferences?.nodes || [])
+        .filter((i: any) => i?.number).map((i: any) => ({ number: i.number, title: i.title || '' }))
 
       items.push({
-        number: pr.number,
-        title: pr.title,
-        labels: (pr.labels?.nodes || []).map((l: any) => ({ name: l.name, color: l.color })),
-        user: pr.author?.login || '',
-        branch: pr.headRefName || null,
+        number: node.number,
+        title: node.title,
+        labels: (node.labels?.nodes || []).map((l: any) => ({ name: l.name, color: l.color })),
+        user: node.author?.login || '',
+        branch: node.headRefName || null,
         isPR: true,
-        url: pr.url,
-        category,
+        url: node.url,
+        category: 'review-requested',
+        repo: node.repository?.nameWithOwner || '',
+        linkedIssues: linkedIssues.length > 0 ? linkedIssues : undefined,
+      })
+    }
+
+    // --- My PRs ---
+    for (const node of data.myPRs?.nodes || []) {
+      if (!node?.number) continue
+      const k = key(node)
+      if (seen.has(k)) continue
+      seen.add(k)
+
+      const linkedIssues: LinkedIssue[] = (node.closingIssuesReferences?.nodes || [])
+        .filter((i: any) => i?.number).map((i: any) => ({ number: i.number, title: i.title || '' }))
+
+      items.push({
+        number: node.number,
+        title: node.title,
+        labels: (node.labels?.nodes || []).map((l: any) => ({ name: l.name, color: l.color })),
+        user: node.author?.login || '',
+        branch: node.headRefName || null,
+        isPR: true,
+        url: node.url,
+        category: 'my-pr',
+        repo: node.repository?.nameWithOwner || '',
+        linkedIssues: linkedIssues.length > 0 ? linkedIssues : undefined,
       })
     }
 

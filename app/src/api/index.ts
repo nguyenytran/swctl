@@ -146,8 +146,9 @@ export async function fetchGitHubStatus(): Promise<GitHubAuthStatus> {
   return res.json()
 }
 
-export async function fetchGitHubIssues(repo: string, state = 'open'): Promise<GitHubResult> {
-  const params = new URLSearchParams({ repo, state })
+export async function fetchGitHubIssues(org?: string): Promise<GitHubResult> {
+  const params = new URLSearchParams()
+  if (org) params.set('org', org)
   const res = await fetch(`${BASE}/github/issues?${params}`)
   return res.json()
 }

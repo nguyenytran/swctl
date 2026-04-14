@@ -2360,13 +2360,25 @@ cmd_create() {
             fi
 
             # 3. Standard trunk flow: diff, sync, provision
+            # For plugin-external: diff the plugin repo against its own default
+            # branch, not the platform's BASE_REF.
             if [ -n "${adopt_worktree_path:-}" ]; then
                 # When adopting, the trunk has no changes — the work is in the
                 # plugin worktree.  Plugin detection below forces the needed builds.
                 DIFF_FILES=""
                 count_changes ""
             else
-                DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
+                local plugin_default_branch
+                plugin_default_branch="$(git -C "$PLUGIN_REPO_PATH" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo main)"
+                local plugin_base_ref
+                if git -C "$PLUGIN_REPO_PATH" rev-parse --verify "origin/${plugin_default_branch}" >/dev/null 2>&1; then
+                    plugin_base_ref="origin/${plugin_default_branch}"
+                elif git -C "$PLUGIN_REPO_PATH" rev-parse --verify "${plugin_default_branch}" >/dev/null 2>&1; then
+                    plugin_base_ref="${plugin_default_branch}"
+                else
+                    plugin_base_ref="HEAD~1"
+                fi
+                DIFF_FILES="$(git -C "$PLUGIN_REPO_PATH" diff --name-only "${plugin_base_ref}...origin/${BRANCH}" 2>/dev/null || true)"
                 count_changes "$DIFF_FILES"
             fi
 

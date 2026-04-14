@@ -420,12 +420,8 @@ app.post('/api/github/logout', (c) => {
 
 // Fetch issues/PRs relevant to the authenticated user
 app.get('/api/github/issues', async (c) => {
-  const repo = c.req.query('repo') || ''
-  const state = c.req.query('state') || 'open'
-
-  if (!repo || !repo.includes('/')) {
-    return c.json({ items: [], error: 'Invalid repo format. Use owner/repo (e.g. shopware/shopware)' }, 400)
-  }
+  // Read org from query param, or fall back to config, or default 'shopware'
+  const org = c.req.query('org') || readProjectConfig()['SWCTL_GITHUB_ORG'] || 'shopware'
 
   const { token } = resolveGitHubToken(getCookie(c, 'gh_token'))
   if (!token) {
@@ -437,7 +433,7 @@ app.get('/api/github/issues', async (c) => {
     return c.json({ items: [], error: 'auth_required' })
   }
 
-  const result = await fetchGitHubIssues(repo, username, token, state)
+  const result = await fetchGitHubIssues(org, username, token)
   return c.json(result)
 })
 
@@ -598,28 +594,47 @@ app.get('/api/diff', async (c) => {
   const inst = instances.find((i: { issueId: string }) => i.issueId === issueId)
   if (!inst?.worktreePath) return c.json({ error: 'Instance not found' }, 404)
 
-  const baseRef = inst.baseRef || 'HEAD~1'
+  // For plugin-external instances, diff the plugin repo (not the trunk platform).
+  let diffCwd = inst.worktreePath
+  let baseRef = inst.baseRef || 'HEAD~1'
   const branch = inst.branch || 'HEAD'
+
+  if (inst.projectType === 'plugin-external' && inst.pluginName) {
+    const pluginDir = path.join(inst.worktreePath, 'custom', 'plugins', inst.pluginName)
+    if (fs.existsSync(pluginDir)) {
+      diffCwd = pluginDir
+      // Resolve the plugin repo's default branch as the base ref
+      try {
+        const defaultBranch = execSync(
+          'git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed "s@^refs/remotes/@@" || echo origin/main',
+          { cwd: pluginDir, encoding: 'utf-8', timeout: 5000 },
+        ).trim()
+        baseRef = defaultBranch || 'origin/main'
+      } catch {
+        baseRef = 'origin/main'
+      }
+    }
+  }
 
   // Try HEAD first, then origin/$BRANCH as fallback.
   // HEAD may equal baseRef if the worktree was created before the
   // remote-tracking fix — in that case origin/$BRANCH has the real changes.
   let ref = 'HEAD'
   try {
-    const stat = execSync(`git diff --stat "${baseRef}...HEAD"`, { cwd: inst.worktreePath, encoding: 'utf-8', timeout: 10000 }).trim()
+    const stat = execSync(`git diff --stat "${baseRef}...HEAD"`, { cwd: diffCwd, encoding: 'utf-8', timeout: 10000 }).trim()
     if (!stat && branch && branch !== 'HEAD') {
       // HEAD has no changes vs base — check if origin/branch has them
-      const remoteStat = execSync(`git diff --stat "${baseRef}...origin/${branch}"`, { cwd: inst.worktreePath, encoding: 'utf-8', timeout: 10000 }).trim()
+      const remoteStat = execSync(`git diff --stat "${baseRef}...origin/${branch}"`, { cwd: diffCwd, encoding: 'utf-8', timeout: 10000 }).trim()
       if (remoteStat) ref = `origin/${branch}`
     }
   } catch {}
 
   let stat = '', diff = ''
   try {
-    stat = execSync(`git diff --stat "${baseRef}...${ref}"`, { cwd: inst.worktreePath, encoding: 'utf-8', timeout: 10000 })
+    stat = execSync(`git diff --stat "${baseRef}...${ref}"`, { cwd: diffCwd, encoding: 'utf-8', timeout: 10000 })
   } catch {}
   try {
-    diff = execSync(`git diff "${baseRef}...${ref}"`, { cwd: inst.worktreePath, encoding: 'utf-8', timeout: 30000 })
+    diff = execSync(`git diff "${baseRef}...${ref}"`, { cwd: diffCwd, encoding: 'utf-8', timeout: 30000 })
   } catch {}
 
   return c.json({ stat, diff, ref })
