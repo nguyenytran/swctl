@@ -28,7 +28,7 @@ import {
 } from './resources.js'
 
 const server = new Server(
-  { name: 'swctl', version: '0.3.3' },
+  { name: 'swctl', version: '0.4.5' },
   { capabilities: { tools: {}, resources: {} } },
 )
 
