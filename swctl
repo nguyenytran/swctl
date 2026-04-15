@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.4.2"
+SWCTL_VERSION="0.4.3"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -1023,14 +1023,17 @@ check_branch_staleness() {
     commits_behind="$(git -C "$WORKTREE_PATH" rev-list --count "$merge_base..${BASE_REF}" 2>/dev/null || printf '0')"
     days_behind="$(( ( $(date +%s) - $(git -C "$WORKTREE_PATH" log -1 --format=%ct "$merge_base" 2>/dev/null || printf '%s' "$(date +%s)") ) / 86400 ))"
 
-    if [ "$commits_behind" -gt 100 ] || [ "$days_behind" -gt 14 ]; then
-        warn "Branch '$BRANCH' is ${commits_behind} commits / ${days_behind} days behind '${SW_BASE_BRANCH}'."
-        warn "The DB is cloned from current trunk — schema mismatches are likely."
-        warn "Recommended: rebase the branch first, then create the worktree."
-        warn "  cd $WORKTREE_PATH && git rebase $BASE_REF"
-        warn "  OR ask the developer to rebase and push."
-    elif [ "$commits_behind" -gt 20 ]; then
-        info "Branch is ${commits_behind} commits behind '${SW_BASE_BRANCH}' (${days_behind} days). Consider rebasing for best results."
+    if [ "$commits_behind" -gt 0 ]; then
+        info "Branch '$BRANCH' is ${commits_behind} commits behind '${SW_BASE_BRANCH}'. Rebasing..."
+        if git -C "$WORKTREE_PATH" rebase "$BASE_REF" 2>&1; then
+            ok "Rebased '$BRANCH' onto '${SW_BASE_BRANCH}' (was ${commits_behind} commits behind)."
+        else
+            warn "Rebase has conflicts. Aborting rebase — worktree will use the branch as-is."
+            git -C "$WORKTREE_PATH" rebase --abort 2>/dev/null || true
+            if [ "$commits_behind" -gt 100 ] || [ "$days_behind" -gt 14 ]; then
+                warn "Branch is ${commits_behind} commits / ${days_behind} days behind. Schema mismatches are likely."
+            fi
+        fi
     fi
 }
 
@@ -2156,6 +2159,7 @@ ensure_platform_worktree() {
     WORKTREE_PATH="${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}"
 
     create_worktree
+    check_branch_staleness
 
     DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" 2>/dev/null || true)"
     count_changes "$DIFF_FILES"
