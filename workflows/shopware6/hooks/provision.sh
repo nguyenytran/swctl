@@ -20,6 +20,10 @@ set -euo pipefail
 
 # --- QA mode: minimal setup (no composer install, no npm, just DB + cache) ---
 if [ "$SWCTL_MODE" = "qa" ]; then
+    # Vendor is bind-mounted from trunk but the autoloader has host paths.
+    # Regenerate it so paths resolve inside the container.
+    run_app_command "$COMPOSE_PROJECT" "composer dump-autoload --no-interaction 2>&1" \
+        || warn "composer dump-autoload failed."
     # Run migrations if the branch has schema changes
     if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected in QA mode. Running migrations."

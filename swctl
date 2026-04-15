@@ -1307,14 +1307,20 @@ print('pat_backend=\"{}\"'.format(d.get('backend', '\\\\.php\$')))
 sync_worktree_deps() {
     # QA mode: always symlink vendor (read-only, no installs).
     # Dev mode: symlink only when no composer/dependency changes.
-    if [ -d "$PROJECT_ROOT/vendor" ] && [ ! -e "$WORKTREE_PATH/vendor" ]; then
+    # Check for autoload.php, not just vendor/ — git checkout creates vendor/composer/
+    # from the repo, but that's not a usable vendor directory.
+    if [ -d "$PROJECT_ROOT/vendor" ] && [ ! -f "$WORKTREE_PATH/vendor/autoload.php" ]; then
         if [ "$SWCTL_MODE" = "qa" ]; then
             # QA mode: vendor is bind-mounted read-only via compose override.
             info "Vendor will be mounted read-only from project root (QA mode)."
         elif [ "$((MIGRATION_CHANGES + ENTITY_CHANGES + COMPOSER_CHANGES))" -gt 0 ]; then
             info "Dependency changes detected. Vendor will be installed fresh inside container."
         else
-            ln -s "$PROJECT_ROOT/vendor" "$WORKTREE_PATH/vendor"
+            # Replace the git-created vendor/composer/ stub with a symlink to trunk's vendor
+            if [ -d "$WORKTREE_PATH/vendor" ] && [ ! -L "$WORKTREE_PATH/vendor" ]; then
+                rm -rf "$WORKTREE_PATH/vendor"
+            fi
+            ln -sf "$PROJECT_ROOT/vendor" "$WORKTREE_PATH/vendor"
             ok "Symlinked vendor/ from project root (no composer changes)."
         fi
     fi
@@ -1502,10 +1508,17 @@ write_compose_volume_override() {
         fi
     fi
 
-    # QA mode: mount vendor from trunk as read-only bind (symlinks don't work in Docker)
-    if [ "$SWCTL_MODE" = "qa" ] && [ -d "$PROJECT_ROOT/vendor" ]; then
-        extra_volumes="${extra_volumes}      - ${PROJECT_ROOT}/vendor:/var/www/html/vendor:ro
+    # Mount vendor from trunk when the worktree shares vendor (no composer changes).
+    # Symlinks don't resolve inside Docker since the target is a host path.
+    # Uses :cached (not :ro) because composer dump-autoload must regenerate the
+    # autoloader with container paths after mount.
+    if [ -d "$PROJECT_ROOT/vendor" ]; then
+        case "$VENDOR_VOLUME" in
+            vendor-base-*)
+                extra_volumes="${extra_volumes}      - ${PROJECT_ROOT}/vendor:/var/www/html/vendor:cached
 "
+                ;;
+        esac
     fi
 
     # Plugin mounts: bind-mount external plugin worktrees into custom/plugins/
@@ -1714,7 +1727,9 @@ bootstrap_dependencies() {
         vendor_needs_install=1
         info "Shared vendor volume is empty. Will populate with composer install."
     else
-        info "Reusing existing vendor volume. Skipping composer install."
+        info "Reusing existing vendor. Regenerating autoloader for container paths."
+        run_app_command "$compose_project" "composer dump-autoload --no-interaction 2>&1" \
+            || warn "composer dump-autoload failed."
     fi
 
     # --- Node modules ---
