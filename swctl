@@ -4,9 +4,9 @@ set -euo pipefail
 # Raise FD limit for parallel worktree creation.
 # Each create spawns many subprocesses (docker compose, docker exec, git, mysql).
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
-ulimit -n 10240 2>/dev/null || true
+ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.4.4"
+SWCTL_VERSION="0.4.5"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -1129,8 +1129,27 @@ create_worktree() {
     local repo_slug
     repo_slug="$(echo "$PROJECT_ROOT" | tr '/' '-')"
     swctl_lock "git-worktree${repo_slug}" _do_worktree_create
+}
 
+# ---------------------------------------------------------------------------
+# Worktree sync: copy ALL non-git state from trunk into a new worktree.
+#
+# Git worktrees only contain tracked, non-ignored files. Everything else
+# (lock files, vendor, plugins with their own repos, compiled assets) must
+# be explicitly copied. These four helpers run in a fixed order and are
+# usually called together via sync_worktree_from_trunk().
+# ---------------------------------------------------------------------------
+
+sync_worktree_from_trunk() {
+    # One-stop sync: call the four helpers in the right order.
+    # 1. Lock files first (composer.lock etc.) — needed by dep install decisions
+    # 2. Gitignored plugins — separate-repo plugins active in the cloned DB
+    # 3. Build artifacts — compiled JS, bundles, theme files from trunk
+    # 4. Vendor/node_modules — PHP + JS dependency trees
     sync_lock_files
+    sync_gitignored_plugins
+    sync_build_artifacts
+    sync_worktree_deps
 }
 
 sync_lock_files() {
@@ -1142,6 +1161,43 @@ sync_lock_files() {
             ok "Copied gitignored '$file' into worktree."
         fi
     done
+}
+
+sync_gitignored_plugins() {
+    # Collect gitignored plugins from trunk that are NOT explicitly linked
+    # (via --plugin / deps). These exist in trunk's DB as active but aren't
+    # on the worktree filesystem — they'd crash the Symfony DI container.
+    #
+    # Instead of copying them (slow, may have unsatisfied deps), we just
+    # mark them for deactivation. If a plugin is needed, the user configures
+    # it explicitly via the plugin flow or deps.
+    [ -d "$WORKTREE_PATH" ] || return 0
+
+    local plugins_dir="${WORKFLOW_PLUGIN_DIR:-custom/plugins}"
+    local src_plugins="$PROJECT_ROOT/$plugins_dir"
+    [ -d "$src_plugins" ] || return 0
+
+    local _deactivate_plugins=""
+    local plugin_path pname
+    for plugin_path in "$src_plugins"/*/; do
+        [ -d "$plugin_path" ] || continue
+        pname="$(basename "$plugin_path")"
+        [ "$pname" = "*" ] && continue
+        [ -f "$plugin_path/composer.json" ] || continue
+
+        # Only care about gitignored plugins (separate repos).
+        git -C "$PROJECT_ROOT" check-ignore -q "$plugins_dir/$pname" 2>/dev/null || continue
+
+        # Skip if this plugin is bind-mounted by the plugin flow
+        case ",${LINKED_PLUGINS:-}," in
+            *,"$pname",*) continue ;;
+        esac
+
+        _deactivate_plugins="${_deactivate_plugins:+${_deactivate_plugins},}${pname}"
+    done
+
+    # Store for deactivation after container starts.
+    SWCTL_SKIPPED_PLUGINS="${_deactivate_plugins}"
 }
 
 sync_build_artifacts() {
@@ -1192,8 +1248,10 @@ print('sync_dirs=\"{}\"'.format(' '.join(dirs)))
             src_dir="$PROJECT_ROOT/$dir"
             dst_dir="$WORKTREE_PATH/$dir"
             if [ -d "$src_dir" ]; then
-                src_count="$(find "$src_dir" -mindepth 1 -maxdepth 1 -not -name '.gitkeep' 2>/dev/null | wc -l | tr -d ' ')"
-                dst_count="$( (find "$dst_dir" -mindepth 1 -maxdepth 1 -not -name '.gitkeep' 2>/dev/null || true) | wc -l | tr -d ' ')"
+                # Count files recursively (not just top-level dirs) so we detect
+                # empty directory shells left by git checkout vs real content.
+                src_count="$(find "$src_dir" -type f -not -name '.gitkeep' 2>/dev/null | wc -l | tr -d ' ')"
+                dst_count="$( (find "$dst_dir" -type f -not -name '.gitkeep' 2>/dev/null || true) | wc -l | tr -d ' ')"
                 if [ "$src_count" -gt 0 ] && [ "${dst_count:-0}" -lt "$src_count" ]; then
                     mkdir -p "$dst_dir"
                     # APFS clone (cp -c): instant copy-on-write. Clone to temp, swap in.
@@ -1323,7 +1381,18 @@ sync_worktree_deps() {
                 rm -rf "$WORKTREE_PATH/vendor"
             fi
             info "Copying vendor from project root..."
-            rsync -a --delete "$PROJECT_ROOT/vendor/" "$WORKTREE_PATH/vendor/"
+            # Prefer APFS clone (instant copy-on-write, no FD pressure).
+            # Vendor can have 20k+ files — rsync exhausts FD limits on macOS.
+            local tmp_vendor="${WORKTREE_PATH}/vendor.swctl-clone"
+            rm -rf "$tmp_vendor"
+            if cp -cR "$PROJECT_ROOT/vendor" "$tmp_vendor" 2>/dev/null; then
+                rm -rf "$WORKTREE_PATH/vendor"
+                mv "$tmp_vendor" "$WORKTREE_PATH/vendor"
+            else
+                rm -rf "$tmp_vendor" 2>/dev/null || true
+                mkdir -p "$WORKTREE_PATH/vendor"
+                rsync -a --delete "$PROJECT_ROOT/vendor/" "$WORKTREE_PATH/vendor/"
+            fi
             ok "Copied vendor/ from project root (no composer changes)."
         fi
     fi
@@ -1699,6 +1768,30 @@ fix_volume_ownership() {
         "chown ${SW_UID}:${SW_GID} /var/www/html/vendor /var/www/html/node_modules 2>/dev/null" || true
 }
 
+_composer_update_missing() {
+    # When `composer install` fails because the lock is stale (branch's composer.json
+    # has packages not in the lock), extract the missing package names and update ONLY
+    # those.  A bare `composer update` is dangerous — it resolves everything from
+    # composer.json and can REMOVE packages needed by synced plugins (e.g. shopware/commercial).
+    local compose_project="$1"
+    local missing_output
+    missing_output="$(run_app_command "$compose_project" \
+        "composer install --dry-run --no-interaction 2>&1 || true" 2>/dev/null)" || true
+    local missing_pkgs=""
+    missing_pkgs="$(echo "$missing_output" | grep 'is not present in the lock file' \
+        | sed 's/.*package "\([^"]*\)".*/\1/' | tr '\n' ' ')" || true
+
+    if [ -n "${missing_pkgs// /}" ]; then
+        info "Lock is missing packages: $missing_pkgs— running targeted composer update."
+        run_app_command "$compose_project" "composer update --no-interaction $missing_pkgs" \
+            || warn "composer update failed for: $missing_pkgs"
+    else
+        warn "composer install failed for unknown reason. Trying full composer update."
+        run_app_command "$compose_project" "composer update --no-interaction" \
+            || warn "composer update failed."
+    fi
+}
+
 bootstrap_dependencies() {
     local compose_project="$1"
     local package_install_cmd=""
@@ -1716,11 +1809,6 @@ bootstrap_dependencies() {
         # Shared base volume is empty (first-time populate)
         vendor_needs_install=1
         info "Shared vendor volume is empty. Will populate with composer install."
-    elif run_app_command "$compose_project" "composer validate --no-check-all --no-check-publish 2>&1 | grep -q 'lock file is not up to date'" >/dev/null 2>&1; then
-        # Lock file is out of sync with composer.json (e.g. after rebase).
-        # Need composer update to regenerate the lock and install new packages.
-        vendor_needs_install=2
-        info "composer.lock is out of sync with composer.json. Will run composer update."
     else
         info "Reusing existing vendor. Skipping composer install."
     fi
@@ -1742,21 +1830,22 @@ bootstrap_dependencies() {
     fi
 
     # --- Run installs (in parallel when both needed) ---
-    # vendor_needs_install: 0=skip, 1=composer install, 2=composer update (lock out of sync)
-    local composer_cmd="composer install --no-interaction"
-    [ "$vendor_needs_install" -eq 2 ] && composer_cmd="composer update --no-interaction"
-
     if [ "$vendor_needs_install" -gt 0 ] && [ "$node_needs_install" -eq 1 ]; then
-        info "Running $composer_cmd and $package_install_cmd in parallel."
-        run_app_command "$compose_project" "$composer_cmd" &
+        info "Running composer install and $package_install_cmd in parallel."
+        run_app_command "$compose_project" "composer install --no-interaction" &
         local composer_pid=$!
         run_app_command "$compose_project" "$package_install_cmd" &
         local node_pid=$!
-        wait "$composer_pid" || warn "composer install/update failed."
+        if ! wait "$composer_pid"; then
+            warn "composer install failed. Trying targeted update for missing packages..."
+            _composer_update_missing "$compose_project"
+        fi
         wait "$node_pid" || warn "Frontend dependency install failed."
     elif [ "$vendor_needs_install" -gt 0 ]; then
-        run_app_command "$compose_project" "$composer_cmd" \
-            || warn "composer install/update failed. Continue after fixing the image or composer setup."
+        if ! run_app_command "$compose_project" "composer install --no-interaction"; then
+            warn "composer install failed. Trying targeted update for missing packages..."
+            _composer_update_missing "$compose_project"
+        fi
     elif [ "$node_needs_install" -eq 1 ]; then
         run_app_command "$compose_project" "$package_install_cmd" \
             || warn "Frontend dependency install failed."
@@ -2017,10 +2106,27 @@ provision_database_and_app() {
     fi
     wait_for_app_container "$COMPOSE_PROJECT"
 
+    # Deactivate plugins that were skipped during sync (unsatisfied deps).
+    # Must happen before any bin/console call — broken plugins crash the DI container.
+    if [ -n "${SWCTL_SKIPPED_PLUGINS:-}" ]; then
+        local _skip_names=""
+        local _old_ifs="$IFS"
+        IFS=','
+        for _skip_plugin in $SWCTL_SKIPPED_PLUGINS; do
+            _skip_names="${_skip_names:+${_skip_names},}'${_skip_plugin}'"
+            info "Deactivating skipped plugin '$_skip_plugin' in database."
+        done
+        IFS="$_old_ifs"
+        run_app_command "$COMPOSE_PROJECT" \
+            "php -r '\$p=new PDO(\"mysql:host=\${SW_DB_HOST};port=\${SW_DB_PORT};dbname=${DB_NAME}\",\"${SW_DB_ROOT_USER}\",\"${SW_DB_ROOT_PASSWORD}\");\$p->exec(\"UPDATE plugin SET active=0,installed_at=NULL WHERE name IN(${_skip_names})\");'" \
+            2>/dev/null || warn "Failed to deactivate skipped plugins."
+    fi
+
     # Export helpers so workflow hooks can call them
     export -f update_sales_channel_domain ensure_install_lock bootstrap_dependencies \
              run_install_command run_app_command clone_database mysql_db_has_tables \
              install_admin_deps_if_needed ensure_jwt_keys fix_volume_ownership \
+             _composer_update_missing \
              info warn ok die sanitize_db_identifier detect_package_install_command 2>/dev/null || true
     # Aliases for hooks
     _swctl_update_sales_channel_domain() { update_sales_channel_domain "$@"; }
@@ -2172,8 +2278,7 @@ ensure_platform_worktree() {
 
     DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" 2>/dev/null || true)"
     count_changes "$DIFF_FILES"
-    sync_build_artifacts
-    sync_worktree_deps
+    sync_worktree_from_trunk
     VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
     NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
 
@@ -2414,17 +2519,19 @@ cmd_create() {
                 mkdir -p "$(dirname "$plugin_target")"
                 rm -rf "$plugin_target" 2>/dev/null || true
                 git -C "$PLUGIN_REPO_PATH" fetch --all --prune 2>/dev/null || true
+                git -C "$PLUGIN_REPO_PATH" worktree prune 2>/dev/null || true
                 if git -C "$PLUGIN_REPO_PATH" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
                     # Try: new local branch from remote → existing local branch → detached
+                    local _wt_err=""
                     git -C "$PLUGIN_REPO_PATH" worktree add "$plugin_target" \
                         -b "swctl/${ISSUE_ID}" "origin/$BRANCH" 2>/dev/null \
                         || git -C "$PLUGIN_REPO_PATH" worktree add "$plugin_target" \
                             "$BRANCH" 2>/dev/null \
-                        || git -C "$PLUGIN_REPO_PATH" worktree add --detach "$plugin_target" \
-                            "origin/$BRANCH" 2>/dev/null \
-                        || die "Failed to create plugin worktree."
+                        || _wt_err="$(git -C "$PLUGIN_REPO_PATH" worktree add --detach "$plugin_target" \
+                            "origin/$BRANCH" 2>&1)" \
+                        || die "Failed to create plugin worktree: $_wt_err"
                 elif git -C "$PLUGIN_REPO_PATH" rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
-                    git -C "$PLUGIN_REPO_PATH" worktree add "$plugin_target" "$BRANCH" 2>/dev/null \
+                    git -C "$PLUGIN_REPO_PATH" worktree add "$plugin_target" "$BRANCH" \
                         || die "Failed to create plugin worktree."
                 else
                     die "Branch '$BRANCH' not found in plugin repo: $PLUGIN_REPO_PATH"
@@ -2513,8 +2620,7 @@ cmd_create() {
                 fi
             done
 
-            sync_build_artifacts
-            sync_worktree_deps
+            sync_worktree_from_trunk
             VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
             NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
 
@@ -2611,8 +2717,7 @@ cmd_create() {
             DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
             count_changes "$DIFF_FILES"
 
-            sync_build_artifacts
-            sync_worktree_deps
+            sync_worktree_from_trunk
             VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
             NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
 
@@ -2728,8 +2833,7 @@ cmd_create() {
             fi
 
             step_start=$SECONDS
-            sync_build_artifacts
-            sync_worktree_deps
+            sync_worktree_from_trunk
             VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
             NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
             info "[timing] sync: $((SECONDS - step_start))s"
@@ -3270,8 +3374,7 @@ cmd_refresh() {
         count_changes "$DIFF_FILES"
 
         # 3. Re-sync artifacts and deps
-        sync_build_artifacts
-        sync_worktree_deps
+        sync_worktree_from_trunk
         VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
         NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
 
@@ -3330,7 +3433,7 @@ cmd_refresh() {
     info "Changes since last build: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
 
     # Re-sync gitignored files if needed
-    sync_build_artifacts
+    sync_worktree_from_trunk
 
     local compose_project="$COMPOSE_PROJECT"
 

@@ -9,9 +9,11 @@ set -euo pipefail
 local compose_project="$COMPOSE_PROJECT"
 local force_plugin_build="${FORCE_PLUGIN_BUILD:-0}"
 
-# QA mode: skip unless plugin has extensions
+# QA mode: skip full builds but still register bundles + assets
 if [ "$SWCTL_MODE" = "qa" ] && [ "$force_plugin_build" -ne 1 ]; then
     info "QA mode: skipping frontend builds (using synced assets)."
+    run_app_command "$compose_project" "$WORKFLOW_CONSOLE bundle:dump" 2>/dev/null || true
+    run_app_command "$compose_project" "$WORKFLOW_CONSOLE assets:install" 2>/dev/null || true
     return 0 2>/dev/null || exit 0
 fi
 
