@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.4.3"
+SWCTL_VERSION="0.4.4"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -1716,6 +1716,11 @@ bootstrap_dependencies() {
         # Shared base volume is empty (first-time populate)
         vendor_needs_install=1
         info "Shared vendor volume is empty. Will populate with composer install."
+    elif run_app_command "$compose_project" "composer validate --no-check-all --no-check-publish 2>&1 | grep -q 'lock file is not up to date'" >/dev/null 2>&1; then
+        # Lock file is out of sync with composer.json (e.g. after rebase).
+        # Need composer update to regenerate the lock and install new packages.
+        vendor_needs_install=2
+        info "composer.lock is out of sync with composer.json. Will run composer update."
     else
         info "Reusing existing vendor. Skipping composer install."
     fi
@@ -1737,17 +1742,21 @@ bootstrap_dependencies() {
     fi
 
     # --- Run installs (in parallel when both needed) ---
-    if [ "$vendor_needs_install" -eq 1 ] && [ "$node_needs_install" -eq 1 ]; then
-        info "Running composer install and $package_install_cmd in parallel."
-        run_app_command "$compose_project" "composer install --no-interaction" &
+    # vendor_needs_install: 0=skip, 1=composer install, 2=composer update (lock out of sync)
+    local composer_cmd="composer install --no-interaction"
+    [ "$vendor_needs_install" -eq 2 ] && composer_cmd="composer update --no-interaction"
+
+    if [ "$vendor_needs_install" -gt 0 ] && [ "$node_needs_install" -eq 1 ]; then
+        info "Running $composer_cmd and $package_install_cmd in parallel."
+        run_app_command "$compose_project" "$composer_cmd" &
         local composer_pid=$!
         run_app_command "$compose_project" "$package_install_cmd" &
         local node_pid=$!
-        wait "$composer_pid" || warn "composer install failed."
+        wait "$composer_pid" || warn "composer install/update failed."
         wait "$node_pid" || warn "Frontend dependency install failed."
-    elif [ "$vendor_needs_install" -eq 1 ]; then
-        run_app_command "$compose_project" "composer install --no-interaction" \
-            || warn "composer install failed. Continue after fixing the image or composer setup."
+    elif [ "$vendor_needs_install" -gt 0 ]; then
+        run_app_command "$compose_project" "$composer_cmd" \
+            || warn "composer install/update failed. Continue after fixing the image or composer setup."
     elif [ "$node_needs_install" -eq 1 ]; then
         run_app_command "$compose_project" "$package_install_cmd" \
             || warn "Frontend dependency install failed."
