@@ -39,6 +39,7 @@ if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
     colors="$(tput colors 2>/dev/null || printf '0')"
     if [ "${colors:-0}" -ge 8 ]; then
         COLOR_RESET="$(tput sgr0)"
+        # shellcheck disable=SC2034
         COLOR_DIM="$(tput dim)"
         COLOR_RED="$(tput setaf 1)"
         COLOR_GREEN="$(tput setaf 2)"
@@ -190,7 +191,7 @@ resolve_path() {
                 fi
                 ;;
             *)
-                stack[$index]="$part"
+                stack[index]="$part"
                 index=$((index + 1))
                 ;;
         esac
@@ -298,12 +299,15 @@ print('WORKFLOW_ENV_FILE=\"{}\"'.format(data.get('env_file', '.env.local')))
         warn "Failed to parse $yaml_file. Using defaults."
         WORKFLOW_CONSOLE="${SW_BIN_CONSOLE:-bin/console}"
         WORKFLOW_PLUGIN_DIR="custom/plugins"
+        # shellcheck disable=SC2034
         WORKFLOW_STATIC_PLUGIN_DIR="custom/static-plugins"
+        # shellcheck disable=SC2034
         WORKFLOW_ENV_FILE=".env.local"
     }
 
     # Allow .swctl.conf to override workflow defaults
     [ -n "${SW_BIN_CONSOLE:-}" ] && WORKFLOW_CONSOLE="$SW_BIN_CONSOLE"
+    # shellcheck disable=SC2034
     [ -n "${SW_ENV_FILE_NAME:-}" ] && WORKFLOW_ENV_FILE="$SW_ENV_FILE_NAME"
 
     export WORKFLOW_CONSOLE
@@ -325,6 +329,7 @@ run_workflow_hook() {
     fi
 
     # Source the hook so it has access to all swctl functions and variables
+    # shellcheck disable=SC1090
     . "$hook_file"
 }
 
@@ -367,6 +372,7 @@ print(data.get('description', ''))
 
 detect_template_path() {
     local runtime="${SW_RUNTIME:-traefik}"
+    # shellcheck disable=SC2034
     local orbstack_suffix=".orbstack"
 
     if [ -n "${SW_COMPOSE_TEMPLATE:-}" ]; then
@@ -1098,6 +1104,7 @@ create_worktree() {
                 warn "Worktree checkout incomplete (attempt $_wt_attempt/$_wt_max) — recovering with git reset."
                 local gitdir=""
                 gitdir="$(sed -n 's/^gitdir: //p' "$WORKTREE_PATH/.git" 2>/dev/null)" || true
+                # shellcheck disable=SC2015
                 [ -n "$gitdir" ] && rm -f "$gitdir/index.lock" 2>/dev/null || true
                 if git -C "$WORKTREE_PATH" reset --hard HEAD 2>&1; then
                     _wt_ok=1
@@ -1579,11 +1586,9 @@ write_compose_volume_override() {
 
     # Plugin mounts: bind-mount external plugin worktrees into custom/plugins/
     if [ -n "${PLUGIN_WORKTREE_PATHS:-}" ] && [ -n "${LINKED_PLUGINS:-}" ]; then
-        local saved_ifs="$IFS"
-        IFS=','
-        local pw_arr=($PLUGIN_WORKTREE_PATHS)
-        local pl_arr=($LINKED_PLUGINS)
-        IFS="$saved_ifs"
+        local pw_arr pl_arr
+        IFS=',' read -ra pw_arr <<< "$PLUGIN_WORKTREE_PATHS"
+        IFS=',' read -ra pl_arr <<< "$LINKED_PLUGINS"
         local i
         for i in "${!pw_arr[@]}"; do
             local pw_path="${pw_arr[$i]}"
@@ -1951,6 +1956,7 @@ install_admin_deps_if_needed() {
 
 run_frontend_build_if_needed() {
     local compose_project="$1"
+    # shellcheck disable=SC2034
     local is_first_create="${2:-0}"
     local force_plugin_build="${3:-0}"
 
@@ -1994,6 +2000,7 @@ run_frontend_build_if_needed() {
             info "Admin + Storefront changes detected. Building with parallel npm."
             run_app_command "$compose_project" "$SW_BIN_CONSOLE feature:dump" || warn "feature:dump failed."
             run_app_command "$compose_project" "$SW_BIN_CONSOLE admin:generate-entity-schema-types" 2>/dev/null || true
+            # shellcheck disable=SC2016
             run_app_command "$compose_project" 'set -e
 ADMIN_DIR=src/Administration/Resources/app/administration
 STOREFRONT_DIR=src/Storefront/Resources/app/storefront
@@ -2090,14 +2097,17 @@ provision_database_and_app() {
     if [ "$DB_STATE" = "fresh" ]; then
         info "Source database '$source_db' is empty. Will run fresh install."
         swctl_lock "db-$SW_DB_HOST" create_database "$DB_NAME"
+        # shellcheck disable=SC2046
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     elif mysql_db_has_tables "$DB_NAME"; then
         info "Database '$DB_NAME' already exists. Reusing."
+        # shellcheck disable=SC2046
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
     else
         # Clone DB in background while container starts
         swctl_lock "db-$SW_DB_HOST" clone_database "$source_db" "$DB_NAME" &
         local clone_pid=$!
+        # shellcheck disable=SC2046
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait "$clone_pid" || die "Database clone failed."
     fi
@@ -2181,6 +2191,7 @@ resolve_project_context() {
             ;;
         plugin-embedded)
             PLUGIN_NAME="$(basename "$plugin_dir")"
+            # shellcheck disable=SC2034
             PLUGIN_DIR="$plugin_dir"
             ;;
     esac
@@ -2561,6 +2572,7 @@ cmd_create() {
             local plugin_head
             plugin_head="$(git -C "$plugin_target" rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
             if [ "$plugin_head" = "HEAD" ]; then
+                # shellcheck disable=SC2015
                 git -C "$plugin_target" checkout -b "swctl/${ISSUE_ID}" 2>/dev/null \
                     && info "Created plugin branch: swctl/${ISSUE_ID}" \
                     || warn "Plugin worktree is in detached HEAD."
@@ -2997,11 +3009,14 @@ select_from_list() {
 }
 
 batch_create_sequential() {
+    # shellcheck disable=SC2178,SC2128
     local pairs="$1"
     local job_dir="$2"
     local issue="" branch=""
 
+    # shellcheck disable=SC2128
     while IFS=' ' read -r issue branch; do
+        # shellcheck disable=SC2015
         [ -n "$issue" ] && [ -n "$branch" ] || continue
         info "Creating worktree for $issue ($branch)..."
         if cmd_create "$issue" "$branch" >"$job_dir/${issue}.log" 2>&1; then
@@ -3015,6 +3030,7 @@ batch_create_sequential() {
 }
 
 batch_create_parallel() {
+    # shellcheck disable=SC2178,SC2128
     local pairs="$1"
     local job_dir="$2"
     local max_jobs="${3:-4}"
@@ -3022,7 +3038,9 @@ batch_create_parallel() {
     local running=0
     local issue="" branch=""
 
+    # shellcheck disable=SC2128
     while IFS=' ' read -r issue branch; do
+        # shellcheck disable=SC2015
         [ -n "$issue" ] && [ -n "$branch" ] || continue
 
         while [ "$running" -ge "$max_jobs" ]; do
@@ -3031,6 +3049,7 @@ batch_create_parallel() {
         done
 
         (
+            # shellcheck disable=SC2015
             cmd_create "$issue" "$branch" >"$job_dir/${issue}.log" 2>&1 \
                 && touch "$job_dir/${issue}.ok" \
                 || touch "$job_dir/${issue}.fail"
@@ -3048,6 +3067,7 @@ batch_create_parallel() {
 }
 
 cmd_batch_create() {
+    # shellcheck disable=SC2178,SC2128
     local pairs=""
     local parallel=0
     local max_jobs=4
@@ -3063,18 +3083,21 @@ cmd_batch_create() {
             --file|-f)
                 shift
                 [ -n "${1:-}" ] || die "Missing argument for --file."
+                # shellcheck disable=SC2178
                 pairs="$(parse_batch_file "$1")"
                 shift
                 ;;
             --gitlab)
                 shift
                 [ -n "${1:-}" ] || die "Missing argument for --gitlab."
+                # shellcheck disable=SC2178
                 pairs="$(fetch_gitlab_mrs "$1" | select_from_list "MR")"
                 shift
                 ;;
             --github)
                 shift
                 [ -n "${1:-}" ] || die "Missing argument for --github."
+                # shellcheck disable=SC2178
                 pairs="$(fetch_github_prs "$1" | select_from_list "PR")"
                 shift
                 ;;
@@ -3092,18 +3115,21 @@ cmd_batch_create() {
                 die "Unknown flag: $1"
                 ;;
             *)
+                # shellcheck disable=SC2178
                 pairs="$(parse_cli_pairs "$@")"
                 break
                 ;;
         esac
     done
 
+    # shellcheck disable=SC2128
     [ -n "$pairs" ] || die "No issue/branch pairs provided.\nUsage: swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]"
 
     # In QA mode, skip pairs without a branch (no linked PR/MR)
     if [ "$SWCTL_MODE" = "qa" ]; then
         local filtered=""
         local skipped=0
+        # shellcheck disable=SC2128
         while IFS=' ' read -r issue branch; do
             [ -n "$issue" ] || continue
             if [ -z "$branch" ]; then
@@ -3115,7 +3141,9 @@ cmd_batch_create() {
 }$issue $branch"
         done <<< "$pairs"
         [ "$skipped" -gt 0 ] && warn "Skipped $skipped issue(s) with no linked branch."
+        # shellcheck disable=SC2178
         pairs="$filtered"
+        # shellcheck disable=SC2128
         [ -n "$pairs" ] || die "No issue/branch pairs remaining after filtering (all lacked linked PRs)."
     fi
 
@@ -3126,12 +3154,15 @@ cmd_batch_create() {
     mkdir -p "$job_dir"
     trap 'rm -rf "$job_dir"' EXIT
 
+    # shellcheck disable=SC2128
     total="$(printf '%s\n' "$pairs" | grep -c '.' || true)"
     info "Batch creating $total worktree(s)$([ "$parallel" -eq 1 ] && printf ' in parallel (max %s jobs)' "$max_jobs")."
 
     if [ "$parallel" -eq 1 ]; then
+        # shellcheck disable=SC2128
         batch_create_parallel "$pairs" "$job_dir" "$max_jobs"
     else
+        # shellcheck disable=SC2128
         batch_create_sequential "$pairs" "$job_dir"
     fi
 
@@ -3286,6 +3317,7 @@ cmd_restart() {
     load_instance_metadata "$meta_file"
 
     if [ -f "$COMPOSE_ENV_FILE" ] && [ -f "$COMPOSE_TEMPLATE" ]; then
+        # shellcheck disable=SC2046
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" restart
     else
         local container_id
@@ -3306,6 +3338,7 @@ cmd_stop() {
     load_instance_metadata "$meta_file"
 
     if [ -f "${COMPOSE_ENV_FILE:-}" ] && [ -f "${COMPOSE_TEMPLATE:-}" ]; then
+        # shellcheck disable=SC2046
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" stop
     else
         local container_id
@@ -3326,6 +3359,7 @@ cmd_start() {
     load_instance_metadata "$meta_file"
 
     if [ -f "${COMPOSE_ENV_FILE:-}" ] && [ -f "${COMPOSE_TEMPLATE:-}" ]; then
+        # shellcheck disable=SC2046
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" start
     else
         local container_id
@@ -3717,6 +3751,7 @@ cmd_switch() {
         write_compose_volume_override
 
         # Restart container with new volume config
+        # shellcheck disable=SC2046
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait_for_app_container "$COMPOSE_PROJECT"
 
@@ -3755,6 +3790,7 @@ cmd_switch() {
         write_compose_volume_override
 
         # Restart container with new volume config
+        # shellcheck disable=SC2046
         compose --project-directory "$SWCTL_TMP_DIR" $(compose_file_args) --env-file "$COMPOSE_ENV_FILE" -p "$COMPOSE_PROJECT" up -d
         wait_for_app_container "$COMPOSE_PROJECT"
     fi
@@ -3806,10 +3842,8 @@ cmd_clean() {
     # from its repo first, then fall through to the standard container/DB/
     # worktree cleanup.
     if [ -n "${PLUGIN_WORKTREE_PATHS:-}" ]; then
-        local saved_ifs="$IFS"
-        IFS=','
-        local pw_arr=($PLUGIN_WORKTREE_PATHS)
-        IFS="$saved_ifs"
+        local pw_arr
+        IFS=',' read -ra pw_arr <<< "$PLUGIN_WORKTREE_PATHS"
         for pw_path in "${pw_arr[@]}"; do
             if [ -d "$pw_path" ]; then
                 # Find the plugin's git repo to remove the worktree properly
@@ -3922,10 +3956,12 @@ clear_screen() {
 }
 
 hide_cursor() {
+    # shellcheck disable=SC2015
     command -v tput >/dev/null 2>&1 && tput civis >/dev/null 2>&1 || true
 }
 
 show_cursor() {
+    # shellcheck disable=SC2015
     command -v tput >/dev/null 2>&1 && tput cnorm >/dev/null 2>&1 || true
 }
 
@@ -4158,6 +4194,7 @@ tui_create_flow() {
 
     local create_args="--$mode_input --project $project_input"
     [ -n "$plugin_input" ] && create_args="$create_args --plugin $plugin_input"
+    # shellcheck disable=SC2086
     cmd_create $create_args "$issue_input" "$branch_input"
 }
 
@@ -4165,6 +4202,7 @@ tui_batch_create_flow() {
     local project_input=""
     local plugin_input=""
     local mode_input=""
+    # shellcheck disable=SC2034
     local issues=""
     local pairs=""
     local parallel_flag=""
@@ -4216,6 +4254,7 @@ tui_batch_create_flow() {
     [ -n "$plugin_input" ] && batch_args="$batch_args --plugin $plugin_input"
     [ -n "$parallel_flag" ] && batch_args="$batch_args $parallel_flag"
 
+    # shellcheck disable=SC2086
     cmd_batch_create $batch_args $pairs
 }
 
@@ -4606,6 +4645,7 @@ ENVEOF
     # Start temporary container with base volumes
     local base_compose_args="-f $SW_COMPOSE_TEMPLATE"
     [ -n "${SW_COMPOSE_PROJECT_OVERRIDE:-}" ] && [ -f "${SW_COMPOSE_PROJECT_OVERRIDE:-}" ] && base_compose_args="$base_compose_args -f $SW_COMPOSE_PROJECT_OVERRIDE"
+    # shellcheck disable=SC2086
     compose --project-directory "$SWCTL_TMP_DIR" \
         $base_compose_args --env-file "$tmp_env" \
         -p "$tmp_project" up -d
@@ -4624,6 +4664,7 @@ ENVEOF
     fi
 
     # Tear down temporary container
+    # shellcheck disable=SC2086
     compose --project-directory "$SWCTL_TMP_DIR" \
         $base_compose_args --env-file "$tmp_env" \
         -p "$tmp_project" down --remove-orphans >/dev/null || true
@@ -4667,6 +4708,7 @@ cmd_build_shared_db() {
 
     # Run system:install against the shared DB by overriding DATABASE_URL
     local install_url="mysql://${SW_DB_ROOT_USER}:${SW_DB_ROOT_PASSWORD}@${SW_DB_HOST}:${SW_DB_PORT}/${shared_db}"
+    # shellcheck disable=SC2086
     docker exec -e "DATABASE_URL=$install_url" "$main_container" \
         $SW_BIN_CONSOLE system:install $SW_SHARED_DB_INSTALL_ARGS \
         || die "system:install failed."
@@ -4678,7 +4720,9 @@ cmd_clean_base() {
     load_project_config
     local vendor_base="vendor-base-${SW_PROJECT_SLUG}"
     local node_base="node_modules-base-${SW_PROJECT_SLUG}"
+    # shellcheck disable=SC2015
     docker volume rm "$vendor_base" 2>/dev/null && ok "Removed $vendor_base" || info "$vendor_base not found."
+    # shellcheck disable=SC2015
     docker volume rm "$node_base" 2>/dev/null && ok "Removed $node_base" || info "$node_base not found."
 }
 
