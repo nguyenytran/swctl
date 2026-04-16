@@ -287,7 +287,16 @@ export async function smartCreate(args: {
 export async function githubIssues(args: { org?: string }): Promise<ToolResult> {
   try {
     const params = args.org ? `?org=${encodeURIComponent(args.org)}` : ''
-    const data = await apiGet(`/api/github/issues${params}`)
+    const [data, instancesRaw] = await Promise.all([
+      apiGet(`/api/github/issues${params}`),
+      apiGet('/api/instances').catch(() => []),
+    ])
+
+    // Build lookups for existing worktrees: by issue ID and by branch name
+    const managedInstances = (Array.isArray(instancesRaw) ? instancesRaw : [])
+      .filter((i: any) => i.kind !== 'external')
+    const existingIds = new Set(managedInstances.map((i: any) => String(i.issueId)))
+    const existingBranches = new Set(managedInstances.map((i: any) => i.branch).filter(Boolean))
 
     if (data.error) {
       if (data.error === 'auth_required') {
@@ -299,6 +308,18 @@ export async function githubIssues(args: { org?: string }): Promise<ToolResult> 
     const items = data.items || []
     if (items.length === 0) return text('No open issues or PRs found.')
 
+    // Match by issue number, PR branch, or linked PR branch
+    const hasWorktree = (i: any): boolean => {
+      if (existingIds.has(String(i.number))) return true
+      if (i.branch && existingBranches.has(i.branch)) return true
+      if (i.linkedPRs?.length) {
+        for (const pr of i.linkedPRs) {
+          if (pr.branch && existingBranches.has(pr.branch)) return true
+        }
+      }
+      return false
+    }
+
     const categories: Record<string, any[]> = {
       'review-requested': [],
       'my-pr': [],
@@ -308,34 +329,44 @@ export async function githubIssues(args: { org?: string }): Promise<ToolResult> 
       categories[item.category]?.push(item)
     }
 
+    // Filter out items that already have a worktree
+    let hiddenCount = 0
+    for (const key of Object.keys(categories)) {
+      const before = categories[key].length
+      categories[key] = categories[key].filter((i: any) => !hasWorktree(i))
+      hiddenCount += before - categories[key].length
+    }
+
+    const formatItem = (i: any, isPR: boolean) => {
+      if (isPR) {
+        return `  - PR #${i.number}: ${i.title} (${i.repo}) [${i.branch || 'no branch'}]`
+      }
+      const type = i.isPR ? 'PR' : 'Issue'
+      const linked = i.linkedPRs?.length ? ` → PR #${i.linkedPRs[0].number}` : ''
+      return `  - ${type} #${i.number}: ${i.title} (${i.repo})${linked} [${i.branch || 'no branch'}]`
+    }
+
     const sections: string[] = []
 
     if (categories['review-requested'].length > 0) {
-      const lines = categories['review-requested'].map((i: any) =>
-        `  - PR #${i.number}: ${i.title} (${i.repo}) [${i.branch || 'no branch'}]`
-      )
+      const lines = categories['review-requested'].map((i: any) => formatItem(i, true))
       sections.push(`**Review Requested (${lines.length}):**\n${lines.join('\n')}`)
     }
 
     if (categories['my-pr'].length > 0) {
-      const lines = categories['my-pr'].map((i: any) =>
-        `  - PR #${i.number}: ${i.title} (${i.repo}) [${i.branch || 'no branch'}]`
-      )
+      const lines = categories['my-pr'].map((i: any) => formatItem(i, true))
       sections.push(`**My PRs (${lines.length}):**\n${lines.join('\n')}`)
     }
 
     if (categories['assigned'].length > 0) {
-      const lines = categories['assigned'].map((i: any) => {
-        const type = i.isPR ? 'PR' : 'Issue'
-        const linked = i.linkedPRs?.length ? ` → PR #${i.linkedPRs[0].number}` : ''
-        return `  - ${type} #${i.number}: ${i.title} (${i.repo})${linked} [${i.branch || 'no branch'}]`
-      })
+      const lines = categories['assigned'].map((i: any) => formatItem(i, false))
       sections.push(`**Assigned (${lines.length}):**\n${lines.join('\n')}`)
     }
 
+    const skipped = hiddenCount > 0 ? `\n\n_${hiddenCount} item(s) hidden (worktree already exists)_` : ''
     const rl = data.rateLimit
-    const rateInfo = rl ? `\n\n_Rate limit: ${rl.remaining}/${rl.limit}_` : ''
-    return text(sections.join('\n\n') + rateInfo)
+    const rateInfo = rl ? `\n_Rate limit: ${rl.remaining}/${rl.limit}_` : ''
+    return text(sections.join('\n\n') + skipped + rateInfo)
   } catch (err: any) {
     return error(`Failed to fetch GitHub issues: ${err.message}`)
   }

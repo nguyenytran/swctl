@@ -2,7 +2,7 @@
   "mcpServers": {
     "swctl": {
       "command": "npx",
-      "args": ["tsx", "app/mcp/index.ts"],
+      "args": ["tsx", "--env-file-if-exists=app/.env", "app/mcp/index.ts"],
       "env": {
         "SWCTL_UI_URL": "http://swctl.orb.local"
       }

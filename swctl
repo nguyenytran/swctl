@@ -1054,13 +1054,10 @@ create_worktree() {
         fi
 
         if [ -d "$WORKTREE_PATH" ]; then
-            # Check if this is a leftover from a failed/interrupted create
-            if [ "${STATUS:-}" = "creating" ] || [ "${STATUS:-}" = "failed" ]; then
-                warn "Cleaning up leftover directory from previous failed create: $WORKTREE_PATH"
-                git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || rm -rf "$WORKTREE_PATH"
-            else
-                die "Target worktree path already exists and is not a registered Git worktree: $WORKTREE_PATH"
-            fi
+            # Directory exists but is not a registered git worktree — leftover from
+            # a previous failed/cleaned create.  Remove it so we can start fresh.
+            warn "Cleaning up leftover directory: $WORKTREE_PATH"
+            git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || rm -rf "$WORKTREE_PATH"
         fi
 
         # Retry loop: git worktree add can fail transiently due to concurrent git
@@ -2431,6 +2428,17 @@ cmd_create() {
         project_config_arg="$SELECTED_PROJECT_PATH/.swctl.conf"
     fi
 
+    # --- Duplicate check: reject if a worktree already exists for this issue ---
+    local _dup_file=""
+    _dup_file="$(resolve_instance_file_by_issue "$ISSUE" 2>/dev/null)" || true
+    if [ -n "$_dup_file" ] && [ -f "$_dup_file" ]; then
+        local _dup_id _dup_domain _dup_project
+        _dup_id="$(grep '^ISSUE_ID=' "$_dup_file" | cut -d= -f2)"
+        _dup_domain="$(grep '^DOMAIN=' "$_dup_file" | cut -d= -f2)"
+        _dup_project="$(grep '^PROJECT=' "$_dup_file" | cut -d= -f2)"
+        die "A worktree already exists for issue '${ISSUE}' (project: ${_dup_project:-unknown}, domain: ${_dup_domain:-unknown}). Use 'swctl clean ${_dup_id:-$ISSUE}' first, or 'swctl refresh ${_dup_id:-$ISSUE}' to update it."
+    fi
+
     case "$PROJECT_TYPE" in
         plugin-external)
             # Create a standard trunk worktree, then nest the plugin's git
@@ -2482,6 +2490,12 @@ cmd_create() {
             # branch in the trunk repo.
             mkdir -p "$SW_WORKTREE_ROOT"
             if ! worktree_exists "$WORKTREE_PATH"; then
+                # Remove leftover directory from a previous failed/cleaned create
+                if [ -d "$WORKTREE_PATH" ]; then
+                    warn "Cleaning up leftover directory: $WORKTREE_PATH"
+                    git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || rm -rf "$WORKTREE_PATH"
+                fi
+                git -C "$PROJECT_ROOT" worktree prune 2>/dev/null || true
                 git -C "$PROJECT_ROOT" worktree add --detach "$WORKTREE_PATH" "$BASE_REF"
                 ok "Created trunk worktree (detached at $BASE_REF)."
             fi
@@ -3853,12 +3867,16 @@ cmd_clean() {
     fi
 
     # 5. Remove the git worktree
-    if [ -d "$WORKTREE_PATH" ] && git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" >/dev/null 2>&1 || warn "Could not remove worktree '${WORKTREE_PATH}'."
+    if [ -d "$WORKTREE_PATH" ]; then
+        git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" >/dev/null 2>&1 \
+            || rm -rf "$WORKTREE_PATH" 2>/dev/null \
+            || warn "Could not remove worktree '${WORKTREE_PATH}'."
         ok "Removed worktree '${WORKTREE_PATH}'."
     else
         info "Worktree path '${WORKTREE_PATH}' is already absent."
     fi
+    # Prune stale worktree references so git doesn't block future creates
+    git -C "$PROJECT_ROOT" worktree prune 2>/dev/null || true
 
     # 6. Clean up generated files in tmp
     rm -f "$SWCTL_TMP_DIR/${COMPOSE_PROJECT}.compose.env" \

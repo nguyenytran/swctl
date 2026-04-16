@@ -11,7 +11,7 @@ const emit = defineEmits<{ close: []; refresh: [] }>()
 
 const { projects } = useProjects()
 const { activeProjectName } = useActiveProject()
-const { instances } = useInstances()
+const { instances, refresh: refreshInstances } = useInstances()
 const batch = useBatchCreate()
 
 // Shared settings
@@ -72,8 +72,9 @@ let ghSkippedTimer: ReturnType<typeof setTimeout> | null = null
 
 // GitHub filter state
 const ghFilterCategories = ref<Set<string>>(new Set(['assigned', 'review-requested', 'my-pr']))
-const ghFilterTypes = ref<Set<string>>(new Set(['issue', 'pr']))
 const ghFilterIssueTypes = ref<Set<string>>(new Set()) // empty = show all
+const ghHideExisting = ref(true) // hide items that already have a worktree
+const ghActiveTab = ref<'issues' | 'prs'>('issues') // split view: issues vs PRs
 
 // Issue type color map (matches the badge colors in the list)
 const issueTypeColors: Record<string, { active: string; label: string }> = {
@@ -99,12 +100,6 @@ function toggleGhFilterCategory(cat: string) {
   else s.add(cat)
   ghFilterCategories.value = s
 }
-function toggleGhFilterType(t: string) {
-  const s = new Set(ghFilterTypes.value)
-  if (s.has(t)) s.delete(t)
-  else s.add(t)
-  ghFilterTypes.value = s
-}
 function toggleGhFilterIssueType(t: string) {
   const s = new Set(ghFilterIssueTypes.value)
   if (s.has(t)) s.delete(t)
@@ -112,18 +107,23 @@ function toggleGhFilterIssueType(t: string) {
   ghFilterIssueTypes.value = s
 }
 
+// Count items per tab (before other filters, for badge counts)
+const ghIssueCount = computed(() => ghItems.value.filter(i => !i.isPR).length)
+const ghPrCount = computed(() => ghItems.value.filter(i => i.isPR).length)
+
 const ghFilteredItems = computed(() => {
   const catFilter = ghFilterCategories.value
-  const typeFilter = ghFilterTypes.value
   const issueTypeFilter = ghFilterIssueTypes.value
+  const hideExisting = ghHideExisting.value
+  const tab = ghActiveTab.value
   return ghItems.value.filter(item => {
+    // Tab filter: issues vs PRs
+    if (tab === 'issues' && item.isPR) return false
+    if (tab === 'prs' && !item.isPR) return false
+    // Hide items that already have a worktree
+    if (hideExisting && hasExistingWorktree(item)) return false
     // Category filter (empty = show all)
     if (catFilter.size > 0 && !catFilter.has(item.category)) return false
-    // Type filter: issue vs PR (empty = show all)
-    if (typeFilter.size > 0) {
-      if (item.isPR && !typeFilter.has('pr')) return false
-      if (!item.isPR && !typeFilter.has('issue')) return false
-    }
     // Issue type filter (empty = show all)
     if (issueTypeFilter.size > 0) {
       if (!item.issueType || !issueTypeFilter.has(item.issueType)) return false
@@ -287,9 +287,11 @@ async function fetchFromGitHub() {
   ghSelected.value = new Set()
   ghFilterIssueTypes.value = new Set()
   ghFilterCategories.value = new Set(['assigned', 'review-requested', 'my-pr'])
-  ghFilterTypes.value = new Set(['issue', 'pr'])
+  ghActiveTab.value = 'issues'
 
   try {
+    // Ensure instances are loaded so we can cross-reference existing worktrees
+    await refreshInstances()
     const result = await fetchGitHubIssues()
     ghFetched.value = true
     if (result.rateLimit) ghRateLimit.value = result.rateLimit
@@ -327,12 +329,31 @@ const existingIssueNumbers = computed(() => {
   return nums
 })
 
-function hasExistingWorktree(issueNumber: number): boolean {
-  return existingIssueNumbers.value.has(issueNumber)
+// Set of branch names that already have an existing worktree (for PR matching)
+const existingBranches = computed(() => {
+  const branches = new Set<string>()
+  for (const inst of instances.value) {
+    if (inst.branch) branches.add(inst.branch)
+  }
+  return branches
+})
+
+function hasExistingWorktree(item: GitHubItem): boolean {
+  // Match by issue number
+  if (existingIssueNumbers.value.has(item.number)) return true
+  // Match PRs by branch name
+  if (item.branch && existingBranches.value.has(item.branch)) return true
+  // Match issues with linked PRs by linked PR branch
+  if (item.linkedPRs?.length) {
+    for (const pr of item.linkedPRs) {
+      if (pr.branch && existingBranches.value.has(pr.branch)) return true
+    }
+  }
+  return false
 }
 
 function isGhItemDisabled(item: GitHubItem): boolean {
-  return hasExistingWorktree(item.number) || (mode.value === 'qa' && !item.branch)
+  return hasExistingWorktree(item) || (mode.value === 'qa' && !item.branch)
 }
 
 function selectableGhItems() {
@@ -368,7 +389,7 @@ function addSelectedGhItems() {
   for (const item of ghItems.value) {
     if (!ghSelected.value.has(item.number)) continue
     // Skip issues that already have a worktree
-    if (hasExistingWorktree(item.number)) {
+    if (hasExistingWorktree(item)) {
       skipped++
       continue
     }
@@ -709,24 +730,26 @@ function handleNewBatch() {
 
               <!-- Results -->
               <div v-if="ghItems.length > 0" class="space-y-2">
+                <!-- Tabs: Issues / Pull Requests -->
+                <div class="flex border-b border-border">
+                  <button
+                    class="px-4 py-1.5 text-xs font-medium transition-colors border-b-2 -mb-px"
+                    :class="ghActiveTab === 'issues'
+                      ? 'text-emerald-400 border-emerald-400'
+                      : 'text-gray-500 border-transparent hover:text-gray-300'"
+                    @click="ghActiveTab = 'issues'"
+                  >Issues ({{ ghIssueCount }})</button>
+                  <button
+                    class="px-4 py-1.5 text-xs font-medium transition-colors border-b-2 -mb-px"
+                    :class="ghActiveTab === 'prs'
+                      ? 'text-purple-400 border-purple-400'
+                      : 'text-gray-500 border-transparent hover:text-gray-300'"
+                    @click="ghActiveTab = 'prs'"
+                  >Pull Requests ({{ ghPrCount }})</button>
+                </div>
+
                 <!-- Filter bar -->
                 <div class="flex items-center gap-2 flex-wrap">
-                  <button
-                    class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
-                    :class="ghFilterTypes.has('issue')
-                      ? 'bg-emerald-600/20 text-emerald-400 border-emerald-600/40'
-                      : 'bg-transparent text-gray-500 border-gray-700 hover:border-gray-500'"
-                    @click="toggleGhFilterType('issue')"
-                  >Issues</button>
-                  <button
-                    class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
-                    :class="ghFilterTypes.has('pr')
-                      ? 'bg-purple-600/20 text-purple-400 border-purple-600/40'
-                      : 'bg-transparent text-gray-500 border-gray-700 hover:border-gray-500'"
-                    @click="toggleGhFilterType('pr')"
-                  >Pull Requests</button>
-
-                  <span class="text-gray-700">|</span>
                   <button
                     class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
                     :class="ghFilterCategories.has('assigned')
@@ -761,6 +784,17 @@ function handleNewBatch() {
                       @click="toggleGhFilterIssueType(itype)"
                     >{{ itype }}</button>
                   </template>
+
+                  <span v-if="existingIssueNumbers.size > 0" class="text-gray-700">|</span>
+                  <button
+                    v-if="existingIssueNumbers.size > 0"
+                    class="text-[11px] px-2 py-0.5 rounded-full border transition-colors"
+                    :class="ghHideExisting
+                      ? 'bg-gray-600/20 text-gray-400 border-gray-600/40'
+                      : 'bg-transparent text-gray-500 border-gray-700 hover:border-gray-500'"
+                    @click="ghHideExisting = !ghHideExisting"
+                    :title="`${existingIssueNumbers.size} issue(s) already have worktrees`"
+                  >Hide existing ({{ existingIssueNumbers.size }})</button>
 
                   <span class="ml-auto text-[10px] text-gray-600">{{ ghFilteredItems.length }}/{{ ghItems.length }}</span>
                 </div>
@@ -859,7 +893,7 @@ function handleNewBatch() {
                           class="text-[10px] px-1 py-0 rounded bg-red-600/20 text-red-400 border border-red-600/30 shrink-0"
                         >No PR</span>
                         <span
-                          v-if="hasExistingWorktree(item.number)"
+                          v-if="hasExistingWorktree(item)"
                           class="text-[10px] px-1 py-0 rounded bg-gray-600/20 text-gray-400 border border-gray-600/30 shrink-0"
                           title="A worktree already exists for this issue"
                         >Worktree exists</span>
