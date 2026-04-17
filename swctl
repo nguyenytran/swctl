@@ -586,6 +586,12 @@ write_metadata() {
         printf 'STATUS=%q\n' "${STATUS:-complete}"
         printf 'FAILED_AT=%q\n' "${FAILED_AT:-}"
         printf 'CREATED_AT=%q\n' "$(timestamp_utc)"
+        # Claude Code resolve session tracking
+        printf 'CLAUDE_SESSION_ID=%q\n' "${CLAUDE_SESSION_ID:-}"
+        printf 'CLAUDE_RESOLVE_STATUS=%q\n' "${CLAUDE_RESOLVE_STATUS:-}"
+        printf 'CLAUDE_RESOLVE_STEP=%q\n' "${CLAUDE_RESOLVE_STEP:-}"
+        printf 'CLAUDE_RESOLVE_STARTED=%q\n' "${CLAUDE_RESOLVE_STARTED:-}"
+        printf 'CLAUDE_RESOLVE_COST=%q\n' "${CLAUDE_RESOLVE_COST:-0}"
     } >"$meta_file"
 }
 
@@ -1208,6 +1214,15 @@ sync_build_artifacts() {
     # Called AFTER count_changes so ADMIN_CHANGES/STOREFRONT_CHANGES are set.
     # Diff-driven: only sync what's needed. Use APFS clones when available.
 
+    # Skip entirely when --no-provision was requested.  Build artifacts
+    # (public/bundles, node_modules, vendor) are only needed for serving the
+    # application and for JS/theme builds — both happen during provisioning.
+    # For analysis-only worktrees this saves 30-120s of copying.
+    if [ "${SWCTL_NO_PROVISION:-0}" = "1" ]; then
+        info "Skipping build-artifact sync (--no-provision): vendor, node_modules, public/bundles"
+        return 0
+    fi
+
     # Read artifact lists from workflow.yaml if available
     local sync_files="" sync_dirs=""
     if [ -n "${SWCTL_WORKFLOW_DIR:-}" ] && [ -f "$SWCTL_WORKFLOW_DIR/workflow.yaml" ]; then
@@ -1370,6 +1385,13 @@ print('pat_backend=\"{}\"'.format(d.get('backend', '\\\\.php\$')))
 }
 
 sync_worktree_deps() {
+    # Skip entirely when --no-provision was requested.  vendor/ is only needed
+    # for the container to run; analysis-only worktrees don't need it.
+    if [ "${SWCTL_NO_PROVISION:-0}" = "1" ]; then
+        info "Skipping vendor copy (--no-provision)"
+        return 0
+    fi
+
     # Copy vendor from trunk when the worktree doesn't have a usable vendor/.
     # Each worktree needs its own copy — shared vendor breaks because composer
     # dump-autoload writes container-specific paths into the autoloader.
@@ -2370,6 +2392,7 @@ cmd_create() {
     local selected_plugin=""
     local selected_deps=""
     local adopt_worktree_path=""
+    local no_provision=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --qa)      SWCTL_MODE="qa"; shift ;;
@@ -2378,10 +2401,12 @@ cmd_create() {
             --plugin)  selected_plugin="$2"; shift 2 ;;
             --deps)    selected_deps="$2"; shift 2 ;;
             --adopt-worktree) adopt_worktree_path="$2"; shift 2 ;;
+            --no-provision) no_provision=1; shift ;;
             *)         break ;;
         esac
     done
     export SWCTL_MODE
+    export SWCTL_NO_PROVISION="$no_provision"
     ISSUE="${1:-}"
     BRANCH="${2:-}"
     [ -n "$ISSUE" ] || die "Usage: swctl create [--qa|--dev] [--project <name>] [--plugin <name>] <issue> [<branch>]"
@@ -2559,7 +2584,19 @@ cmd_create() {
                     git -C "$PLUGIN_REPO_PATH" worktree add "$plugin_target" "$BRANCH" \
                         || die "Failed to create plugin worktree."
                 else
-                    die "Branch '$BRANCH' not found in plugin repo: $PLUGIN_REPO_PATH"
+                    # Branch doesn't exist anywhere — create it from the
+                    # plugin's default branch.  This is the common case when
+                    # swctl is asked to create a worktree for a brand new fix
+                    # branch (e.g. resolve/<issue> from the resolve workflow).
+                    local _plugin_default
+                    _plugin_default="$(git -C "$PLUGIN_REPO_PATH" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
+                    [ -z "$_plugin_default" ] && _plugin_default="$(git -C "$PLUGIN_REPO_PATH" symbolic-ref --short HEAD 2>/dev/null)"
+                    [ -z "$_plugin_default" ] && _plugin_default="main"
+                    info "Branch '$BRANCH' not found in plugin repo — creating from '$_plugin_default'."
+                    git -C "$PLUGIN_REPO_PATH" fetch origin "$_plugin_default" 2>/dev/null || true
+                    git -C "$PLUGIN_REPO_PATH" worktree add -b "$BRANCH" "$plugin_target" "origin/$_plugin_default" 2>/dev/null \
+                        || git -C "$PLUGIN_REPO_PATH" worktree add -b "$BRANCH" "$plugin_target" "$_plugin_default" 2>/dev/null \
+                        || die "Failed to create plugin worktree on new branch '$BRANCH' from '$_plugin_default'."
                 fi
                 ok "Plugin worktree nested at: custom/plugins/${PLUGIN_NAME}"
             else
@@ -2659,6 +2696,19 @@ cmd_create() {
             info "Mode: ${SWCTL_MODE} | Plugin: ${PLUGIN_NAME}"
             info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
 
+            # Defer heavy provisioning (DB clone, Docker containers, Shopware
+            # install) when --no-provision was requested.  Leaves the worktree
+            # and metadata in place for 'swctl setup <issue>' to finish.
+            if [ "${SWCTL_NO_PROVISION:-0}" = "1" ]; then
+                STATUS="provisioning-deferred"
+                trap - EXIT
+                write_metadata "$SWCTL_ACTIVE_META_FILE"
+                ok "Worktree '${WORKTREE_ID}' ready (provisioning deferred)."
+                info "Worktree: ${WORKTREE_PATH}"
+                info "Run 'swctl setup ${ISSUE_ID}' to provision database + container when ready."
+                return 0
+            fi
+
             provision_database_and_app "$COMPOSE_PROJECT"
 
             # Ensure the nested plugin is properly registered before the admin
@@ -2749,6 +2799,19 @@ cmd_create() {
 
             info "Mode: ${SWCTL_MODE} | Plugin: ${PLUGIN_NAME}"
             info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
+
+            # Defer heavy provisioning (DB clone, Docker containers, Shopware
+            # install) when --no-provision was requested.  Leaves the worktree
+            # and metadata in place for 'swctl setup <issue>' to finish.
+            if [ "${SWCTL_NO_PROVISION:-0}" = "1" ]; then
+                STATUS="provisioning-deferred"
+                trap - EXIT
+                write_metadata "$SWCTL_ACTIVE_META_FILE"
+                ok "Worktree '${WORKTREE_ID}' ready (provisioning deferred)."
+                info "Worktree: ${WORKTREE_PATH}"
+                info "Run 'swctl setup ${ISSUE_ID}' to provision database + container when ready."
+                return 0
+            fi
 
             provision_database_and_app "$COMPOSE_PROJECT"
             run_frontend_build_if_needed "$COMPOSE_PROJECT" 1
@@ -3383,8 +3446,10 @@ cmd_refresh() {
     # Load project config from the instance's saved config path
     load_project_config ${CONFIG_PATH:+"$CONFIG_PATH"}
 
-    # Resume failed/interrupted creates
-    if [ "${STATUS:-complete}" = "failed" ] || [ "${STATUS:-complete}" = "creating" ]; then
+    # Resume failed/interrupted/deferred creates
+    if [ "${STATUS:-complete}" = "failed" ] \
+       || [ "${STATUS:-complete}" = "creating" ] \
+       || [ "${STATUS:-complete}" = "provisioning-deferred" ]; then
         info "Worktree '$ISSUE_ID' has status '${STATUS}'. Resuming provisioning..."
         STATUS="creating"
         ensure_infra_ready
@@ -3430,7 +3495,30 @@ cmd_refresh() {
         provision_database_and_app "$COMPOSE_PROJECT"
 
         # 5. Frontend build
-        run_frontend_build_if_needed "$COMPOSE_PROJECT" 1
+        # For plugin-external instances we must force the plugin build so
+        # public/bundles/<slug>/administration/js/* gets generated.  A
+        # PHP-only commit wouldn't otherwise bump ADMIN_CHANGES /
+        # STOREFRONT_CHANGES, and without those the workflow build hook
+        # falls through to "No frontend builds needed".  Mirror the
+        # detection + counter bumps done in cmd_create.
+        local _refresh_force_plugin_build=0
+        if [ "${PROJECT_TYPE:-}" = "plugin-external" ] && [ -n "${PLUGIN_WORKTREE_PATHS:-}" ]; then
+            local _old_ifs="$IFS"; IFS=','
+            for _pdir in $PLUGIN_WORKTREE_PATHS; do
+                if find "$_pdir" -maxdepth 4 -path "*/Resources/app/administration" -type d 2>/dev/null | grep -q .; then
+                    ADMIN_CHANGES=$((${ADMIN_CHANGES:-0} + 1))
+                    _refresh_force_plugin_build=1
+                    info "$(basename "$_pdir") has admin extensions — admin build will be triggered."
+                fi
+                if find "$_pdir" -maxdepth 4 -path "*/Resources/app/storefront" -type d 2>/dev/null | grep -q .; then
+                    STOREFRONT_CHANGES=$((${STOREFRONT_CHANGES:-0} + 1))
+                    _refresh_force_plugin_build=1
+                    info "$(basename "$_pdir") has storefront extensions — storefront build will be triggered."
+                fi
+            done
+            IFS="$_old_ifs"
+        fi
+        run_frontend_build_if_needed "$COMPOSE_PROJECT" 1 "$_refresh_force_plugin_build"
 
         # 6. Activate plugin if needed
         if [ -n "${PLUGIN_NAME:-}" ]; then
@@ -4046,6 +4134,7 @@ render_tui_menu() {
     printf '%s\n' "[7] Restart           [8] Refresh (pull)    [9] Switch mode"
     printf '%s\n' "[0] Clean worktree    [o] Open in browser   [d] Live dashboard"
     printf '%s\n' "[b] Batch create      [i] Init infra        [r] Reload"
+    printf '%s\n' "[R] Resolve (Claude)  [M] Manage issue      [S] Resolve status"
     printf '%s\n' "[q] Quit"
     printf '\n'
 }
@@ -4509,7 +4598,10 @@ cmd_tui() {
             b|B) show_cursor; tui_batch_create_flow; hide_cursor; pause_for_key ;;
             d|D) cmd_dashboard ;;
             i|I) init_infra; pause_for_key ;;
-            r|R) ;;
+            r) ;;
+            R) show_cursor; tui_resolve_flow; hide_cursor; pause_for_key ;;
+            M) show_cursor; tui_resolve_manage_flow; hide_cursor; pause_for_key ;;
+            S) show_cursor; render_resolve_status; hide_cursor; pause_for_key ;;
             q|Q) break ;;
             *) warn "Unknown option: $choice"; pause_for_key ;;
         esac
@@ -4901,7 +4993,12 @@ Usage:
   swctl code <issue> [--claude|--codex|--phpstorm|--code|--cursor]
   swctl switch <issue> --qa|--dev
   swctl clean <issue>
+  swctl resolve [--select] [--jobs N] <issue...>
+  swctl resolve resume <issue>
+  swctl resolve status
   swctl auth [login|logout|status]
+  swctl skill [install|uninstall|status] [--user|--repo]
+  swctl mcp [install|uninstall|status] [--user|--project]
   swctl tui
   swctl dashboard
   swctl --version
@@ -4921,10 +5018,27 @@ Commands:
   code        Open worktree in an editor: --phpstorm (default), --claude, --codex, --code, --cursor.
   switch      Switch a worktree between QA and Dev mode (rebuilds only what's needed).
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
+  resolve     Dispatch issues to Claude Code for automated resolution and manage results.
+              swctl resolve [--select] [--github <owner/repo>] [--jobs N] [--supervised] <issue...>
+              swctl resolve resume <issue>          Resume a paused Claude session.
+              swctl resolve status                  Show progress of all sessions.
+              swctl resolve diff <issue>            View code changes.
+              swctl resolve ask <issue> "message"   Ask Claude about the code.
+              swctl resolve chat <issue>            Open interactive Claude session.
+              swctl resolve pr list                 List PRs from resolve sessions.
+              swctl resolve pr view <issue>         View PR details.
+              swctl resolve pr push <issue>         Push branch to origin.
+              swctl resolve pr create <issue>       Create draft PR on GitHub.
+              swctl resolve pr merge <issue>        Merge PR (squash + delete branch).
+              swctl resolve pr approve <issue>      Approve PR.
   auth        Authenticate with GitHub using Device Flow. Subcommands: login, logout, status.
   tui         Open the interactive ANSI dashboard.
   dashboard   Open the live monitoring dashboard.
   ui          Start/stop the web UI (http://swctl.orb.local). Usage: swctl ui [start|stop|logs]
+  skill       Install/remove the bundled shopware-resolve skill for your host Claude Code.
+              swctl skill install [--user|--repo]    swctl skill uninstall    swctl skill status
+  mcp         Install/remove swctl's MCP server in your host Claude Code settings.
+              swctl mcp install   [--user|--project]  swctl mcp uninstall    swctl mcp status
   project     Manage registered projects: swctl project [add|list|remove|init]
   build-base  Pre-populate shared vendor and node_modules base volumes from the project root.
   clean-base  Remove shared base volumes for the current project.
@@ -4968,9 +5082,51 @@ cmd_ui() {
     export SWCTL_EDITOR="${SWCTL_EDITOR:-phpstorm}"
     export SWCTL_BROWSE_ROOT="${SWCTL_BROWSE_ROOT:-$HOME}"
     export SWCTL_GITHUB_CLIENT_ID="${SWCTL_GITHUB_CLIENT_ID:-}"
+    # SWCTL_PLUGINS_DIR accepts a colon-separated list (PATH convention).
+    # Default: user plugins first (so local copies can override), then the
+    # repo's bundled examples (discovered automatically when running from
+    # source — $SWCTL_SCRIPT_DIR points at the repo root).
+    local default_user_plugins="$HOME/.swctl/plugins"
+    local default_bundled_plugins="$SWCTL_SCRIPT_DIR/examples/plugins"
+    if [ -d "$default_bundled_plugins" ]; then
+        export SWCTL_PLUGINS_DIR="${SWCTL_PLUGINS_DIR:-$default_user_plugins:$default_bundled_plugins}"
+    else
+        export SWCTL_PLUGINS_DIR="${SWCTL_PLUGINS_DIR:-$default_user_plugins}"
+    fi
+    # Only the user plugin dir is auto-created; the bundled one either exists
+    # in the repo or not. Strip multi-path before mkdir'ing.
+    mkdir -p "${SWCTL_PLUGINS_DIR%%:*}" 2>/dev/null || true
+    # Propagate HOME so docker-compose can set it inside the container.  The
+    # UI's shopware-resolve plugin needs Claude Code's auth which lives in
+    # $HOME/.claude/ on the host.  $HOME is already covered by the BROWSE_ROOT
+    # bind mount above, so no new volume is needed.
+    export HOME="${HOME}"
 
     case "$action" in
         start)
+            # The UI container bind-mounts ./dist into /app/dist (see
+            # docker-compose.ui.yml), so the served frontend is whatever
+            # the host dist/ contains — NOT what the Docker build stage
+            # produced. Run the host-side Vite build first so source edits
+            # actually land in the running UI. npm install is idempotent
+            # and only runs if node_modules is missing.
+            local ui_app_dir="$SWCTL_TEMPLATE_DIR/app"
+            if [ -d "$ui_app_dir" ] && [ -f "$ui_app_dir/package.json" ]; then
+                (
+                    cd "$ui_app_dir" || exit 0
+                    if [ ! -d node_modules ]; then
+                        info "swctl ui: installing UI dependencies (first run)"
+                        npm install --no-audit --no-fund >/dev/null 2>&1 || {
+                            warn "swctl ui: npm install failed — falling back to image-built dist/"
+                            exit 0
+                        }
+                    fi
+                    info "swctl ui: building frontend"
+                    npm run build >/dev/null 2>&1 || {
+                        warn "swctl ui: npm run build failed — falling back to image-built dist/"
+                    }
+                )
+            fi
             compose --project-directory "$SWCTL_TEMPLATE_DIR/app" -f "$ui_compose" -p swctl-ui up -d --build
             ok "swctl UI running at http://swctl.orb.local"
             ;;
@@ -4990,6 +5146,1286 @@ cmd_ui() {
 cmd_version() {
     printf 'swctl %s\n' "$SWCTL_VERSION"
 }
+
+# ── Claude Code skill + MCP install helpers ──────────────────────────────────
+#
+# Expose swctl's bundled `shopware-resolve` skill and its `swctl` MCP
+# server to the user's host Claude Code installation.  Both commands
+# are idempotent, print what they did, and support a `--repo` /
+# `--project` flag to target the current project's `.claude/` /
+# `.mcp.json` instead of `$HOME`.
+
+# Locate the bundled skill source (pkgshare via brew, repo root via dev)
+skill_bundle_path() {
+    local dir="${SWCTL_SCRIPT_DIR:-$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")}"
+    printf '%s/skills/shopware-resolve' "$dir"
+}
+
+# Locate the MCP server entry that should be wired up
+mcp_bundle_path() {
+    local dir="${SWCTL_SCRIPT_DIR:-$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")}"
+    printf '%s/app/mcp/index.ts' "$dir"
+}
+
+cmd_skill_install() {
+    local scope="user"
+    case "${1:-}" in
+        --user) scope="user"; shift ;;
+        --repo|--project) scope="repo"; shift ;;
+    esac
+
+    local src dst
+    src="$(skill_bundle_path)"
+    [ -d "$src" ] || die "Bundled skill not found at $src. Reinstall swctl."
+
+    if [ "$scope" = "user" ]; then
+        dst="$HOME/.claude/skills/shopware-resolve"
+    else
+        dst="$(pwd)/.claude/skills/shopware-resolve"
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+
+    if [ -L "$dst" ]; then
+        local current
+        current="$(readlink "$dst" 2>/dev/null || true)"
+        if [ "$current" = "$src" ]; then
+            ok "shopware-resolve skill already linked at $dst"
+            return 0
+        fi
+        warn "Replacing existing symlink ($current → $src)"
+        ln -sfn "$src" "$dst"
+    elif [ -e "$dst" ]; then
+        die "$dst already exists as a file/dir (not a symlink). Move it aside or run 'swctl skill uninstall' first."
+    else
+        ln -sfn "$src" "$dst"
+    fi
+    ok "Linked shopware-resolve skill → $dst"
+    info "Run 'claude /shopware-resolve' from a terminal to use it on the host."
+}
+
+cmd_skill_uninstall() {
+    local scope="user"
+    case "${1:-}" in
+        --user) scope="user"; shift ;;
+        --repo|--project) scope="repo"; shift ;;
+    esac
+
+    local dst
+    if [ "$scope" = "user" ]; then
+        dst="$HOME/.claude/skills/shopware-resolve"
+    else
+        dst="$(pwd)/.claude/skills/shopware-resolve"
+    fi
+
+    if [ -L "$dst" ]; then
+        rm -f "$dst"
+        ok "Removed shopware-resolve skill symlink: $dst"
+    elif [ -e "$dst" ]; then
+        die "$dst is not a symlink — refusing to delete (user-owned content)."
+    else
+        info "No shopware-resolve skill linked at $dst"
+    fi
+}
+
+cmd_skill_status() {
+    local user_dst="$HOME/.claude/skills/shopware-resolve"
+    local repo_dst; repo_dst="$(pwd)/.claude/skills/shopware-resolve"
+    local src
+    src="$(skill_bundle_path)"
+
+    printf '%bBundled source:%b %s\n' "${COLOR_BOLD:-}" "${COLOR_RESET:-}" "$src"
+    if [ -d "$src" ]; then
+        ok "  present"
+    else
+        warn "  MISSING — reinstall swctl"
+    fi
+
+    printf '\n%bUser-level link (%s):%b\n' "${COLOR_BOLD:-}" "$user_dst" "${COLOR_RESET:-}"
+    if [ -L "$user_dst" ]; then
+        ok "  → $(readlink "$user_dst")"
+    elif [ -e "$user_dst" ]; then
+        warn "  present but not a symlink (user-installed content)"
+    else
+        info "  not linked (run 'swctl skill install --user')"
+    fi
+
+    printf '\n%bRepo-level link (%s):%b\n' "${COLOR_BOLD:-}" "$repo_dst" "${COLOR_RESET:-}"
+    if [ -L "$repo_dst" ]; then
+        ok "  → $(readlink "$repo_dst")"
+    elif [ -e "$repo_dst" ]; then
+        warn "  present but not a symlink"
+    else
+        info "  not linked"
+    fi
+}
+
+cmd_skill() {
+    local sub="${1:-}"
+    [ -n "$sub" ] || die "Usage: swctl skill [install|uninstall|status] [--user|--repo]"
+    shift
+    case "$sub" in
+        install)   cmd_skill_install "$@" ;;
+        uninstall) cmd_skill_uninstall "$@" ;;
+        status)    cmd_skill_status "$@" ;;
+        *) die "Unknown skill subcommand: $sub" ;;
+    esac
+}
+
+cmd_mcp_install() {
+    local scope="user"
+    case "${1:-}" in
+        --user) scope="user"; shift ;;
+        --repo|--project) scope="repo"; shift ;;
+    esac
+
+    command -v jq >/dev/null 2>&1 || die "'jq' is required for MCP install. brew install jq."
+
+    local src target
+    src="$(mcp_bundle_path)"
+    [ -f "$src" ] || die "Bundled MCP server not found at $src. Reinstall swctl."
+
+    if [ "$scope" = "user" ]; then
+        target="$HOME/.claude/settings.json"
+    else
+        target="$(pwd)/.mcp.json"
+    fi
+
+    mkdir -p "$(dirname "$target")"
+    [ -s "$target" ] || printf '{}\n' > "$target"
+
+    local desired
+    desired="$(jq -n --arg cmd "npx" --arg tsx "tsx" --arg p "$src" \
+        '{command: $cmd, args: [$tsx, $p]}')"
+
+    local tmp; tmp="$(mktemp)"
+    jq --argjson swctl "$desired" \
+        '.mcpServers = (.mcpServers // {}) | .mcpServers.swctl = $swctl' \
+        "$target" > "$tmp" && mv "$tmp" "$target"
+
+    ok "Wired swctl MCP entry into $target"
+    info "Command: npx tsx $src"
+}
+
+cmd_mcp_uninstall() {
+    local scope="user"
+    case "${1:-}" in
+        --user) scope="user"; shift ;;
+        --repo|--project) scope="repo"; shift ;;
+    esac
+
+    command -v jq >/dev/null 2>&1 || die "'jq' is required."
+
+    local target
+    if [ "$scope" = "user" ]; then
+        target="$HOME/.claude/settings.json"
+    else
+        target="$(pwd)/.mcp.json"
+    fi
+
+    if [ ! -s "$target" ]; then
+        info "No $target to edit."
+        return 0
+    fi
+
+    local tmp; tmp="$(mktemp)"
+    jq 'if .mcpServers.swctl then .mcpServers |= del(.swctl) else . end' \
+        "$target" > "$tmp" && mv "$tmp" "$target"
+    ok "Removed swctl MCP entry from $target"
+}
+
+cmd_mcp_status() {
+    local user_target="$HOME/.claude/settings.json"
+    local repo_target; repo_target="$(pwd)/.mcp.json"
+    local src
+    src="$(mcp_bundle_path)"
+
+    printf '%bBundled MCP source:%b %s\n' "${COLOR_BOLD:-}" "${COLOR_RESET:-}" "$src"
+    if [ -f "$src" ]; then
+        ok "  present"
+    else
+        warn "  MISSING — reinstall swctl"
+    fi
+
+    for target in "$user_target" "$repo_target"; do
+        printf '\n%b%s:%b\n' "${COLOR_BOLD:-}" "$target" "${COLOR_RESET:-}"
+        if [ -s "$target" ] && command -v jq >/dev/null 2>&1; then
+            local entry
+            entry="$(jq -c '.mcpServers.swctl // null' "$target" 2>/dev/null || echo null)"
+            if [ "$entry" != "null" ]; then
+                ok "  $entry"
+            else
+                info "  no swctl MCP entry"
+            fi
+        else
+            info "  (not present)"
+        fi
+    done
+}
+
+cmd_mcp() {
+    local sub="${1:-}"
+    [ -n "$sub" ] || die "Usage: swctl mcp [install|uninstall|status] [--user|--repo]"
+    shift
+    case "$sub" in
+        install)   cmd_mcp_install "$@" ;;
+        uninstall) cmd_mcp_uninstall "$@" ;;
+        status)    cmd_mcp_status "$@" ;;
+        *) die "Unknown mcp subcommand: $sub" ;;
+    esac
+}
+
+# ── Claude Code resolve integration ──────────────────────────────────────────
+
+resolve_generate_uuid() {
+    uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || cat /proc/sys/kernel/random/uuid 2>/dev/null || printf '%s' "$(date +%s)-$$"
+}
+
+# Parse an issue ref (URL, owner/repo#N, or just N) into owner|repo|number.
+# Echoes three lines; caller reads with mapfile or three `read` calls.
+resolve_parse_issue_ref() {
+    local ref="$1"
+    local default_repo="${2:-shopware/shopware}"
+    local owner="${default_repo%/*}"
+    local repo="${default_repo#*/}"
+    local number=""
+    case "$ref" in
+        *github.com/*/*/issues/*)
+            # https://github.com/<owner>/<repo>/issues/<N>
+            local path="${ref#*github.com/}"
+            owner="${path%%/*}"; path="${path#*/}"
+            repo="${path%%/*}"
+            number="${ref##*/issues/}"
+            number="${number%%[!0-9]*}"
+            ;;
+        */*#[0-9]*)
+            # owner/repo#N
+            local repo_part="${ref%%#*}"
+            owner="${repo_part%/*}"
+            repo="${repo_part#*/}"
+            number="${ref##*#}"
+            ;;
+        [0-9]*)
+            number="$ref"
+            ;;
+        *)
+            number="$(printf '%s' "$ref" | tr -cd '0-9')"
+            ;;
+    esac
+    printf '%s\n%s\n%s\n' "$owner" "$repo" "$number"
+}
+
+# Fetch an issue's labels via `gh api` (preferred) or `curl` with token.
+# Prints one label name per line; empty on failure.
+resolve_fetch_issue_labels() {
+    local ref="$1"
+    local default_repo="${2:-shopware/shopware}"
+    local parsed; parsed="$(resolve_parse_issue_ref "$ref" "$default_repo")"
+    local owner repo number
+    { IFS= read -r owner; IFS= read -r repo; IFS= read -r number; } <<<"$parsed"
+    [ -n "$number" ] || return 0
+
+    if command -v gh >/dev/null 2>&1; then
+        gh api "repos/${owner}/${repo}/issues/${number}" --jq '.labels[].name' 2>/dev/null && return 0
+    fi
+
+    # Fallback: curl + swctl-stored token (same location as the UI uses)
+    local token_file="${SWCTL_STATE_DIR:-$HOME/.local/state/swctl}/github.token"
+    [ -f "$token_file" ] || return 0
+    local token; token="$(cat "$token_file" 2>/dev/null)"
+    [ -n "$token" ] || return 0
+    curl -sSf -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${owner}/${repo}/issues/${number}" 2>/dev/null \
+        | jq -r '.labels[].name' 2>/dev/null
+}
+
+# Pick a conventional-commit branch prefix (fix/feat/chore) from labels.
+# Default: fix.  Matches the branchPrefixFromLabels() logic in resolve.ts.
+resolve_branch_prefix_from_labels() {
+    local labels="$1"
+    local lower; lower="$(printf '%s' "$labels" | tr '[:upper:]' '[:lower:]')"
+    case "$lower" in
+        *feature\ request*|*enhancement*|*improvement*|*feature*) printf 'feat'; return ;;
+    esac
+    case "$lower" in
+        *refactor*|*chore*|*docs*|*documentation*|*tech\ debt*|*cleanup*|*tooling*|*\ ci*) printf 'chore'; return ;;
+    esac
+    printf 'fix'
+}
+
+# Detect a plugin-external project from `extension/<slug>` labels.
+# Prints the plugin name (e.g. SwagCustomizedProducts) or empty.
+# Word-based fuzzy match: every word in the label must appear in the plugin name.
+resolve_detect_plugin_from_labels() {
+    local labels="$1"
+    [ -n "$labels" ] || return 0
+    [ -f "$SWCTL_PROJECTS_FILE" ] || return 0
+
+    # Collect registered plugin-external project names (tab-separated columns)
+    local plugins_list
+    plugins_list="$(grep -E $'\tplugin-external\t' "$SWCTL_PROJECTS_FILE" 2>/dev/null | cut -f1)"
+    [ -n "$plugins_list" ] || return 0
+
+    local best_plugin="" best_score=0
+    while IFS= read -r label; do
+        case "$label" in
+            extension/*) ;;
+            Extension/*) ;;
+            *) continue ;;
+        esac
+        local slug="${label#*/}"
+        # Split on non-alphanumerics, keep words ≥ 3 chars, lowercase
+        local words
+        words="$(printf '%s' "$slug" | tr -c '[:alnum:]' '\n' | grep -E '^[a-zA-Z0-9]{3,}$' | tr '[:upper:]' '[:lower:]')"
+        [ -n "$words" ] || continue
+
+        while IFS= read -r plugin; do
+            [ -n "$plugin" ] || continue
+            local target; target="$(printf '%s' "$plugin" | tr '[:upper:]' '[:lower:]')"
+            # Every word must appear in the plugin name
+            local all_match=1
+            while IFS= read -r w; do
+                [ -n "$w" ] || continue
+                case "$target" in *"$w"*) ;; *) all_match=0; break ;; esac
+            done <<<"$words"
+            if [ "$all_match" = "1" ]; then
+                # Score: sum of word lengths (longer = better match)
+                local score; score="$(printf '%s' "$words" | tr -d '\n' | wc -c | tr -d ' ')"
+                if [ "$score" -gt "$best_score" ]; then
+                    best_plugin="$plugin"
+                    best_score="$score"
+                fi
+            fi
+        done <<<"$plugins_list"
+    done <<<"$labels"
+
+    [ -n "$best_plugin" ] && printf '%s' "$best_plugin"
+}
+
+# Build the structured /shopware-resolve prompt the UI uses.  Same ground
+# rules, required artifacts, step markers, and stop criterion as
+# resolve.ts so both entry points produce identical transcripts.
+resolve_build_prompt() {
+    local issue_url="$1"
+    local issue_id="$2"
+    # The skill's own SKILL.md carries the ground rules + per-step
+    # artifact requirements + stop criterion (see
+    # skills/shopware-resolve/SKILL.md "Ground rules" / "Required
+    # artifact per step" sections).  All three entry points (swctl UI,
+    # swctl CLI, direct `claude /shopware-resolve`) use those same
+    # rules, so we keep the prompt minimal: just the slash command +
+    # the explicit issue id for Step 5's swctl refresh.
+    cat <<EOF
+/shopware-resolve $issue_url
+
+(issue id for Step 5 swctl refresh: $issue_id)
+EOF
+}
+
+fetch_github_issues() {
+    local repo="$1"
+    local labels="${2:-}"
+    local token=""
+    [ -f "${SWCTL_GITHUB_TOKEN_FILE:-}" ] && token="$(cat "$SWCTL_GITHUB_TOKEN_FILE")"
+
+    local auth_header=""
+    [ -n "$token" ] && auth_header="Authorization: token $token"
+
+    local url="https://api.github.com/repos/${repo}/issues?state=open&per_page=100"
+    [ -n "$labels" ] && url="${url}&labels=${labels}"
+
+    curl -sSf ${auth_header:+-H "$auth_header"} "$url" \
+        | jq -r '.[] | select(.pull_request == null) | "\(.number)\t\(.title | .[0:70])"'
+}
+
+resolve_stream_monitor() {
+    local issue_id="$1"
+    local run_dir="$SWCTL_TMP_DIR/resolve/$issue_id"
+    mkdir -p "$run_dir"
+
+    local last_tool_name="" last_tool_input="" last_tool_id=""
+
+    while IFS= read -r line; do
+        printf '%s\n' "$line" >> "$run_dir/stream.jsonl"
+
+        local msg_type
+        msg_type="$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null)" || continue
+
+        case "$msg_type" in
+            assistant)
+                # Extract tool_use if present
+                local tool_name
+                tool_name="$(printf '%s' "$line" | jq -r '(.message.content // [])[-1].name // empty' 2>/dev/null)"
+                if [ -n "$tool_name" ]; then
+                    last_tool_name="$tool_name"
+                    last_tool_id="$(printf '%s' "$line" | jq -r '(.message.content // [])[-1].id // empty' 2>/dev/null)"
+                    last_tool_input="$(printf '%s' "$line" | jq -r '(.message.content // [])[-1].input | tostring' 2>/dev/null)"
+                fi
+                # Extract text for step tracking
+                local text
+                text="$(printf '%s' "$line" | jq -r '(.message.content // [])[] | select(.type=="text") | .text // empty' 2>/dev/null)"
+                if printf '%s' "$text" | grep -q 'Step [0-9]'; then
+                    printf '%s' "$text" | grep -oE 'Step [0-9]+[^.]*' | tail -1 > "$run_dir/step"
+                fi
+                ;;
+            user)
+                # Check for approval request (denied tool)
+                local content
+                content="$(printf '%s' "$line" | jq -r '(.message.content // [])[0].content // empty' 2>/dev/null)"
+                if printf '%s' "$content" | grep -qi 'requires approval\|permission\|denied'; then
+                    printf 'approval_needed\n' > "$run_dir/status"
+                    printf '%s\n%s\n%s\n' "$last_tool_name" "$last_tool_id" "$last_tool_input" > "$run_dir/pending_approval"
+                fi
+                ;;
+            result)
+                local is_error cost
+                is_error="$(printf '%s' "$line" | jq -r '.is_error // false' 2>/dev/null)"
+                cost="$(printf '%s' "$line" | jq -r '.total_cost_usd // 0' 2>/dev/null)"
+                if [ "$is_error" = "true" ]; then
+                    printf 'failed\n' > "$run_dir/status"
+                else
+                    printf 'done\n' > "$run_dir/status"
+                fi
+                printf '%s\n' "$cost" > "$run_dir/cost"
+                ;;
+        esac
+    done
+}
+
+resolve_dispatch_issue() {
+    local issue_url="$1"
+    local issue_id="$2"
+    local worktree_path="$3"
+    local session_id="$4"
+    local permission_mode="${5:-acceptEdits}"
+    # Optional 6th arg: explicit prompt to send Claude.  When omitted, fall
+    # back to the terse `/shopware-resolve <url>` form for backwards compat.
+    local prompt="${6:-/shopware-resolve $issue_url}"
+    local run_dir="$SWCTL_TMP_DIR/resolve/$issue_id"
+
+    mkdir -p "$run_dir"
+    printf 'running\n' > "$run_dir/status"
+
+    # Matches the UI (app/server/lib/resolve.ts):
+    # - explicit allowlist so non-interactive mode doesn't hit approval prompts
+    # - --effort max for a wider per-turn thinking budget
+    # - --session-id makes `claude --resume <id>` work later
+    claude -p "$prompt" \
+        --output-format stream-json \
+        --verbose \
+        --permission-mode "$permission_mode" \
+        --allowedTools "Bash Edit Write Read Grep Glob Task WebFetch WebSearch TodoWrite" \
+        --effort max \
+        --session-id "$session_id" \
+        --name "resolve-$issue_id" \
+        --add-dir "$worktree_path" \
+        --max-budget-usd 5.00 \
+        2>"$run_dir/stderr.log" \
+    | resolve_stream_monitor "$issue_id"
+
+    local exit_code=$?
+    printf '%s\n' "$exit_code" > "$run_dir/exit_code"
+    return $exit_code
+}
+
+resolve_one() {
+    local issue_number="$1"
+    local repo="${2:-shopware/shopware}"
+    local permission_mode="${3:-acceptEdits}"
+
+    local issue_url="https://github.com/${repo}/issues/${issue_number}"
+    local issue_id
+    issue_id="$(sanitize_slug "$issue_number")"
+    local session_id
+    session_id="$(resolve_generate_uuid)"
+
+    # Fetch labels once; reuse for scope detection + branch prefix.  Matches
+    # the UI orchestration (app/server/lib/resolve.ts:startResolveStream).
+    local labels
+    labels="$(resolve_fetch_issue_labels "$issue_url" "$repo" 2>/dev/null || true)"
+    local detected_plugin
+    detected_plugin="$(resolve_detect_plugin_from_labels "$labels")"
+    local branch_prefix
+    branch_prefix="$(resolve_branch_prefix_from_labels "$labels")"
+    local branch_name="${branch_prefix}/${issue_number}"
+
+    if [ -n "$labels" ]; then
+        info "[resolve] labels: $(printf '%s' "$labels" | tr '\n' ' ')"
+    else
+        info "[resolve] no labels returned — defaulting to platform scope + fix/ prefix"
+    fi
+    if [ -n "$detected_plugin" ]; then
+        info "[resolve] scope → $detected_plugin"
+    else
+        info "[resolve] scope → platform (trunk)"
+    fi
+    info "[resolve] branch: $branch_name"
+
+    # Check if worktree exists; create if not
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_id" 2>/dev/null)" || true
+
+    if [ -z "$meta_file" ] || [ ! -f "$meta_file" ]; then
+        info "[resolve] Creating worktree for issue $issue_id..."
+        local create_args=(--qa --no-provision)
+        [ -n "$detected_plugin" ] && create_args+=(--project "$detected_plugin")
+        cmd_create "${create_args[@]}" "$issue_number" "$branch_name" || {
+            err "Failed to create worktree for $issue_id"
+            return 1
+        }
+        meta_file="$(resolve_instance_file_by_issue "$issue_id")" || {
+            err "Worktree created but metadata missing for $issue_id"
+            return 1
+        }
+    else
+        # Scope-mismatch guard: if the existing instance was created against
+        # a different scope than the labels now indicate, refuse and point
+        # the user at `swctl clean`.  Mirrors the UI's stale-scope check.
+        load_instance_metadata "$meta_file"
+        if [ -n "$detected_plugin" ] && [ "$detected_plugin" != "${PLUGIN_NAME:-}" ]; then
+            die "[scope] existing instance is scoped to ${PLUGIN_NAME:-platform/trunk} but the issue labels point at $detected_plugin. Run 'swctl clean $issue_id' and retry to recreate with the correct plugin scope."
+        fi
+    fi
+
+    load_instance_metadata "$meta_file"
+
+    # Store session ID + running status in metadata (enables `swctl resolve
+    # resume <id>` later and parity with the UI's env fields).
+    CLAUDE_SESSION_ID="$session_id"
+    CLAUDE_RESOLVE_STATUS="running"
+    CLAUDE_RESOLVE_STARTED="$(timestamp_utc)"
+    CLAUDE_RESOLVE_STEP="0"
+    write_metadata "$meta_file"
+
+    info "[resolve] Dispatching issue #$issue_number to Claude Code (session: ${session_id:0:8}...)"
+
+    # Build the structured prompt (same content as the UI's resolve prompt)
+    local prompt
+    prompt="$(resolve_build_prompt "$issue_url" "$issue_id")"
+    resolve_dispatch_issue "$issue_url" "$issue_id" "$WORKTREE_PATH" \
+        "$session_id" "$permission_mode" "$prompt"
+    local rc=$?
+
+    # Update metadata with final status
+    local final_status="done"
+    [ "$rc" -ne 0 ] && final_status="failed"
+
+    CLAUDE_RESOLVE_STATUS="$final_status"
+    local cost_file="$SWCTL_TMP_DIR/resolve/$issue_id/cost"
+    [ -f "$cost_file" ] && CLAUDE_RESOLVE_COST="$(cat "$cost_file")"
+    # Persist last-completed-step so the UI's Resume card can pick up
+    local step_file="$SWCTL_TMP_DIR/resolve/$issue_id/step"
+    if [ -f "$step_file" ]; then
+        CLAUDE_RESOLVE_STEP="$(grep -oE '[0-9]+' "$step_file" 2>/dev/null | tail -1 || echo 0)"
+    fi
+    write_metadata "$meta_file"
+
+    if [ "$rc" -eq 0 ]; then
+        ok "[resolve] Issue #$issue_number completed. Cost: \$${CLAUDE_RESOLVE_COST:-0}"
+    else
+        err "[resolve] Issue #$issue_number failed (exit $rc)."
+    fi
+
+    return $rc
+}
+
+resolve_parallel() {
+    local issues="$1"
+    local repo="$2"
+    local max_jobs="${3:-2}"
+    local permission_mode="${4:-acceptEdits}"
+    local job_dir="$SWCTL_TMP_DIR/resolve-batch.$$"
+    mkdir -p "$job_dir"
+
+    local running=0
+    local issue_number=""
+
+    while IFS= read -r issue_number; do
+        [ -n "$issue_number" ] || continue
+
+        # Wait if at max capacity
+        while [ "$running" -ge "$max_jobs" ]; do
+            wait -n 2>/dev/null || true
+            running=$((running - 1))
+        done
+
+        (
+            resolve_one "$issue_number" "$repo" "$permission_mode" \
+                >"$job_dir/${issue_number}.log" 2>&1 \
+                && touch "$job_dir/${issue_number}.ok" \
+                || touch "$job_dir/${issue_number}.fail"
+        ) &
+
+        running=$((running + 1))
+        info "[resolve] Dispatched #$issue_number (job $running/$max_jobs)"
+    done <<< "$issues"
+
+    # Wait for all remaining
+    wait 2>/dev/null || true
+
+    # Summary
+    local succeeded failed total
+    succeeded="$(find "$job_dir" -name '*.ok' 2>/dev/null | wc -l | tr -d ' ')"
+    failed="$(find "$job_dir" -name '*.fail' 2>/dev/null | wc -l | tr -d ' ')"
+    total="$(printf '%s\n' "$issues" | grep -c '.' || echo 0)"
+
+    if [ "$failed" -gt 0 ]; then
+        warn "[resolve] Batch: $succeeded succeeded, $failed failed of $total."
+        for f in "$job_dir"/*.fail; do
+            [ -f "$f" ] || continue
+            local fid
+            fid="$(basename "$f" .fail)"
+            warn "  #$fid failed. Log: $job_dir/${fid}.log"
+        done
+    else
+        ok "[resolve] Batch: all $succeeded of $total succeeded."
+    fi
+
+    rm -rf "$job_dir"
+    [ "$failed" -eq 0 ]
+}
+
+cmd_resolve() {
+    local repo="shopware/shopware"
+    local max_jobs=2
+    local permission_mode="acceptEdits"
+    local issues=""
+    local labels=""
+
+    SWCTL_GITHUB_TOKEN_FILE="${SWCTL_STATE_DIR:-$HOME/.local/state/swctl}/github.token"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --github)  shift; repo="${1:?Missing --github arg}"; shift ;;
+            --jobs|-j) shift; max_jobs="${1:?Missing --jobs arg}"; shift ;;
+            --supervised) permission_mode="default"; shift ;;
+            --labels)  shift; labels="${1:?Missing --labels arg}"; shift ;;
+            --select)
+                shift
+                local fetched
+                fetched="$(fetch_github_issues "$repo" "$labels")"
+                if [ -z "$fetched" ]; then
+                    die "No open issues found in $repo."
+                fi
+                if command -v fzf >/dev/null 2>&1; then
+                    issues="$(printf '%s\n' "$fetched" | fzf --multi --prompt='Select issues> ' --height=40% --reverse | awk '{print $1}')"
+                else
+                    printf '%s\n' "$fetched"
+                    printf '\nEnter issue numbers (space-separated): '
+                    read -r issues
+                fi
+                ;;
+            -*)  die "Unknown flag: $1" ;;
+            *)   issues="${issues:+$issues
+}$1"; shift ;;
+        esac
+    done
+
+    [ -n "$issues" ] || die "No issues specified.\nUsage: swctl resolve [--github <owner/repo>] [--select] [--labels <labels>] [--jobs N] [--supervised] <issue...>"
+
+    command -v claude >/dev/null 2>&1 || die "Claude Code CLI not found. Install: https://docs.anthropic.com/en/docs/claude-code"
+    command -v jq >/dev/null 2>&1 || die "jq required for stream parsing."
+
+    local total
+    total="$(printf '%s\n' "$issues" | grep -c '.' || echo 0)"
+    info "[resolve] Resolving $total issue(s) with Claude Code (max $max_jobs concurrent)."
+
+    if [ "$total" -eq 1 ]; then
+        resolve_one "$(printf '%s' "$issues" | tr -d '[:space:]')" "$repo" "$permission_mode"
+    else
+        resolve_parallel "$issues" "$repo" "$max_jobs" "$permission_mode"
+    fi
+}
+
+cmd_resolve_resume() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl resolve resume <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    [ -n "${CLAUDE_SESSION_ID:-}" ] || die "No Claude session found for '$issue_input'."
+
+    local last_step="${CLAUDE_RESOLVE_STEP:-0}"
+    last_step="$(printf '%s' "$last_step" | grep -oE '[0-9]+' | tail -1 || echo 0)"
+    local next_step=$(( last_step + 1 ))
+    [ "$next_step" -gt 8 ] && next_step=8
+
+    info "[resolve] Resuming session ${CLAUDE_SESSION_ID:0:8}... for #$ISSUE_ID from Step $next_step"
+
+    local run_dir="$SWCTL_TMP_DIR/resolve/$ISSUE_ID"
+    mkdir -p "$run_dir"
+    printf 'running\n' > "$run_dir/status"
+
+    CLAUDE_RESOLVE_STATUS="running"
+    write_metadata "$meta_file"
+
+    # Minimal continuation prompt — the skill's SKILL.md already carries
+    # the ground rules (step markers, artifact list, stop criterion), and
+    # the resumed session still has them in context from the original run.
+    local resume_prompt
+    resume_prompt="Continue the previous /shopware-resolve run. You stopped after Step ${last_step}. Pick up at Step ${next_step} now, following the same ground rules from the skill."
+
+    claude -p "$resume_prompt" \
+        --resume "$CLAUDE_SESSION_ID" \
+        --output-format stream-json \
+        --verbose \
+        --permission-mode acceptEdits \
+        --allowedTools "Bash Edit Write Read Grep Glob Task WebFetch WebSearch TodoWrite" \
+        --effort max \
+        --add-dir "$WORKTREE_PATH" \
+        2>"$run_dir/stderr.log" \
+    | resolve_stream_monitor "$ISSUE_ID"
+
+    local rc=$?
+    local final_status="done"
+    [ "$rc" -ne 0 ] && final_status="failed"
+
+    CLAUDE_RESOLVE_STATUS="$final_status"
+    local cost_file="$run_dir/cost"
+    [ -f "$cost_file" ] && CLAUDE_RESOLVE_COST="$(cat "$cost_file")"
+    local step_file="$run_dir/step"
+    if [ -f "$step_file" ]; then
+        CLAUDE_RESOLVE_STEP="$(grep -oE '[0-9]+' "$step_file" 2>/dev/null | tail -1 || echo "$last_step")"
+    fi
+    write_metadata "$meta_file"
+
+    return $rc
+}
+
+render_resolve_status() {
+    printf '\n%b%-12s %-12s %-35s %-10s%b\n' \
+        "${COLOR_BOLD:-}" "Issue" "Status" "Step" "Cost" "${COLOR_RESET:-}"
+    printf '%-12s %-12s %-35s %-10s\n' \
+        "------------" "------------" "-----------------------------------" "----------"
+
+    local found=0
+    local run_dir
+    for run_dir in "$SWCTL_TMP_DIR"/resolve/*/; do
+        [ -d "$run_dir" ] || continue
+        found=1
+        local issue_id status step cost
+        issue_id="$(basename "$run_dir")"
+        status="$(cat "$run_dir/status" 2>/dev/null || printf 'unknown')"
+        step="$(cat "$run_dir/step" 2>/dev/null || printf '-')"
+        cost="$(cat "$run_dir/cost" 2>/dev/null || printf '-')"
+
+        local sc=""
+        case "$status" in
+            done)            sc="${COLOR_GREEN:-}" ;;
+            failed)          sc="${COLOR_RED:-}" ;;
+            approval_needed) sc="${COLOR_RED:-}" ;;
+            running)         sc="${COLOR_YELLOW:-}" ;;
+        esac
+
+        printf '%-12s %b%-12s%b %-35s %-10s\n' \
+            "#$issue_id" \
+            "$sc" "$status" "${COLOR_RESET:-}" \
+            "${step:0:35}" \
+            "\$$cost"
+    done
+
+    [ "$found" -eq 1 ] || printf '  (no active resolve sessions)\n'
+    printf '\n'
+}
+
+tui_resolve_flow() {
+    local repo="shopware/shopware"
+    local issues=""
+
+    # Source selection
+    info "Select issue source:"
+    printf '  1) Fetch from GitHub\n'
+    printf '  2) Enter manually\n'
+    printf '  Choice: '
+    local choice=""
+    read -r -n 1 choice
+    printf '\n'
+
+    case "$choice" in
+        1)
+            local labels_input=""
+            printf '  Labels filter (empty for all): '
+            read -r labels_input
+            local fetched
+            fetched="$(fetch_github_issues "$repo" "$labels_input" 2>/dev/null)"
+            if [ -z "$fetched" ]; then
+                warn "No issues found."; return
+            fi
+            if command -v fzf >/dev/null 2>&1; then
+                issues="$(printf '%s\n' "$fetched" | fzf --multi --prompt='Select issues (TAB to multi-select)> ' --height=50% --reverse | awk '{print $1}')"
+            else
+                printf '%s\n' "$fetched"
+                printf '\nEnter issue numbers (space-separated): '
+                read -r issues
+                issues="$(printf '%s' "$issues" | tr ' ' '\n')"
+            fi
+            ;;
+        2)
+            printf '  Issue numbers (space-separated): '
+            local manual_input=""
+            read -r manual_input
+            issues="$(printf '%s' "$manual_input" | tr ' ' '\n')"
+            ;;
+        *)
+            warn "Invalid choice."; return ;;
+    esac
+
+    [ -n "$issues" ] || { warn "No issues selected."; return; }
+
+    local total
+    total="$(printf '%s\n' "$issues" | grep -c '.' || echo 0)"
+    info "Will resolve $total issue(s) with Claude Code."
+    cmd_resolve $(printf '%s\n' "$issues" | tr '\n' ' ')
+}
+
+# ── Resolve management commands ───────────────────────────────────────────────
+
+cmd_resolve_diff() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl resolve diff <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    local wt="$WORKTREE_PATH"
+    [ -d "$wt" ] || die "Worktree not found: $wt"
+
+    local base="${BASE_REF:-trunk}"
+
+    info "Changes in $BRANCH vs $base:"
+    printf '\n'
+
+    # Show stat summary first
+    git -C "$wt" diff "$base...$BRANCH" --stat 2>/dev/null
+
+    printf '\n'
+
+    # Full diff with color, piped to pager
+    if command -v delta >/dev/null 2>&1; then
+        git -C "$wt" diff "$base...$BRANCH" | delta
+    elif command -v bat >/dev/null 2>&1; then
+        git -C "$wt" diff "$base...$BRANCH" --color=always | bat --style=plain
+    else
+        git -C "$wt" diff "$base...$BRANCH" --color=always | ${PAGER:-less -R}
+    fi
+}
+
+cmd_resolve_ask() {
+    local issue_input="${1:-}"
+    shift || true
+    local message="$*"
+
+    [ -n "$issue_input" ] || die "Usage: swctl resolve ask <issue> \"message\""
+    [ -n "$message" ] || die "Message required.\nUsage: swctl resolve ask <issue> \"explain the changes\""
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+        info "[resolve] Asking Claude (resuming session ${CLAUDE_SESSION_ID:0:8}...):"
+        claude -p "$message" \
+            --resume "$CLAUDE_SESSION_ID" \
+            --permission-mode acceptEdits \
+            --add-dir "$WORKTREE_PATH" \
+            2>/dev/null
+    else
+        info "[resolve] Asking Claude (new session in worktree):"
+        claude -p "$message" \
+            --permission-mode acceptEdits \
+            --add-dir "$WORKTREE_PATH" \
+            2>/dev/null
+    fi
+}
+
+cmd_resolve_chat() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl resolve chat <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    info "[resolve] Opening interactive Claude session for #$ISSUE_ID"
+    info "Worktree: $WORKTREE_PATH"
+    info "Branch: $BRANCH"
+
+    cd "$WORKTREE_PATH" || die "Cannot cd to $WORKTREE_PATH"
+
+    if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+        info "Resuming session ${CLAUDE_SESSION_ID:0:8}..."
+        exec claude --resume "$CLAUDE_SESSION_ID"
+    else
+        info "Starting new session..."
+        exec claude
+    fi
+}
+
+cmd_resolve_pr() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        list)   cmd_resolve_pr_list "$@" ;;
+        view)   cmd_resolve_pr_view "$@" ;;
+        push)   cmd_resolve_pr_push "$@" ;;
+        create) cmd_resolve_pr_create "$@" ;;
+        merge)  cmd_resolve_pr_merge "$@" ;;
+        approve) cmd_resolve_pr_approve "$@" ;;
+        *)      die "Usage: swctl resolve pr [list|view|push|create|merge|approve] [<issue>]" ;;
+    esac
+}
+
+cmd_resolve_pr_list() {
+    local repo="${1:-shopware/shopware}"
+
+    printf '\n%b%-8s %-12s %-50s %-10s%b\n' \
+        "${COLOR_BOLD:-}" "PR" "Issue" "Title" "Status" "${COLOR_RESET:-}"
+    printf '%-8s %-12s %-50s %-10s\n' \
+        "--------" "------------" "--------------------------------------------------" "----------"
+
+    # Scan all resolve instances for branches, check if they have PRs
+    local registry_dir="${SWCTL_REGISTRY_DIR:-$SWCTL_STATE_DIR/instances}"
+    for meta_file in "$registry_dir"/*/*.env; do
+        [ -f "$meta_file" ] || continue
+        (
+            source "$meta_file" 2>/dev/null || exit 0
+            [ -n "${CLAUDE_SESSION_ID:-}" ] || exit 0  # Only resolve sessions
+
+            local pr_info
+            pr_info="$(gh pr list --head "${BRANCH:-}" --repo "$repo" --json number,title,state --jq '.[] | "\(.number)\t\(.title)\t\(.state)"' 2>/dev/null)" || exit 0
+
+            if [ -n "$pr_info" ]; then
+                local pr_num pr_title pr_state
+                pr_num="$(printf '%s' "$pr_info" | cut -f1)"
+                pr_title="$(printf '%s' "$pr_info" | cut -f2 | cut -c1-50)"
+                pr_state="$(printf '%s' "$pr_info" | cut -f3)"
+
+                local sc=""
+                case "$pr_state" in
+                    OPEN)   sc="${COLOR_GREEN:-}" ;;
+                    MERGED) sc="${COLOR_BLUE:-}" ;;
+                    CLOSED) sc="${COLOR_RED:-}" ;;
+                esac
+
+                printf '%-8s %-12s %-50s %b%-10s%b\n' \
+                    "#$pr_num" "#${ISSUE_ID:-}" "$pr_title" "$sc" "$pr_state" "${COLOR_RESET:-}"
+            fi
+        )
+    done
+    printf '\n'
+}
+
+cmd_resolve_pr_view() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl resolve pr view <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    [ -n "${BRANCH:-}" ] || die "No branch found for issue $issue_input"
+
+    gh pr view "$BRANCH" --repo "shopware/shopware" || warn "No PR found for branch $BRANCH"
+}
+
+cmd_resolve_pr_push() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl resolve pr push <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    local wt="$WORKTREE_PATH"
+    [ -d "$wt" ] || die "Worktree not found: $wt"
+
+    info "Pushing $BRANCH to origin..."
+    git -C "$wt" push -u origin "$BRANCH" 2>&1
+    ok "Pushed $BRANCH"
+}
+
+cmd_resolve_pr_create() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl resolve pr create <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    # For plugin-external instances the fix commit lives in the nested
+    # plugin worktree, not the trunk worktree.  Route git operations to
+    # that subdir and derive the repo + base branch from the plugin's own
+    # git remote (trunk is the PLATFORM default, not the plugin's).
+    local git_cwd="$WORKTREE_PATH"
+    if [ "${PROJECT_TYPE:-}" = "plugin-external" ] && [ -n "${PLUGIN_NAME:-}" ]; then
+        git_cwd="$WORKTREE_PATH/custom/plugins/$PLUGIN_NAME"
+    fi
+    [ -d "$git_cwd" ] || die "Worktree git dir not found: $git_cwd"
+
+    # Resolve repo from `origin` remote url (ssh + https forms)
+    local origin_url; origin_url="$(git -C "$git_cwd" remote get-url origin 2>/dev/null || true)"
+    local target_repo="shopware/shopware"
+    if [ -n "$origin_url" ]; then
+        # Strip trailing `.git`, then take the last two path segments.
+        local clean_url="${origin_url%.git}"
+        # shellcheck disable=SC2001
+        clean_url="$(printf '%s' "$clean_url" | sed 's#^git@\([^:]*\):#https://\1/#')"
+        local owner_repo="${clean_url#*github.com/}"
+        # owner/repo is the last two segments
+        target_repo="${owner_repo#*/}"
+        target_repo="${owner_repo%%/*}/${owner_repo##*/}"
+    fi
+    if [ "$target_repo" = "shopware/shopware" ] && [ -n "${PLUGIN_NAME:-}" ]; then
+        target_repo="shopware/$PLUGIN_NAME"
+    fi
+
+    # Resolve base branch from origin/HEAD (falls back to `main` for plugins, `trunk` otherwise)
+    local base_branch
+    base_branch="$(git -C "$git_cwd" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+    if [ -z "$base_branch" ]; then
+        if [ "${PROJECT_TYPE:-}" = "plugin-external" ]; then base_branch="main"; else base_branch="trunk"; fi
+    fi
+
+    # Build the canonical PR title from the original GitHub issue:
+    #   <prefix>: <issue title>     (e.g. "fix: Show configuration …")
+    # Fetch title + labels from GitHub; fall back to the latest commit's
+    # subject if the API isn't reachable.  The default source repo is
+    # shopware/shopware — override via SWCTL_RESOLVE_ISSUE_REPO env var
+    # or by seeding resolve-runs.json (the UI flow does this automatically).
+    local source_repo="${SWCTL_RESOLVE_ISSUE_REPO:-shopware/shopware}"
+    local issue_url="https://github.com/${source_repo}/issues/${ISSUE_ID}"
+    local issue_title="" labels="" prefix="fix"
+    if command -v gh >/dev/null 2>&1; then
+        issue_title="$(gh api "repos/${source_repo}/issues/${ISSUE_ID}" --jq '.title' 2>/dev/null || true)"
+        labels="$(gh api "repos/${source_repo}/issues/${ISSUE_ID}" --jq '.labels[].name' 2>/dev/null || true)"
+    fi
+    [ -n "$labels" ] && prefix="$(resolve_branch_prefix_from_labels "$labels")"
+
+    local title
+    if [ -n "$issue_title" ]; then
+        title="${prefix}: ${issue_title}"
+    else
+        title="$(git -C "$git_cwd" log --format='%s' -1 "$BRANCH" 2>/dev/null || echo "fix: resolve issue #${ISSUE_ID}")"
+    fi
+
+    # Squash every commit on $BRANCH since the merge-base with
+    # origin/$base_branch into a single commit with the canonical title.
+    local merge_base
+    merge_base="$(git -C "$git_cwd" merge-base HEAD "origin/$base_branch" 2>/dev/null || git -C "$git_cwd" rev-list --max-parents=0 HEAD | tail -1)"
+    if [ -n "$merge_base" ]; then
+        local commit_count
+        commit_count="$(git -C "$git_cwd" rev-list --count "${merge_base}..HEAD" 2>/dev/null || echo 0)"
+        if [ "$commit_count" -gt 1 ]; then
+            info "Squashing ${commit_count} commits since ${merge_base:0:7} into one."
+            git -C "$git_cwd" reset --soft "$merge_base" || die "reset --soft failed"
+        fi
+        # Re-commit with the canonical title (amend if we didn't reset).
+        if [ "${commit_count:-0}" -gt 1 ]; then
+            git -C "$git_cwd" commit --allow-empty -m "$title" >/dev/null \
+                || die "commit failed after squash"
+        else
+            git -C "$git_cwd" commit --allow-empty --amend -m "$title" >/dev/null \
+                || die "commit --amend failed"
+        fi
+    else
+        warn "Could not resolve merge-base with origin/${base_branch}; skipping squash."
+    fi
+
+    # Force-push the rewritten branch.
+    info "Pushing ${BRANCH} (force-with-lease) from $git_cwd..."
+    git -C "$git_cwd" push --force-with-lease -u origin "$BRANCH" 2>&1
+
+    info "Creating draft PR on $target_repo (base: $base_branch)..."
+    # Link back to the original issue.  For plugin-external runs this
+    # is typically a cross-repo reference (fix is in shopware/<plugin>
+    # but the issue lives on shopware/shopware), so use the full
+    # owner/repo#N form when the source differs from the target.  GitHub
+    # will render the link in the issue's timeline even though cross-repo
+    # auto-close is not supported.
+    local link_ref
+    if [ "$source_repo" = "$target_repo" ]; then
+        link_ref="#${ISSUE_ID}"
+    else
+        link_ref="${source_repo}#${ISSUE_ID}"
+    fi
+
+    # Body precedence:
+    #   1. /tmp/pr-body.md if the resolve skill's Step 7 wrote one.
+    #   2. On-the-fly generation via `claude -p` (Shopware #16215 style).
+    #   3. Minimal fallback: Fixes link + attribution.
+    local body_file="/tmp/pr-body-${ISSUE_ID}-$$.md"
+    local body_source="fallback"
+    local fallback_body
+    # shellcheck disable=SC2016 # backticks here are literal markdown, not command sub
+    fallback_body="$(printf 'Fixes %s\n\nCreated by `swctl resolve`.\n' "$link_ref")"
+
+    if [ -s "/tmp/pr-body.md" ]; then
+        local skill_body
+        skill_body="$(cat /tmp/pr-body.md)"
+        if printf '%s' "$skill_body" | grep -qF "Fixes ${link_ref}"; then
+            printf '%s\n' "$skill_body" > "$body_file"
+            body_source="skill (/tmp/pr-body.md)"
+        elif [ -n "$skill_body" ]; then
+            printf '%s\n\nFixes %s\n' "$skill_body" "$link_ref" > "$body_file"
+            body_source="skill + Fixes inject"
+        fi
+    fi
+
+    if [ "$body_source" = "fallback" ] && command -v claude >/dev/null 2>&1; then
+        local issue_body diff_ctx generated prompt
+        issue_body="$(gh api "repos/${source_repo}/issues/${ISSUE_ID}" --jq '.body' 2>/dev/null || true)"
+        diff_ctx="$( { git -C "$git_cwd" diff --stat "origin/${base_branch}..HEAD"; echo '---'; git -C "$git_cwd" diff "origin/${base_branch}..HEAD"; } 2>/dev/null | head -c 20000)"
+        prompt="$(cat <<PROMPT
+You are generating a GitHub pull-request body. Follow the EXACT structure used in Shopware core PRs (example: https://github.com/shopware/shopware/pull/16215):
+
+## Summary
+- <1-3 bullets>
+
+Fixes ${link_ref}
+
+## Root cause
+<1 short paragraph>
+
+## Reproduction
+1. <step>
+
+## Test plan
+- [ ] <check>
+
+## Flow Builder Impact
+<"None — …" or list>
+
+RULES:
+- Respond with ONLY the markdown body. No preamble, no code fences around the output.
+- Do NOT invent reproduction steps — extract them from the issue body when present.
+- Keep each section terse; the whole body should fit in ~40 lines.
+
+INPUTS:
+
+### Issue
+Title: ${issue_title:-unknown}
+Body:
+${issue_body:-(not available)}
+
+### PR title
+${title}
+
+### Diff (stat + patch, truncated)
+${diff_ctx:-(no diff)}
+PROMPT
+)"
+        generated="$(printf '%s' "$prompt" | claude -p --output-format text --allowedTools "" 2>/dev/null || true)"
+        if [ -n "$generated" ] && printf '%s' "$generated" | grep -qF "Fixes ${link_ref}" && printf '%s' "$generated" | grep -qE '^##[[:space:]]+' ; then
+            printf '%s\n' "$generated" > "$body_file"
+            body_source="generated"
+        fi
+    fi
+
+    if [ ! -s "$body_file" ]; then
+        printf '%s\n' "$fallback_body" > "$body_file"
+    fi
+
+    info "PR body source: ${body_source}"
+    gh pr create \
+        --repo "$target_repo" \
+        --base "$base_branch" \
+        --head "$BRANCH" \
+        --title "$title" \
+        --body-file "$body_file" \
+        --assignee @me \
+        --draft \
+        2>&1
+
+    rm -f "$body_file"
+
+    ok "Draft PR created for #$ISSUE_ID"
+}
+
+cmd_resolve_pr_merge() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl resolve pr merge <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    [ -n "${BRANCH:-}" ] || die "No branch for $issue_input"
+
+    info "Merging PR for $BRANCH..."
+    gh pr merge "$BRANCH" --repo "shopware/shopware" --squash --delete-branch 2>&1
+    ok "PR merged for #$ISSUE_ID"
+}
+
+cmd_resolve_pr_approve() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl resolve pr approve <issue>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file=""
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
+    load_instance_metadata "$meta_file"
+
+    [ -n "${BRANCH:-}" ] || die "No branch for $issue_input"
+
+    info "Approving PR for $BRANCH..."
+    gh pr review "$BRANCH" --repo "shopware/shopware" --approve 2>&1
+    ok "PR approved for #$ISSUE_ID"
+}
+
+# ── Resolve TUI management dashboard ────────────────────────────────────────
+
+tui_resolve_manage_flow() {
+    local scope="all"
+    maybe_load_project_config >/dev/null 2>&1 && scope="project"
+
+    local issue_input=""
+    issue_input="$(select_issue_prompt "$scope" || true)"
+    [ -n "$issue_input" ] || { warn "No issue selected."; return; }
+
+    printf '\n'
+    printf '  Actions for #%s:\n' "$issue_input"
+    printf '  [d] View diff          [a] Ask Claude\n'
+    printf '  [c] Chat (interactive) [s] Resolve status\n'
+    printf '  [p] Push branch        [r] Create PR\n'
+    printf '  [v] View PR            [m] Merge PR\n'
+    printf '  [A] Approve PR         [q] Back\n'
+    printf '\n  Choice: '
+
+    local action=""
+    read -r -n 1 action
+    printf '\n'
+
+    case "$action" in
+        d) cmd_resolve_diff "$issue_input" ;;
+        a)
+            local msg=""
+            msg="$(prompt_text "Ask Claude about this issue")"
+            [ -n "$msg" ] && cmd_resolve_ask "$issue_input" "$msg"
+            ;;
+        c) cmd_resolve_chat "$issue_input" ;;
+        s) render_resolve_status ;;
+        p) cmd_resolve_pr_push "$issue_input" ;;
+        r) cmd_resolve_pr_create "$issue_input" ;;
+        v) cmd_resolve_pr_view "$issue_input" ;;
+        m) cmd_resolve_pr_merge "$issue_input" ;;
+        A) cmd_resolve_pr_approve "$issue_input" ;;
+        q|*) return ;;
+    esac
+}
+
+# ── End Claude Code resolve integration ──────────────────────────────────────
 
 main() {
     local command="${1:-help}"
@@ -5068,6 +6504,20 @@ main() {
             shift
             cmd_code "$@"
             ;;
+        resolve)
+            ensure_state_dirs
+            shift
+            case "${1:-}" in
+                resume) shift; cmd_resolve_resume "$@" ;;
+                status) render_resolve_status ;;
+                diff)   shift; cmd_resolve_diff "$@" ;;
+                ask)    shift; cmd_resolve_ask "$@" ;;
+                chat)   shift; cmd_resolve_chat "$@" ;;
+                pr)     shift; cmd_resolve_pr "$@" ;;
+                manage) shift; tui_resolve_manage_flow ;;
+                *)      cmd_resolve "$@" ;;
+            esac
+            ;;
         switch)
             ensure_state_dirs
             shift
@@ -5090,6 +6540,14 @@ main() {
             ensure_state_dirs
             shift
             cmd_ui "${1:-start}"
+            ;;
+        skill)
+            shift
+            cmd_skill "$@"
+            ;;
+        mcp)
+            shift
+            cmd_mcp "$@"
             ;;
         build-base)
             ensure_state_dirs

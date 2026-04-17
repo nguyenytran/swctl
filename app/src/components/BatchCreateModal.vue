@@ -292,6 +292,9 @@ async function fetchFromGitHub() {
   try {
     // Ensure instances are loaded so we can cross-reference existing worktrees
     await refreshInstances()
+    // Batch-create shows everything the user is assigned to. Label-based
+    // narrowing is the Resolve page's concern — batch-create is for bulk
+    // operations (stop/start/delete/create) where exhaustive lists help.
     const result = await fetchGitHubIssues()
     ghFetched.value = true
     if (result.rateLimit) ghRateLimit.value = result.rateLimit

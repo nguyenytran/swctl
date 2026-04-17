@@ -57,6 +57,10 @@ export function readAllInstances() {
           platformIssueId: m.PLATFORM_ISSUE_ID || '',
           status: m.STATUS || 'complete',
           failedAt: m.FAILED_AT || '',
+          claudeSessionId: m.CLAUDE_SESSION_ID || '',
+          claudeResolveStatus: m.CLAUDE_RESOLVE_STATUS || '',
+          claudeResolveStep: m.CLAUDE_RESOLVE_STEP || '',
+          claudeResolveCost: m.CLAUDE_RESOLVE_COST || '0',
           changes: {
             migration: parseInt(m.MIGRATION_CHANGES) || 0,
             entity: parseInt(m.ENTITY_CHANGES) || 0,

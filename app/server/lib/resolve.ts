@@ -1,0 +1,1480 @@
+import fs from 'fs'
+import path from 'path'
+import crypto from 'crypto'
+import { execSync } from 'child_process'
+import type { Context } from 'hono'
+import { streamSSE } from 'hono/streaming'
+import { spawn } from 'child_process'
+import { streamSpawn, spawnSwctl } from './stream.js'
+import { readAllInstances } from './metadata.js'
+import { readProjects } from './projects.js'
+import { emit } from './events.js'
+
+const STATE_DIR = process.env.SWCTL_STATE_DIR || ''
+const RUNS_FILE = STATE_DIR ? path.join(STATE_DIR, 'resolve-runs.json') : ''
+
+export interface ResolveRun {
+  issue: string
+  project?: string
+  mode?: string
+  startedAt: string
+  finishedAt?: string
+  status: 'running' | 'done' | 'failed'
+  exitCode?: number
+}
+
+function readRuns(): ResolveRun[] {
+  if (!RUNS_FILE || !fs.existsSync(RUNS_FILE)) return []
+  try {
+    return JSON.parse(fs.readFileSync(RUNS_FILE, 'utf-8'))
+  } catch {
+    return []
+  }
+}
+
+function writeRuns(runs: ResolveRun[]): void {
+  if (!RUNS_FILE) return
+  try {
+    fs.mkdirSync(path.dirname(RUNS_FILE), { recursive: true })
+    fs.writeFileSync(RUNS_FILE, JSON.stringify(runs.slice(0, 20), null, 2))
+  } catch (err) {
+    console.warn('[resolve] failed to write runs file:', err)
+  }
+}
+
+export function listResolveRuns(): ResolveRun[] {
+  return readRuns()
+}
+
+function recordStart(run: Omit<ResolveRun, 'startedAt' | 'status'>): void {
+  const runs = readRuns()
+  runs.unshift({ ...run, startedAt: new Date().toISOString(), status: 'running' })
+  writeRuns(runs)
+}
+
+function recordFinish(issue: string, exitCode: number): void {
+  const runs = readRuns()
+  const idx = runs.findIndex(r => r.issue === issue && r.status === 'running')
+  if (idx >= 0) {
+    runs[idx] = {
+      ...runs[idx],
+      status: exitCode === 0 ? 'done' : 'failed',
+      exitCode,
+      finishedAt: new Date().toISOString(),
+    }
+    writeRuns(runs)
+  }
+}
+
+/**
+ * Normalise a string to an alpha-numeric lowercase slug so plugin names
+ * ("SwagCustomizedProducts"), extension labels ("Custom-Products") and
+ * user input can all be compared loosely.
+ */
+function normSlug(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
+/**
+ * Read the swctl GitHub token written by `swctl auth login` (same file used
+ * by the Resolve form's issue picker). Returns the empty string if absent.
+ */
+function readSwctlGithubToken(): string {
+  const stateDir = process.env.SWCTL_STATE_DIR || ''
+  if (!stateDir) return process.env.GITHUB_TOKEN || process.env.GH_TOKEN || ''
+  try {
+    const p = path.join(stateDir, 'github.token')
+    return fs.readFileSync(p, 'utf-8').trim()
+  } catch {
+    return process.env.GITHUB_TOKEN || process.env.GH_TOKEN || ''
+  }
+}
+
+/**
+ * Fetch an issue's labels directly from the GitHub REST API using swctl's
+ * stored token. We avoid `gh` CLI here because its auth in the container
+ * can drift out of sync with the host's; swctl's own token is already
+ * maintained by the UI's auth flow.
+ *
+ * Returns an empty array on any failure so the caller can just fall through
+ * to platform-scope defaults.
+ */
+async function fetchIssueLabels(issueRef: string): Promise<string[]> {
+  const info = await fetchIssueInfo(issueRef)
+  return info?.labels || []
+}
+
+/**
+ * Fetch full issue info from GitHub: title + labels + html_url.  Used by
+ * the PR-create flow to build a squashed commit message and to persist
+ * the source repo in instance metadata.  Returns null on any failure.
+ */
+export async function fetchIssueInfo(issueRef: string): Promise<{
+  owner: string; repo: string; number: string; title: string; labels: string[]; htmlUrl: string
+} | null> {
+  let owner = 'shopware', repo = 'shopware', num = ''
+  const urlMatch = issueRef.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/)
+  const refMatch = issueRef.match(/^([^/]+)\/([^/#]+)#(\d+)$/)
+  const numMatch = issueRef.match(/^(\d+)$/)
+  if (urlMatch) { owner = urlMatch[1]; repo = urlMatch[2]; num = urlMatch[3] }
+  else if (refMatch) { owner = refMatch[1]; repo = refMatch[2]; num = refMatch[3] }
+  else if (numMatch) { num = numMatch[1] }
+  else return null
+
+  const token = readSwctlGithubToken()
+  if (!token) return null
+
+  try {
+    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/issues/${num}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    })
+    if (!res.ok) return null
+    const data = await res.json() as { title?: string; labels?: Array<{ name?: string }>; html_url?: string }
+    return {
+      owner, repo, number: num,
+      title: data.title || '',
+      labels: (data.labels || []).map((l) => l?.name || '').filter(Boolean),
+      htmlUrl: data.html_url || `https://github.com/${owner}/${repo}/issues/${num}`,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Split an extension label on non-alphanumerics and return the lowercase
+ * words (length ≥ 3 to skip noise like "a", "of").
+ */
+function labelWords(label: string): string[] {
+  return label.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3)
+}
+
+/**
+ * Pick a conventional-commit branch prefix (fix / feat / chore) from an
+ * issue's labels. Defaults to "fix" because Shopware issues skew toward
+ * bug reports.
+ */
+export function branchPrefixFromLabels(labels: string[]): 'fix' | 'feat' | 'chore' {
+  const lower = labels.map((l) => l.toLowerCase())
+  const has = (...needles: string[]) =>
+    lower.some((l) => needles.some((n) => l === n || l.endsWith('/' + n) || l.includes(n)))
+
+  // Feature / enhancement indicators
+  if (has('feature', 'enhancement', 'new feature', 'improvement')) return 'feat'
+  // Non-functional / maintenance indicators
+  if (has('refactor', 'chore', 'docs', 'documentation', 'tech debt', 'cleanup', 'tooling', 'ci')) return 'chore'
+  // Default to bug-fix
+  return 'fix'
+}
+
+/**
+ * Given a set of issue labels, return the first registered plugin-external
+ * project whose name fuzzy-matches an `extension/<slug>` label. Returns null
+ * when the issue is platform-scoped.
+ *
+ * Matching rule: split the label into words (e.g. "Custom-Products" →
+ * ["custom", "products"]) and require every word to appear as a substring of
+ * the plugin name (case-insensitive). This handles "Custom-Products" →
+ * "SwagCustomizedProducts" (both "custom" and "products" are present).
+ */
+export function detectPluginScopeFromLabels(labels: string[]): string | null {
+  const plugins = readProjects().filter((p) => p.type === 'plugin-external').map((p) => p.name)
+  if (plugins.length === 0) return null
+
+  // Rank candidates by word count so multi-word labels beat single-word ones,
+  // and longer matches win ties deterministically.
+  const candidates: Array<{ plugin: string; score: number }> = []
+
+  for (const label of labels) {
+    const m = label.match(/^extension\/(.+)$/i)
+    if (!m) continue
+    const words = labelWords(m[1])
+    if (words.length === 0) continue
+
+    for (const plugin of plugins) {
+      const target = plugin.toLowerCase()
+      if (words.every((w) => target.includes(w))) {
+        candidates.push({ plugin, score: words.join('').length })
+      }
+    }
+  }
+
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => b.score - a.score)
+  return candidates[0].plugin
+}
+
+/**
+ * Generate a RFC4122 v4 UUID for Claude Code's `--session-id`.  Claude
+ * Code validates the format (UUID with dashes) and rejects anything else.
+ */
+function newSessionId(): string {
+  // Node 18+ has randomUUID; fallback to crypto.randomBytes-based hex if not.
+  const anyCrypto = crypto as unknown as { randomUUID?: () => string }
+  if (typeof anyCrypto.randomUUID === 'function') return anyCrypto.randomUUID()
+  const b = crypto.randomBytes(16)
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = b.toString('hex')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+/**
+ * Locate the instance's env file by issueId.  Returns null if not found.
+ * Metadata lives at `~/.local/state/swctl/instances/<projectSlug>/<id>.env`.
+ */
+function findInstanceEnvFile(issueId: string): string | null {
+  if (!STATE_DIR) return null
+  const instancesDir = path.join(STATE_DIR, 'instances')
+  if (!fs.existsSync(instancesDir)) return null
+  for (const project of fs.readdirSync(instancesDir)) {
+    const candidate = path.join(instancesDir, project, `${issueId}.env`)
+    if (fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+/**
+ * Atomically patch CLAUDE_* fields in an instance env file.  Replaces
+ * existing lines in place; leaves unrelated lines untouched.
+ */
+function patchResolveMetadata(
+  issueId: string,
+  patch: Partial<{
+    CLAUDE_SESSION_ID: string
+    CLAUDE_RESOLVE_STATUS: string
+    CLAUDE_RESOLVE_STEP: string
+    CLAUDE_RESOLVE_STARTED: string
+    CLAUDE_RESOLVE_COST: string
+  }>,
+): void {
+  const f = findInstanceEnvFile(issueId)
+  if (!f) return
+  let content: string
+  try { content = fs.readFileSync(f, 'utf-8') } catch { return }
+
+  for (const [key, rawValue] of Object.entries(patch)) {
+    if (rawValue == null) continue
+    // Match the swctl shell-quoting convention: printf '%q' on bash tends
+    // to output unquoted-if-safe, quoted-if-not.  We just wrap in single
+    // quotes and escape embedded single quotes — enough for our values.
+    const quoted = `'${String(rawValue).replace(/'/g, `'\\''`)}'`
+    const line = `${key}=${quoted}`
+    const re = new RegExp(`^${key}=.*$`, 'm')
+    if (re.test(content)) {
+      content = content.replace(re, line)
+    } else {
+      // Append if missing (older env files might not have the field)
+      content = content.replace(/\s*$/, '') + '\n' + line + '\n'
+    }
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(f), { recursive: true })
+    fs.writeFileSync(f, content, 'utf-8')
+  } catch (err) {
+    console.warn('[resolve] failed to patch metadata:', err)
+  }
+}
+
+/**
+ * Lightweight SSE-side stream parser.  Called on each log line we forward
+ * to the browser.  Accumulates the last-completed step number and any
+ * session id Claude reports (used as fallback when our preassigned id
+ * is unknown).  Also tracks final cost from the terminal `result` event.
+ */
+interface ResolveStreamState {
+  sessionId: string
+  lastCompletedStep: number
+  cost: number
+}
+
+function observeStreamLine(state: ResolveStreamState, raw: string): void {
+  const trimmed = (raw || '').trim()
+  if (!trimmed.startsWith('{')) {
+    // Plain text line — may carry a step END marker (swctl-forwarded)
+    const m = trimmed.match(/^###\s*STEP\s+(\d)\s+END\b/i)
+    if (m) state.lastCompletedStep = Math.max(state.lastCompletedStep, parseInt(m[1], 10))
+    return
+  }
+  let ev: any
+  try { ev = JSON.parse(trimmed) } catch { return }
+
+  if (ev.type === 'system' && typeof ev.session_id === 'string') {
+    if (!state.sessionId) state.sessionId = ev.session_id
+  }
+
+  if (ev.type === 'assistant' && ev.message?.content) {
+    const blocks = Array.isArray(ev.message.content) ? ev.message.content : []
+    for (const b of blocks) {
+      if (b?.type === 'text' && typeof b.text === 'string') {
+        const matches = b.text.matchAll(/###\s*STEP\s+(\d)\s+END\b/gi)
+        for (const m of matches) {
+          state.lastCompletedStep = Math.max(state.lastCompletedStep, parseInt(m[1], 10))
+        }
+      }
+    }
+  }
+
+  if (ev.type === 'result') {
+    if (typeof ev.total_cost_usd === 'number') state.cost = ev.total_cost_usd
+  }
+}
+
+/**
+ * Spawn Claude Code non-interactively with the shopware-resolve skill and
+ * stream its output back to the caller via SSE.
+ *
+ * Before launching Claude, creates a worktree for the issue (if one doesn't
+ * already exist) so the instance appears in the Dashboard and Detail view.
+ */
+export function startResolveStream(
+  c: Context,
+  params: { issue: string; project?: string; mode?: 'qa' | 'dev' },
+) {
+  const { issue, project, mode } = params
+  const home = process.env.HOME || '/root'
+
+  // Extract issue number from URL or raw number
+  const issueMatch = issue.match(/\/issues\/(\d+)/) || issue.match(/^(\d+)$/)
+  const issueId = issueMatch ? issueMatch[1] : issue.replace(/\D/g, '')
+
+  // The skill's own SKILL.md carries the ground rules, per-step artifact
+  // requirements, and stop criterion — see
+  // `skills/shopware-resolve/SKILL.md` "Ground rules" / "Required
+  // artifact per step" sections.  All three entry points (swctl UI,
+  // swctl CLI, direct `claude /shopware-resolve`) use those same rules,
+  // so we keep this prompt minimal: just the slash command + the
+  // explicit issue id for Step 5.
+  const prompt = `/shopware-resolve ${issue}\n\n(issue id for Step 5 swctl refresh: ${issueId})`
+
+  recordStart({ issue, project, mode })
+
+  const streamId = `resolve:${issue}`
+
+  // Stream SSE: first create worktree, then launch Claude
+  return streamSSE(c, async (stream) => {
+    const sendEvent = async (event: string, data: object) => {
+      try { await stream.writeSSE({ event, data: JSON.stringify(data) }) } catch {}
+    }
+
+    // Step 1: Check if worktree already exists
+    const existing = readAllInstances().find((i: any) => i.issueId === issueId)
+
+    // If an instance exists, do a sanity-check: does its scope match what we
+    // would have detected from the issue's labels? If not, warn the user and
+    // refuse to proceed — this is usually a stale instance created before
+    // the label-based scope detection worked.
+    if (existing && !project) {
+      try {
+        const labels = await fetchIssueLabels(issue)
+        const detected = labels.length > 0 ? detectPluginScopeFromLabels(labels) : null
+        const actualPlugin: string = (existing as any).pluginName || ''
+        if (detected && detected !== actualPlugin) {
+          await sendEvent('log', { line: `[scope] existing instance is scoped to ${actualPlugin || 'platform/trunk'} but the issue labels point at ${detected}`, ts: Date.now() })
+          await sendEvent('log', { line: `[scope] this is likely a stale instance — run 'swctl clean ${issueId}' and retry to recreate with the correct plugin scope`, ts: Date.now() })
+          await sendEvent('done', { exitCode: 1, elapsed: 0 })
+          return
+        }
+      } catch {
+        // best-effort check; don't block if detection fails
+      }
+    }
+
+    if (!existing) {
+      await sendEvent('log', { line: `[swctl] Creating worktree for #${issueId}...`, ts: Date.now() })
+
+      // Fetch labels once and reuse for scope detection + branch prefix.
+      const labels = await fetchIssueLabels(issue)
+      if (labels.length > 0) {
+        await sendEvent('log', { line: `[scope] issue labels: ${labels.join(', ')}`, ts: Date.now() })
+      } else {
+        await sendEvent('log', { line: `[scope] couldn't fetch issue labels → defaulting to platform scope + fix/ branch prefix`, ts: Date.now() })
+      }
+
+      // --- Scope detection ---
+      let effectiveProject = project
+      if (!effectiveProject) {
+        const detected = labels.length > 0 ? detectPluginScopeFromLabels(labels) : null
+        if (detected) {
+          effectiveProject = detected
+          await sendEvent('log', { line: `[scope] plugin detected from labels → ${detected}`, ts: Date.now() })
+        } else if (labels.length > 0) {
+          await sendEvent('log', { line: `[scope] no extension/* label matched a registered plugin → platform scope`, ts: Date.now() })
+        }
+      } else {
+        await sendEvent('log', { line: `[scope] using user-provided project: ${effectiveProject}`, ts: Date.now() })
+      }
+
+      // --- Branch prefix from issue type ---
+      const prefix = branchPrefixFromLabels(labels)
+      await sendEvent('log', { line: `[branch] prefix from labels → ${prefix}/`, ts: Date.now() })
+
+      const branchName = `${prefix}/${issueId}`
+      const createArgs: string[] = ['create']
+      // qa mode is the default for resolve (read-only skim); user can override with "dev"
+      if (mode !== 'dev') createArgs.push('--qa')
+      // --no-provision defers the heavy work (Docker container, DB clone,
+      // Shopware install) until Claude's Step 5 calls `swctl_setup`.  The
+      // lightweight git worktree is ready for code edits in ~5s.
+      createArgs.push('--no-provision')
+      // Pass --project for plugin-external / non-default projects.  swctl
+      // already knows the plugin name from the registered project metadata,
+      // so we only pass --project.  (Passing --plugin too is rejected by
+      // swctl as "--plugin can only be used with a platform project".)
+      if (effectiveProject && effectiveProject !== 'trunk') {
+        createArgs.push('--project', effectiveProject)
+      }
+      createArgs.push(issueId, branchName)
+      await sendEvent('log', { line: `[swctl] swctl ${createArgs.join(' ')}`, ts: Date.now() })
+      const result = await spawnSwctl(createArgs)
+
+      if (result.ok) {
+        await sendEvent('log', { line: `[swctl] Worktree ready.`, ts: Date.now() })
+        emit({ type: 'instance-changed' })
+      } else {
+        // Abort the resolve — launching Claude against a missing worktree only
+        // results in a confusing "done exit 0" run with nothing to show for it.
+        await sendEvent('log', { line: `[swctl] Worktree creation FAILED — aborting resolve.`, ts: Date.now() })
+        for (const line of result.output.split('\n').slice(-10)) {
+          if (line.trim()) await sendEvent('log', { line: `[swctl] ${line}`, ts: Date.now() })
+        }
+        await sendEvent('done', { exitCode: 1, elapsed: 0 })
+        return
+      }
+    } else {
+      await sendEvent('log', { line: `[swctl] Worktree already exists for #${issueId}.`, ts: Date.now() })
+    }
+
+    // Step 2: Resolve worktree path for Claude
+    const instance = readAllInstances().find((i: any) => i.issueId === issueId)
+    const worktreePath = instance?.worktreePath || home
+
+    await sendEvent('log', { line: `[claude] Starting /shopware-resolve ${issue}`, ts: Date.now() })
+
+    // Step 3: Launch Claude Code
+    //
+    // Non-interactive runs need every tool Claude will use to be allow-listed
+    // up-front — otherwise `Bash(gh …)`, `Bash(git commit …)`, etc. sit
+    // waiting for a human approval that never comes.  We can't use
+    // `--permission-mode bypassPermissions` because Claude Code refuses that
+    // when run as root (which is how the swctl-ui container runs its node
+    // process).  `--allowedTools` has no such root check.
+    //
+    // `--effort max` gives each turn the widest thinking budget so the skill
+    // has room to actually execute every step instead of rushing to a summary.
+    const allowedTools = [
+      'Bash', 'Edit', 'Write', 'Read', 'Grep', 'Glob',
+      'Task', 'WebFetch', 'WebSearch', 'TodoWrite',
+    ].join(' ')
+    // Pre-assign a session id so we can `claude --resume <uuid>` later
+    // from the /api/skill/resolve/resume/stream endpoint.
+    const sessionId = newSessionId()
+    const claudeArgs = [
+      '-p', prompt,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--permission-mode', 'acceptEdits',
+      '--allowedTools', allowedTools,
+      '--session-id', sessionId,
+      '--effort', 'max',
+      '--add-dir', worktreePath,
+    ]
+
+    // Persist the session id + running status up-front so a crash/abort
+    // still leaves something the UI can resume from.
+    patchResolveMetadata(issueId, {
+      CLAUDE_SESSION_ID: sessionId,
+      CLAUDE_RESOLVE_STATUS: 'running',
+      CLAUDE_RESOLVE_STEP: '0',
+      CLAUDE_RESOLVE_STARTED: new Date().toISOString(),
+    })
+
+    const startTime = Date.now()
+    const child = spawn('claude', claudeArgs, {
+      cwd: worktreePath,
+      env: { ...process.env, HOME: home, TERM: 'dumb' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    const streamState: ResolveStreamState = {
+      sessionId,
+      lastCompletedStep: 0,
+      cost: 0,
+    }
+
+    const onData = (chunk: Buffer) => {
+      for (const line of chunk.toString().split('\n')) {
+        if (line) {
+          observeStreamLine(streamState, line)
+          sendEvent('log', { line, ts: Date.now() })
+        }
+      }
+    }
+
+    child.stdout!.on('data', onData)
+    child.stderr!.on('data', onData)
+
+    stream.onAbort(() => { child.kill() })
+
+    await new Promise<void>((resolve) => {
+      child.on('close', (code) => {
+        const exitCode = code || 0
+        // Persist final state so the UI can render a Resume card and
+        // `swctl resolve resume <id>` picks up the same session.
+        patchResolveMetadata(issueId, {
+          CLAUDE_SESSION_ID: streamState.sessionId || sessionId,
+          CLAUDE_RESOLVE_STATUS: exitCode === 0 ? 'done' : 'failed',
+          CLAUDE_RESOLVE_STEP: String(streamState.lastCompletedStep),
+          CLAUDE_RESOLVE_COST: String(streamState.cost),
+        })
+        emit({ type: 'instance-changed' })
+        sendEvent('done', {
+          exitCode,
+          elapsed: Date.now() - startTime,
+          sessionId: streamState.sessionId || sessionId,
+          lastCompletedStep: streamState.lastCompletedStep,
+        }).then(resolve)
+      })
+      child.on('error', (err) => {
+        patchResolveMetadata(issueId, {
+          CLAUDE_RESOLVE_STATUS: 'failed',
+          CLAUDE_RESOLVE_STEP: String(streamState.lastCompletedStep),
+        })
+        sendEvent('error', { message: err.message })
+          .then(resolve)
+      })
+    })
+  })
+}
+
+/**
+ * Resume a previous resolve run for an issue.  Requires the instance env
+ * file to carry a `CLAUDE_SESSION_ID` (written by `startResolveStream`
+ * on any prior attempt).  Builds a continuation prompt that points
+ * Claude at the step to pick up from and streams the output the same way
+ * as a fresh run.
+ */
+export function startResolveResumeStream(
+  c: Context,
+  params: { issueId: string },
+) {
+  const { issueId } = params
+  const home = process.env.HOME || '/root'
+
+  const envFile = findInstanceEnvFile(issueId)
+  if (!envFile) {
+    return c.json({ error: `No instance found for ${issueId}` }, 404)
+  }
+
+  // Read CLAUDE_* + WORKTREE_PATH from env file
+  const env = fs.readFileSync(envFile, 'utf-8')
+  const read = (k: string) => {
+    const m = env.match(new RegExp(`^${k}=(.*)$`, 'm'))
+    if (!m) return ''
+    // Strip surrounding single quotes if present
+    return m[1].replace(/^'([\s\S]*)'$/, '$1').replace(/\\''/g, "'")
+  }
+  const sessionId = read('CLAUDE_SESSION_ID')
+  const worktreePath = read('WORKTREE_PATH') || home
+  const lastStepStr = read('CLAUDE_RESOLVE_STEP')
+  const lastStep = parseInt(lastStepStr, 10) || 0
+  const nextStep = Math.min(lastStep + 1, 8)
+
+  if (!sessionId) {
+    return c.json({ error: `No Claude session recorded for ${issueId}. Run a fresh resolve first.` }, 400)
+  }
+
+  // The skill's SKILL.md already carries the ground rules; the resumed
+  // session still has them in context from the original run.  Keep the
+  // continuation prompt a single sentence.
+  const prompt =
+    `Continue the previous /shopware-resolve run. You stopped after Step ${lastStep}. ` +
+    `Pick up at Step ${nextStep} now, following the same ground rules from the skill.`
+
+  return streamSSE(c, async (stream) => {
+    const sendEvent = async (event: string, data: object) => {
+      try { await stream.writeSSE({ event, data: JSON.stringify(data) }) } catch {}
+    }
+
+    await sendEvent('log', { line: `[resume] Continuing session ${sessionId.slice(0, 8)}... from Step ${nextStep}`, ts: Date.now() })
+
+    const allowedTools = [
+      'Bash', 'Edit', 'Write', 'Read', 'Grep', 'Glob',
+      'Task', 'WebFetch', 'WebSearch', 'TodoWrite',
+    ].join(' ')
+    const claudeArgs = [
+      '-p', prompt,
+      '--resume', sessionId,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--permission-mode', 'acceptEdits',
+      '--allowedTools', allowedTools,
+      '--effort', 'max',
+      '--add-dir', worktreePath,
+    ]
+
+    patchResolveMetadata(issueId, {
+      CLAUDE_RESOLVE_STATUS: 'running',
+    })
+
+    const startTime = Date.now()
+    const child = spawn('claude', claudeArgs, {
+      cwd: worktreePath,
+      env: { ...process.env, HOME: home, TERM: 'dumb' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    const streamState: ResolveStreamState = {
+      sessionId,
+      lastCompletedStep: lastStep,
+      cost: 0,
+    }
+
+    const onData = (chunk: Buffer) => {
+      for (const line of chunk.toString().split('\n')) {
+        if (line) {
+          observeStreamLine(streamState, line)
+          sendEvent('log', { line, ts: Date.now() })
+        }
+      }
+    }
+
+    child.stdout!.on('data', onData)
+    child.stderr!.on('data', onData)
+
+    stream.onAbort(() => { child.kill() })
+
+    await new Promise<void>((resolve) => {
+      child.on('close', (code) => {
+        const exitCode = code || 0
+        patchResolveMetadata(issueId, {
+          CLAUDE_SESSION_ID: streamState.sessionId || sessionId,
+          CLAUDE_RESOLVE_STATUS: exitCode === 0 ? 'done' : 'failed',
+          CLAUDE_RESOLVE_STEP: String(streamState.lastCompletedStep),
+          CLAUDE_RESOLVE_COST: String(streamState.cost),
+        })
+        emit({ type: 'instance-changed' })
+        sendEvent('done', {
+          exitCode,
+          elapsed: Date.now() - startTime,
+          sessionId: streamState.sessionId || sessionId,
+          lastCompletedStep: streamState.lastCompletedStep,
+        }).then(resolve)
+      })
+      child.on('error', (err) => {
+        patchResolveMetadata(issueId, {
+          CLAUDE_RESOLVE_STATUS: 'failed',
+        })
+        sendEvent('error', { message: err.message }).then(resolve)
+      })
+    })
+  })
+}
+
+/**
+ * Called by the UI after it receives the SSE 'done' event. Updates the
+ * resolve-runs state file with the final status. Idempotent.
+ */
+export function finishResolveRun(issue: string, exitCode: number): void {
+  recordFinish(issue, exitCode)
+}
+
+/**
+ * Resume a Claude session for an issue and stream a follow-up question —
+ * typically from the Diff tab's review widget.  Unlike the old minimal
+ * version, this path uses the same guardrails as the main resolve
+ * stream (tool allowlist + --effort max) AND brackets the Claude run
+ * with head-sha checks so the UI can tell whether a commit actually
+ * landed or Claude just described what it would do.
+ */
+export function askResolveStream(
+  c: Context,
+  params: { issueId: string; message: string },
+) {
+  const { issueId, message } = params
+  const instance = findInstance(issueId)
+  if (!instance) {
+    return c.json({ error: `No instance found for ${issueId}` }, 404)
+  }
+
+  const home = process.env.HOME || '/root'
+  const sessionId = instance.claudeSessionId
+
+  // Resolve the git CWD (plugin subdir for plugin-external, else the
+  // trunk worktree).  Same rule prAction() uses.
+  const isPlugin = (instance as any).projectType === 'plugin-external' && !!(instance as any).pluginName
+  const gitCwd = isPlugin
+    ? `${instance.worktreePath}/custom/plugins/${(instance as any).pluginName}`
+    : instance.worktreePath
+
+  // Capture HEAD before we spawn Claude so we can tell whether the run
+  // produced a new commit.  Null → we couldn't read it (e.g. missing
+  // worktree); treat the "committed" flag as unknown.
+  const headBefore = (() => {
+    if (!gitCwd) return null
+    try {
+      return execSync(`git -C "${gitCwd}" rev-parse HEAD 2>/dev/null`, {
+        encoding: 'utf-8', timeout: 5_000,
+      }).trim() || null
+    } catch { return null }
+  })()
+
+  const allowedTools = [
+    'Bash', 'Edit', 'Write', 'Read', 'Grep', 'Glob',
+    'Task', 'WebFetch', 'WebSearch', 'TodoWrite',
+  ].join(' ')
+
+  const args = [
+    '-p', message,
+    '--output-format', 'stream-json',
+    '--verbose',
+    '--permission-mode', 'acceptEdits',
+    '--allowedTools', allowedTools,
+    '--effort', 'max',
+  ]
+
+  if (sessionId) {
+    args.push('--resume', sessionId)
+  }
+
+  if (instance.worktreePath) {
+    args.push('--add-dir', instance.worktreePath)
+  }
+
+  return streamSSE(c, async (stream) => {
+    const sendEvent = async (event: string, data: object) => {
+      try { await stream.writeSSE({ event, data: JSON.stringify(data) }) } catch {}
+    }
+
+    const startTime = Date.now()
+    const child = spawn('claude', args, {
+      cwd: instance.worktreePath || home,
+      env: { ...process.env, HOME: home, TERM: 'dumb' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    const onData = (chunk: Buffer) => {
+      for (const line of chunk.toString().split('\n')) {
+        if (line) sendEvent('log', { line, ts: Date.now() })
+      }
+    }
+
+    child.stdout!.on('data', onData)
+    child.stderr!.on('data', onData)
+
+    stream.onAbort(() => { child.kill() })
+
+    await new Promise<void>((resolve) => {
+      child.on('close', (code) => {
+        const exitCode = code || 0
+
+        // Re-read HEAD after Claude finishes.  A commit landed iff the
+        // SHA moved.  We report the result to the UI so the review
+        // banner can show a committed/not-committed indicator.
+        let headAfter: string | null = null
+        if (gitCwd) {
+          try {
+            headAfter = execSync(`git -C "${gitCwd}" rev-parse HEAD 2>/dev/null`, {
+              encoding: 'utf-8', timeout: 5_000,
+            }).trim() || null
+          } catch {}
+        }
+        const committed = !!(headBefore && headAfter && headAfter !== headBefore)
+
+        emit({ type: 'instance-changed' })
+        sendEvent('done', {
+          exitCode,
+          elapsed: Date.now() - startTime,
+          committed,
+          headBefore,
+          headAfter,
+          gitCwd,
+        }).then(resolve)
+      })
+      child.on('error', (err) => {
+        sendEvent('error', { message: err.message }).then(resolve)
+      })
+    })
+  })
+}
+
+/**
+ * Shape returned by `getPrForIssue` / `getPrsForIssues`.
+ */
+export interface PrInfo {
+  number?: number
+  title?: string
+  state?: string
+  url?: string
+  draft?: boolean
+  repo?: string
+}
+
+/**
+ * Derive the GitHub repo (`owner/name`) for a swctl instance.  Plugin fixes
+ * go to `shopware/<PluginName>`, core fixes to `shopware/shopware`.
+ */
+function repoForInstance(instance: any): string {
+  const raw = instance.pluginName
+    ? `shopware/${instance.pluginName}`
+    : (instance.project || 'shopware/shopware')
+  return raw.includes('/') ? raw : 'shopware/shopware'
+}
+
+/** In-memory cache of recent `/pulls` page-1 responses, keyed by repo. */
+interface PullsCacheEntry { at: number; pulls: any[] }
+const pullsCache = new Map<string, PullsCacheEntry>()
+const PULLS_CACHE_TTL_MS = 15_000
+
+/**
+ * Fetch the first page of `/pulls?state=all&sort=updated` for a repo.
+ * Cached for `PULLS_CACHE_TTL_MS` so the resolve page's 15 s repaint timer
+ * doesn't pound GitHub.
+ */
+async function fetchRecentPulls(repo: string, token: string | undefined): Promise<any[] | null> {
+  const now = Date.now()
+  const cached = pullsCache.get(repo)
+  if (cached && now - cached.at < PULLS_CACHE_TTL_MS) return cached.pulls
+
+  const headers: Record<string, string> = { Accept: 'application/vnd.github+json' }
+  if (token) headers.Authorization = `Bearer ${token}`
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${repo}/pulls?state=all&per_page=100&sort=updated&direction=desc`,
+      { headers },
+    )
+    if (!res.ok) return null
+    const pulls = await res.json() as any[]
+    pullsCache.set(repo, { at: now, pulls })
+    return pulls
+  } catch {
+    return null
+  }
+}
+
+/** Map a `/pulls` item to our PrInfo shape. */
+function toPrInfo(pr: any, repo: string): PrInfo {
+  return {
+    number: pr.number,
+    title: pr.title,
+    state: pr.merged_at ? 'MERGED' : pr.state === 'closed' ? 'CLOSED' : 'OPEN',
+    url: pr.html_url,
+    draft: pr.draft,
+    repo,
+  }
+}
+
+/**
+ * Resolve PR info for many issues at once.  Groups by target repo and does
+ * ONE `/pulls` listing call per repo (cached), then matches branches in
+ * memory.  Falls back to per-branch `/pulls?head=` for branches not found
+ * in the first page (older PRs beyond the 100 most-recent).
+ *
+ * Output: one entry per requested issueId, null when no matching PR exists
+ * or the instance has no branch/token.
+ */
+export async function getPrsForIssues(
+  issueIds: string[],
+  token?: string,
+): Promise<Record<string, PrInfo | null>> {
+  const result: Record<string, PrInfo | null> = {}
+  if (!issueIds.length) return result
+
+  if (!token) {
+    const stateDir = process.env.SWCTL_STATE_DIR || ''
+    if (stateDir) {
+      try { token = fs.readFileSync(path.join(stateDir, 'github.token'), 'utf-8').trim() } catch {}
+    }
+  }
+
+  // Build {repo → [{issueId, branch}]} and pre-fill null for unknown ids.
+  const byRepo = new Map<string, Array<{ issueId: string; branch: string }>>()
+  for (const id of issueIds) {
+    const instance = findInstance(id)
+    if (!instance?.branch) { result[id] = null; continue }
+    const repo = repoForInstance(instance)
+    const list = byRepo.get(repo) || []
+    list.push({ issueId: id, branch: instance.branch })
+    byRepo.set(repo, list)
+  }
+
+  await Promise.all(Array.from(byRepo.entries()).map(async ([repo, items]) => {
+    const owner = repo.split('/')[0]
+    const pulls = await fetchRecentPulls(repo, token)
+
+    // Match against cached page-1 first.
+    const unmatched: Array<{ issueId: string; branch: string }> = []
+    for (const { issueId, branch } of items) {
+      let hit: any = null
+      if (pulls) {
+        hit = pulls.find(p =>
+          p?.head?.ref === branch &&
+          // Same-repo head only — filters fork PRs with the same branch name.
+          p?.head?.repo?.owner?.login === owner,
+        )
+      }
+      if (hit) {
+        result[issueId] = toPrInfo(hit, repo)
+      } else {
+        unmatched.push({ issueId, branch })
+      }
+    }
+
+    // Fallback for branches older than the 100 most-recent PRs: one targeted
+    // call per unmatched branch (still cheaper than the old N-per-issue flow
+    // because every repo with any match short-circuits on page-1).
+    if (!unmatched.length) return
+    const headers: Record<string, string> = { Accept: 'application/vnd.github+json' }
+    if (token) headers.Authorization = `Bearer ${token}`
+    await Promise.all(unmatched.map(async ({ issueId, branch }) => {
+      try {
+        const res = await fetch(
+          `https://api.github.com/repos/${repo}/pulls?head=${owner}:${branch}&state=all&per_page=1`,
+          { headers },
+        )
+        if (!res.ok) { result[issueId] = null; return }
+        const prs = await res.json() as any[]
+        result[issueId] = prs.length ? toPrInfo(prs[0], repo) : null
+      } catch {
+        result[issueId] = null
+      }
+    }))
+  }))
+
+  // Ensure every requested id has an entry (safety — shouldn't be necessary).
+  for (const id of issueIds) if (!(id in result)) result[id] = null
+  return result
+}
+
+/**
+ * Get PR info for a single issue.  Thin wrapper around `getPrsForIssues`
+ * so single-issue callers (PR preview, instance detail, etc.) share the
+ * same cache as the batched resolve-page paint.
+ */
+export async function getPrForIssue(issueId: string, token?: string): Promise<PrInfo | null> {
+  const map = await getPrsForIssues([issueId], token)
+  return map[issueId] || null
+}
+
+/**
+ * Fetch the full body (markdown) for a GitHub issue.  Used to populate
+ * the "Reproduction" section in generated PR bodies.  Returns an empty
+ * string on any failure.
+ */
+async function fetchIssueBody(issueRef: string): Promise<string> {
+  const info = await fetchIssueInfo(issueRef)
+  if (!info) return ''
+  const token = readSwctlGithubToken()
+  if (!token) return ''
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${info.owner}/${info.repo}/issues/${info.number}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/vnd.github+json',
+        },
+      },
+    )
+    if (!res.ok) return ''
+    const data = await res.json() as { body?: string }
+    return (data.body || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Generate a rich PR body (Shopware PR #16215 style) via Claude Code.
+ * Falls back to `null` on any failure — caller should substitute a
+ * minimal 2-line body.
+ *
+ * Called at Create-PR time when `/tmp/pr-body.md` isn't already present
+ * (i.e. the resolve skill's Step 7 didn't run).  Uses `claude -p` with
+ * `--allowedTools ""` so Claude produces pure markdown and can't edit
+ * files or shell out.
+ */
+async function generatePrBody(params: {
+  gitCwd: string
+  baseBranch: string
+  branch: string
+  prTitle: string
+  linkRef: string
+  issueRef: string
+  home: string
+}): Promise<string | null> {
+  try {
+    // Gather context: the issue text + the branch's diff stats + the
+    // committed change.  Truncate aggressively so the prompt stays small.
+    const issueInfo = await fetchIssueInfo(params.issueRef)
+    const issueBody = await fetchIssueBody(params.issueRef)
+    let diff = ''
+    try {
+      diff = execSync(
+        `git -C "${params.gitCwd}" diff --stat "origin/${params.baseBranch}..HEAD" && echo '---' && git -C "${params.gitCwd}" diff "origin/${params.baseBranch}..HEAD"`,
+        { encoding: 'utf-8', timeout: 10_000, maxBuffer: 4_000_000, shell: '/bin/bash' },
+      )
+    } catch {}
+    const truncatedDiff = diff.length > 20_000 ? diff.slice(0, 20_000) + '\n…[truncated]' : diff
+
+    const prompt = `You are generating a GitHub pull-request body.  Follow the EXACT structure used in Shopware core PRs (example: https://github.com/shopware/shopware/pull/16215):
+
+## Summary
+- <1-3 bullets: what changed and why, one line each>
+
+Fixes ${params.linkRef}
+
+## Root cause
+<1 short paragraph: why the bug existed>
+
+## Reproduction
+1. <step>
+2. <step>
+…
+
+## Test plan
+- [ ] <check>
+- [ ] <check>
+
+## Flow Builder Impact
+<either "None — …" with one-sentence justification, or a list of affected events/actions/rules>
+
+RULES:
+- Respond with ONLY the markdown body. No preamble, no code fences around the output, no commentary.
+- Do NOT invent reproduction steps — extract them from the issue body's "How to reproduce" section when present.
+- Keep each section terse; the whole body should fit in ~40 lines.
+- If information is genuinely unknown, write a short honest placeholder (e.g. "To be verified").
+
+INPUTS:
+
+### Issue
+Title: ${issueInfo?.title || 'unknown'}
+${issueBody ? `Body:\n${issueBody}` : 'Body: (not available)'}
+
+### PR title (commit subject)
+${params.prTitle}
+
+### Diff (stat + patch, truncated)
+${truncatedDiff || '(no diff available)'}`
+
+    // Call claude non-interactively with no tools at all — we only want
+    // the markdown back.  --permission-mode default is fine because no
+    // tool is allowed.
+    const result = execSync(
+      `claude -p ${JSON.stringify(prompt)} --output-format text --allowedTools "" 2>&1`,
+      {
+        encoding: 'utf-8',
+        timeout: 120_000,
+        maxBuffer: 1_000_000,
+        cwd: params.gitCwd,
+        env: { ...process.env, HOME: params.home, TERM: 'dumb' },
+      },
+    )
+    const trimmed = result.trim()
+    // Sanity check: the body should contain the Fixes link and at
+    // least one `## ` section header.  Otherwise discard and fall back.
+    if (!trimmed.includes(`Fixes ${params.linkRef}`) || !/##\s+\w+/.test(trimmed)) {
+      return null
+    }
+    return trimmed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Look up the original GitHub issue URL for an instance.  Tries
+ * resolve-runs.json (written by startResolveStream) first, then falls
+ * back to `https://github.com/shopware/shopware/issues/<id>` — the
+ * default repo for this project.
+ */
+function issueUrlForId(issueId: string): string {
+  try {
+    const runs = readRuns()
+    const match = runs.find((r) => {
+      const m = r.issue.match(/\/issues\/(\d+)/) || r.issue.match(/^(\d+)$/)
+      return m && m[1] === issueId
+    })
+    if (match) return match.issue
+  } catch {}
+  return `https://github.com/shopware/shopware/issues/${issueId}`
+}
+
+/**
+ * Resolve the git operating dir, target repo, and base branch for an
+ * instance.  Shared by both preview and action paths.
+ */
+function prContext(issueId: string): {
+  ok: boolean
+  error?: string
+  instance?: any
+  isPlugin?: boolean
+  gitCwd?: string
+  branch?: string
+  repo?: string
+  baseBranch?: string
+} {
+  const instance = findInstance(issueId)
+  if (!instance?.branch || !instance.worktreePath) {
+    return { ok: false, error: `No instance/branch for ${issueId}` }
+  }
+  const isPlugin = instance.projectType === 'plugin-external' && !!instance.pluginName
+  const gitCwd = isPlugin
+    ? `${instance.worktreePath}/custom/plugins/${instance.pluginName}`
+    : instance.worktreePath
+  const branch = instance.branch
+
+  let repo = 'shopware/shopware'
+  try {
+    const remoteUrl = execSync(`git -C "${gitCwd}" remote get-url origin 2>/dev/null`, { encoding: 'utf-8', timeout: 5_000 }).trim()
+    const m = remoteUrl.match(/github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?$/)
+    if (m) repo = `${m[1]}/${m[2]}`
+  } catch {}
+  if (repo === 'shopware/shopware' && isPlugin && instance.pluginName) {
+    repo = `shopware/${instance.pluginName}`
+  }
+
+  let baseBranch = 'trunk'
+  try {
+    const head = execSync(`git -C "${gitCwd}" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null`, { encoding: 'utf-8', timeout: 5_000 }).trim()
+    const short = head.replace(/^origin\//, '')
+    if (short) baseBranch = short
+  } catch {
+    if (isPlugin) baseBranch = 'main'
+  }
+  return { ok: true, instance, isPlugin, gitCwd, branch, repo, baseBranch }
+}
+
+/**
+ * Preview what `prAction('create')` would use: title, body, base branch,
+ * target repo, link reference.  Non-mutating — safe to show in a modal
+ * before the user confirms.
+ */
+export async function previewPrCreate(issueId: string): Promise<{
+  ok: boolean
+  error?: string
+  title?: string
+  body?: string
+  bodySource?: 'skill' | 'generated' | 'fallback'
+  repo?: string
+  baseBranch?: string
+  branch?: string
+  linkRef?: string
+  commitCount?: number
+}> {
+  const ctx = prContext(issueId)
+  if (!ctx.ok) return { ok: false, error: ctx.error }
+  const { gitCwd, branch, repo, baseBranch } = ctx as Required<typeof ctx>
+
+  // Title derivation (same as in create flow).
+  const issueUrl = issueUrlForId(issueId)
+  const issueInfo = await fetchIssueInfo(issueUrl)
+  let prTitle = ''
+  if (issueInfo?.title) {
+    const prefix = branchPrefixFromLabels(issueInfo.labels)
+    prTitle = `${prefix}: ${issueInfo.title}`
+  } else {
+    try {
+      prTitle = execSync(`git -C "${gitCwd}" log --format='%s' -1 "${branch}"`, { encoding: 'utf-8', timeout: 5_000 }).trim()
+    } catch {
+      prTitle = `fix: resolve issue #${issueId}`
+    }
+  }
+
+  // Link ref (same-repo vs cross-repo).
+  const issueOwner = issueInfo?.owner || 'shopware'
+  const issueRepo = issueInfo?.repo || 'shopware'
+  const linkRef = (issueOwner === repo.split('/')[0] && issueRepo === repo.split('/')[1])
+    ? `#${issueId}`
+    : `${issueOwner}/${issueRepo}#${issueId}`
+
+  // Body precedence (same as create): skill file → generated → fallback.
+  const fallbackBody = `Fixes ${linkRef}\n\nCreated by \`swctl resolve\`.`
+  let body = fallbackBody
+  let bodySource: 'skill' | 'generated' | 'fallback' = 'fallback'
+  const skillBodyPath = '/tmp/pr-body.md'
+  try {
+    if (fs.existsSync(skillBodyPath)) {
+      const fromSkill = fs.readFileSync(skillBodyPath, 'utf-8').trim()
+      if (fromSkill && fromSkill.includes(`Fixes ${linkRef}`)) {
+        body = fromSkill
+        bodySource = 'skill'
+      } else if (fromSkill) {
+        body = `${fromSkill}\n\nFixes ${linkRef}`
+        bodySource = 'skill'
+      }
+    }
+  } catch {}
+  if (bodySource === 'fallback') {
+    const generated = await generatePrBody({
+      gitCwd, baseBranch, branch, prTitle, linkRef,
+      issueRef: issueUrl, home: process.env.HOME || '/root',
+    })
+    if (generated) { body = generated; bodySource = 'generated' }
+  }
+
+  // Commit count (informational — tells user how many commits will be squashed).
+  let commitCount = 0
+  try {
+    const mergeBase = execSync(
+      `git -C "${gitCwd}" merge-base HEAD "origin/${baseBranch}" 2>/dev/null || git -C "${gitCwd}" rev-list --max-parents=0 HEAD | tail -1`,
+      { encoding: 'utf-8', timeout: 5_000, shell: '/bin/bash' },
+    ).trim()
+    if (mergeBase) {
+      commitCount = parseInt(execSync(`git -C "${gitCwd}" rev-list --count "${mergeBase}..HEAD"`,
+        { encoding: 'utf-8', timeout: 5_000 }).trim() || '0', 10)
+    }
+  } catch {}
+
+  return { ok: true, title: prTitle, body, bodySource, repo, baseBranch, branch, linkRef, commitCount }
+}
+
+/**
+ * Execute a PR action (push, create, merge, approve) using gh CLI.
+ *
+ * For `create`, optional `overrides` let the caller supply a user-edited
+ * title / body / baseBranch (from the preview modal).  If an override is
+ * absent the flow falls back to the same auto-derivation as previewPrCreate.
+ */
+export async function prAction(
+  issueId: string,
+  action: 'push' | 'create' | 'merge' | 'approve' | 'ready',
+  overrides?: { title?: string; body?: string; baseBranch?: string },
+): Promise<{ ok: boolean; output: string }> {
+  const instance = findInstance(issueId)
+  if (!instance?.branch || !instance.worktreePath) {
+    return { ok: false, output: `No instance/branch for ${issueId}` }
+  }
+
+  // For plugin-external instances the fix commit lives in the nested
+  // plugin worktree, not in the trunk worktree.  Push + log + pr-create
+  // must all target that subdirectory, and the repo + base branch must
+  // come from the plugin's own git remote — trunk is only the PLATFORM
+  // default branch and would 404 on the plugin repo.
+  const isPlugin = instance.projectType === 'plugin-external' && !!instance.pluginName
+  const gitCwd = isPlugin
+    ? `${instance.worktreePath}/custom/plugins/${instance.pluginName}`
+    : instance.worktreePath
+  const branch = instance.branch
+
+  // Resolve repo + base branch from the git remote so we don't hardcode
+  // assumptions like `shopware/<PluginName>` or `--base trunk`.
+  let repo = 'shopware/shopware'
+  try {
+    const remoteUrl = execSync(`git -C "${gitCwd}" remote get-url origin 2>/dev/null`, { encoding: 'utf-8', timeout: 5_000 }).trim()
+    // Accept both ssh (git@github.com:owner/repo.git) and https forms
+    const m = remoteUrl.match(/github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?$/)
+    if (m) repo = `${m[1]}/${m[2]}`
+  } catch {
+    // fallback below
+  }
+  if (repo === 'shopware/shopware' && isPlugin && instance.pluginName) {
+    repo = `shopware/${instance.pluginName}`
+  }
+
+  let baseBranch = 'trunk'
+  try {
+    const head = execSync(`git -C "${gitCwd}" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null`, { encoding: 'utf-8', timeout: 5_000 }).trim()
+    // e.g. "origin/main" → "main"
+    const short = head.replace(/^origin\//, '')
+    if (short) baseBranch = short
+  } catch {
+    if (isPlugin) baseBranch = 'main'
+  }
+  // User can override the base branch from the preview modal.
+  if (overrides?.baseBranch && overrides.baseBranch.trim()) {
+    baseBranch = overrides.baseBranch.trim()
+  }
+
+  // Inject the swctl-maintained GH token into every `gh` call.  The
+  // container's `~/.config/gh/hosts.yml` is often stale (UI OAuth flow
+  // writes to swctl's own token file, not gh's config), so without
+  // GH_TOKEN every `gh` call hits HTTP 401.  The token file is populated
+  // by `swctl auth login` and by the UI's GitHub auth flow.
+  const ghToken = readSwctlGithubToken()
+  const ghEnv = ghToken
+    ? { ...process.env, GH_TOKEN: ghToken, GITHUB_TOKEN: ghToken }
+    : process.env
+
+  try {
+    let output = ''
+    switch (action) {
+      case 'push':
+        output = execSync(`git -C "${gitCwd}" push -u origin "${branch}" 2>&1`, { encoding: 'utf-8', timeout: 30_000 })
+        break
+      case 'create': {
+        // Build a canonical PR title from the original GitHub issue:
+        //   `<prefix>: <issue title>` (e.g. "fix: Show configuration …")
+        // Fall back to the latest commit's subject if GitHub can't be
+        // reached.  This gives every PR a title derived from the issue
+        // regardless of how many ad-hoc review commits are on the branch.
+        const issueUrl = issueUrlForId(issueId)
+        const issueInfo = await fetchIssueInfo(issueUrl)
+        let prTitle = ''
+        if (overrides?.title && overrides.title.trim()) {
+          prTitle = overrides.title.trim()
+        } else if (issueInfo?.title) {
+          const prefix = branchPrefixFromLabels(issueInfo.labels)
+          prTitle = `${prefix}: ${issueInfo.title}`
+        } else {
+          prTitle = execSync(`git -C "${gitCwd}" log --format='%s' -1 "${branch}"`, { encoding: 'utf-8', timeout: 5_000 }).trim()
+        }
+
+        // Squash every commit on `branch` since the merge base with the
+        // base branch into a single commit with the canonical title.
+        // `reset --soft` keeps the working tree + index untouched; we
+        // just rewrite the commit graph.
+        let squashOut = ''
+        try {
+          const mergeBase = execSync(
+            `git -C "${gitCwd}" merge-base HEAD "origin/${baseBranch}" 2>/dev/null || git -C "${gitCwd}" rev-list --max-parents=0 HEAD | tail -1`,
+            { encoding: 'utf-8', timeout: 5_000, shell: '/bin/bash' },
+          ).trim()
+          if (!mergeBase) throw new Error(`Could not resolve merge-base with origin/${baseBranch}`)
+
+          const commitCount = parseInt(
+            execSync(`git -C "${gitCwd}" rev-list --count "${mergeBase}..HEAD"`,
+              { encoding: 'utf-8', timeout: 5_000 }).trim() || '0',
+            10,
+          )
+          if (commitCount > 1) {
+            squashOut += `Squashing ${commitCount} commits since ${mergeBase.slice(0, 7)} into one.\n`
+            execSync(`git -C "${gitCwd}" reset --soft "${mergeBase}"`, { encoding: 'utf-8', timeout: 5_000 })
+          }
+          // (re-)commit with the canonical title — even single-commit
+          // branches get the title normalised.
+          const safeTitle = prTitle.replace(/"/g, '\\"')
+          execSync(
+            `git -C "${gitCwd}" commit --allow-empty --amend -m "${safeTitle}" 2>&1 || ` +
+            `git -C "${gitCwd}" commit --allow-empty -m "${safeTitle}" 2>&1`,
+            { encoding: 'utf-8', timeout: 10_000, shell: '/bin/bash' },
+          )
+        } catch (squashErr: any) {
+          return {
+            ok: false,
+            output:
+              `Could not squash commits before PR create.\n` +
+              `${squashErr?.stdout || ''}${squashErr?.stderr || squashErr?.message || ''}`,
+          }
+        }
+
+        // Force-push the rewritten branch.  `--force-with-lease` refuses
+        // the push if someone else has pushed to the branch in between.
+        let pushOut = ''
+        try {
+          pushOut = execSync(`git -C "${gitCwd}" push --force-with-lease -u origin "${branch}" 2>&1`, {
+            encoding: 'utf-8', timeout: 30_000,
+          })
+        } catch (pushErr: any) {
+          return {
+            ok: false,
+            output:
+              `Squashed locally but failed to push ${branch} to origin.\n` +
+              `git output:\n${pushErr?.stdout || ''}${pushErr?.stderr || pushErr?.message || ''}`,
+          }
+        }
+
+        // Body links the PR back to the original GitHub issue.  For
+        // plugin-external runs this is typically a *cross-repo*
+        // reference (the fix is in shopware/SwagCustomizedProducts but
+        // the issue lives on shopware/shopware), so we need the full
+        // owner/repo#N form — GitHub shows the reference in the issue's
+        // timeline even though cross-repo auto-close is not supported.
+        const issueOwner = issueInfo?.owner || 'shopware'
+        const issueRepo = issueInfo?.repo || 'shopware'
+        const linkRef = (issueOwner === repo.split('/')[0] && issueRepo === repo.split('/')[1])
+          ? `#${issueId}`                                // same-repo → auto-close
+          : `${issueOwner}/${issueRepo}#${issueId}`      // cross-repo → reference only
+        // Body precedence:
+        //   0. User-edited body from the preview modal (highest).
+        //   1. `/tmp/pr-body.md` if the resolve skill's Step 7 wrote one.
+        //   2. On-the-fly generation via `claude -p` (Shopware #16215 style).
+        //   3. Minimal fallback: Fixes link + one-line attribution.
+        const fallbackBody = `Fixes ${linkRef}\n\nCreated by \`swctl resolve\`.`
+        let body = fallbackBody
+        let bodySource = 'fallback'
+        if (overrides?.body && overrides.body.trim()) {
+          body = overrides.body
+          bodySource = 'user-edited'
+        } else {
+          const skillBodyPath = '/tmp/pr-body.md'
+          try {
+            if (fs.existsSync(skillBodyPath)) {
+              const fromSkill = fs.readFileSync(skillBodyPath, 'utf-8').trim()
+              if (fromSkill && fromSkill.includes(`Fixes ${linkRef}`)) {
+                body = fromSkill
+                bodySource = 'skill (/tmp/pr-body.md)'
+              } else if (fromSkill) {
+                body = `${fromSkill}\n\nFixes ${linkRef}`
+                bodySource = 'skill + Fixes inject'
+              }
+            }
+          } catch {}
+          if (bodySource === 'fallback') {
+            const generated = await generatePrBody({
+              gitCwd,
+              baseBranch,
+              branch,
+              prTitle,
+              linkRef,
+              issueRef: issueUrl,
+              home: process.env.HOME || '/root',
+            })
+            if (generated) {
+              body = generated
+              bodySource = 'generated'
+            }
+          }
+        }
+        // Pass the body via --body-file so newlines/backticks/quotes can't
+        // be mangled by shell escaping.
+        const bodyFile = `/tmp/pr-body-${issueId}-${Date.now()}.md`
+        fs.writeFileSync(bodyFile, body, 'utf-8')
+        const safeTitle = prTitle.replace(/"/g, '\\"')
+        try {
+          output = execSync(
+            `gh pr create --repo "${repo}" --base "${baseBranch}" --head "${branch}" --title "${safeTitle}" --body-file "${bodyFile}" --assignee @me --draft 2>&1`,
+            { encoding: 'utf-8', timeout: 30_000, cwd: gitCwd, env: ghEnv },
+          )
+          output = `$ squash\n${squashOut}$ git push --force-with-lease\n${pushOut}\n$ pr body source: ${bodySource}\n$ gh pr create …\n${output}`
+          try { fs.unlinkSync(bodyFile) } catch {}
+        } catch (ghErr: any) {
+          return {
+            ok: false,
+            output:
+              `Pushed ${branch} but \`gh pr create\` failed.\n` +
+              `squash:\n${squashOut}\n` +
+              `push output:\n${pushOut}\n\n` +
+              `gh output:\n${ghErr?.stdout || ''}${ghErr?.stderr || ghErr?.message || ''}`,
+          }
+        }
+        break
+      }
+      case 'merge':
+        output = execSync(`gh pr merge "${branch}" --repo "${repo}" --squash --delete-branch 2>&1`, { encoding: 'utf-8', timeout: 30_000, env: ghEnv })
+        break
+      case 'approve':
+        output = execSync(`gh pr review "${branch}" --repo "${repo}" --approve 2>&1`, { encoding: 'utf-8', timeout: 30_000, env: ghEnv })
+        break
+      case 'ready':
+        output = execSync(`gh pr ready "${branch}" --repo "${repo}" 2>&1`, { encoding: 'utf-8', timeout: 30_000, env: ghEnv })
+        break
+    }
+    // Emit so cache middleware invalidates `pr` + `instances` tags; any UI
+    // refresh after push/create/merge now renders with fresh PR state.
+    emit({ type: 'instance-changed' })
+    return { ok: true, output: output.trim() }
+  } catch (err: any) {
+    return { ok: false, output: err.stderr || err.message || String(err) }
+  }
+}
+
+function findInstance(issueId: string): any | null {
+  const all = readAllInstances()
+  return all.find((i: any) => i.issueId === issueId) || null
+}

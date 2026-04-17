@@ -1,3 +1,24 @@
+import { readAllInstances } from './metadata.js'
+import { listResolveRuns } from './resolve.js'
+
+/**
+ * Default allowlist of issue labels surfaced by the Resolve page's fetch-issues
+ * filter. The UI initialises its chip-filter with this set; users can remove
+ * chips to narrow the list. An empty selection means "no assigned issues
+ * shown" (user has deselected everything) — callers should pass `undefined`
+ * to disable label filtering entirely.
+ */
+export const DEFAULT_ISSUE_LABEL_FILTERS: readonly string[] = [
+  'domain/inventory',
+  'priority/low',
+  'priority/high',
+  'priority/critical',
+  'priority/security-related',
+  'extension/Custom-Products',
+  'extension/Commercial',
+  'customer-support',
+]
+
 export interface LinkedPR {
   number: number
   branch: string
@@ -266,6 +287,7 @@ export async function fetchGitHubIssues(
   username: string,
   token: string,
   perPage = 50,
+  labelFilter?: string[],
 ): Promise<GitHubResult> {
   if (!org) {
     return { items: [], error: 'No GitHub organization configured.' }
@@ -391,7 +413,49 @@ export async function fetchGitHubIssues(
       return b.number - a.number
     })
 
-    return { items, rateLimit }
+    // Hide assigned issues that are already being handled by swctl:
+    //   (a) have an active resolve session (listResolveRuns, status=running),
+    //   (b) have a completed / failed resolve session,
+    //   (c) have a worktree instance (readAllInstances).
+    // PRs in 'review-requested' / 'my-pr' categories are review tasks, not
+    // resolution candidates, and pass through unfiltered.
+    const handled = new Set<number>()
+    try {
+      for (const inst of readAllInstances()) {
+        const n = parseInt((inst as { issueId?: string }).issueId || '', 10)
+        if (Number.isFinite(n)) handled.add(n)
+      }
+    } catch {
+      // Non-fatal — if we can't read instances, just don't hide any.
+    }
+    try {
+      for (const run of listResolveRuns()) {
+        const m = run.issue.match(/(?:\/issues\/|#)(\d+)$/) || run.issue.match(/^(\d+)$/)
+        if (m) handled.add(parseInt(m[1], 10))
+      }
+    } catch {
+      // Non-fatal — same rationale as above.
+    }
+    // Optional label allowlist: if the caller passed `labelFilter`, restrict
+    // the 'assigned' category to items whose GitHub labels intersect the
+    // allowlist (case-insensitive). An empty array means "user deselected
+    // everything" → no assigned items pass. `undefined` means "no filter".
+    const labelSet = labelFilter
+      ? new Set(labelFilter.map((l) => l.toLowerCase()))
+      : null
+
+    const filteredItems = items.filter((it) => {
+      if (it.category !== 'assigned') return true
+      if (handled.has(it.number)) return false
+      if (labelSet !== null) {
+        if (labelSet.size === 0) return false
+        const hit = it.labels.some((l) => labelSet.has(l.name.toLowerCase()))
+        if (!hit) return false
+      }
+      return true
+    })
+
+    return { items: filteredItems, rateLimit }
   } catch (err: any) {
     return { items: [], error: `Network error: ${err.message}` }
   }

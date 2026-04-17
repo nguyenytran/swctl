@@ -1,0 +1,1571 @@
+  /**
+ * shopware-resolve — swctl plugin
+ *
+ * Integrates the "shopware-resolve" Claude Code skill with swctl:
+ *   - Route   : /resolve (top-nav)  — form to submit an issue URL/number
+ *   - Widget  : dashboard-bottom    — recent resolve runs with status
+ *   - Action  : instance row        — "Resolve with Claude" pre-fills the form
+ *
+ * The plugin talks to the server-side `/api/skill/resolve/stream` SSE endpoint
+ * which spawns Claude Code non-interactively with `/shopware-resolve <issue>`.
+ */
+
+// ---------- Shared state (module-level so widgets can refresh) ----------
+
+let runsPoller = null
+async function fetchRuns() {
+  try {
+    const res = await fetch('/api/skill/resolve/runs')
+    return res.ok ? await res.json() : []
+  } catch {
+    return []
+  }
+}
+
+// ---------- Stream helper (used by route + action) ----------
+
+function startStream(issue, project, mode, out, onDone) {
+  const params = new URLSearchParams()
+  params.set('issue', issue)
+  if (project) params.set('project', project)
+  if (mode) params.set('mode', mode)
+
+  const url = `/api/skill/resolve/stream?${params.toString()}`
+  const es = new EventSource(url)
+
+  es.addEventListener('log', (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      renderLine(out, data.line)
+    } catch {}
+  })
+
+  es.addEventListener('done', async (e) => {
+    let exitCode = 0
+    try {
+      exitCode = JSON.parse(e.data).exitCode ?? 0
+    } catch {}
+    es.close()
+    appendLine(out, `\n─── Done (exit ${exitCode}) ───`, exitCode === 0 ? 'ok' : 'err')
+    // Tell the server to finalise the run record so widgets refresh
+    try {
+      await fetch('/api/skill/resolve/finish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ issue, exitCode }),
+      })
+    } catch {}
+    if (onDone) onDone(exitCode)
+  })
+
+  es.addEventListener('error', (e) => {
+    let msg = 'Stream error'
+    try { msg = JSON.parse(e.data).message || msg } catch {}
+    appendLine(out, `ERROR: ${msg}`, 'err')
+    es.close()
+    if (onDone) onDone(1)
+  })
+
+  return es
+}
+
+function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper, resultEl, onDone) {
+  const params = new URLSearchParams()
+  params.set('issue', issue)
+  if (project) params.set('project', project)
+  if (mode) params.set('mode', mode)
+
+  const url = `/api/skill/resolve/stream?${params.toString()}`
+  const es = new EventSource(url)
+  let currentStep = 1
+
+  const stepNames = {
+    1: 'Verify the issue',
+    2: 'Find root cause',
+    3: 'Implement the fix',
+    4: 'Independent review',
+    5: 'Provision environment',
+    6: 'Test and validate',
+    7: 'Prepare for merge',
+    8: 'Decision-ready output',
+  }
+
+  // Coverage tracking: record which steps actually started/ended so we can
+  // surface gaps to the user after the run completes.
+  const stepsStarted = new Set()
+  const stepsEnded = new Set()
+
+  es.addEventListener('log', (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      const line = data.line || ''
+      renderLine(out, line)
+
+      // Strict markers emitted by Claude under our instruction:
+      //   ### STEP <N> START: <name>
+      //   ### STEP <N> END
+      const startMatch = line.match(/###\s*STEP\s+(\d)\s+START/i)
+      const endMatch = line.match(/###\s*STEP\s+(\d)\s+END/i)
+      if (startMatch) {
+        const n = parseInt(startMatch[1])
+        if (n >= 1 && n <= 8) {
+          stepsStarted.add(n)
+          if (n >= currentStep) {
+            currentStep = n
+            updateStepper(currentStep, 'active')
+            stepInfo.textContent = `Step ${currentStep}: ${stepNames[currentStep] || ''}`
+          }
+        }
+      } else if (endMatch) {
+        const n = parseInt(endMatch[1])
+        if (n >= 1 && n <= 8) {
+          stepsEnded.add(n)
+          updateStepper(n, 'done')
+        }
+      } else {
+        // Fallback: legacy loose matcher for older runs without markers.
+        const legacy = line.match(/(?:^|\s)Step\s+(\d)\b/i)
+        if (legacy) {
+          const n = parseInt(legacy[1])
+          if (n > currentStep && n <= 8) {
+            currentStep = n
+            updateStepper(currentStep, 'active')
+            stepInfo.textContent = `Step ${currentStep}: ${stepNames[currentStep] || ''}`
+          }
+        }
+      }
+    } catch {}
+  })
+
+  es.addEventListener('done', async (e) => {
+    let exitCode = 0
+    let lastCompletedStepFromServer = 0
+    try {
+      const data = JSON.parse(e.data)
+      exitCode = data.exitCode ?? 0
+      lastCompletedStepFromServer = data.lastCompletedStep ?? 0
+    } catch {}
+    es.close()
+
+    // Extract issue ID from URL or number
+    const issueMatch = issue.match(/\/issues\/(\d+)/) || issue.match(/^(\d+)$/)
+    const issueId = issueMatch ? issueMatch[1] : issue
+
+    // Helper: navigate via the hash router explicitly. Plain <a href="#/..."> can
+    // fail to trigger hashchange when the current path already starts with "#/".
+    const goTo = (path) => {
+      const clean = path.startsWith('/') ? path : `/${path}`
+      // Use location.assign so the browser pushes a history entry and fires
+      // hashchange reliably across Safari/Chromium.
+      location.assign(`${location.pathname}${location.search}#${clean}`)
+      // Fallback: also dispatch the event in case the assign above doesn't
+      // trigger it (same-path case).
+      requestAnimationFrame(() => window.dispatchEvent(new HashChangeEvent('hashchange')))
+    }
+
+    if (exitCode === 0) {
+      updateStepper(9, 'done')
+      stepInfo.textContent = ''
+      appendLine(out, '\n─── Resolve completed ───', 'ok')
+
+      // Coverage: how many of the 8 steps actually ran (emitted an END marker)?
+      const coverage = stepsEnded.size
+      const missing = []
+      for (let i = 1; i <= 8; i++) if (!stepsEnded.has(i)) missing.push(i)
+      const coverageBanner = coverage < 8
+        ? `<div class="sr-coverage-warn" style="background:#78350f20;border:1px solid #b45309;color:#fbbf24;padding:8px 10px;border-radius:4px;margin-bottom:8px;font-size:12px;">
+             ⚠ Only <strong>${coverage}/8</strong> steps emitted an END marker. Missing: Step ${missing.join(', Step ')}.
+             The transcript may be incomplete — scroll up to check.
+           </div>`
+        : `<div class="sr-coverage-ok" style="color:#34d399;font-size:11px;margin-bottom:6px;">✓ All 8 steps ran (START/END markers found)</div>`
+
+      // Fetch PR info and show result card
+      let prHtml = ''
+      try {
+        const prRes = await fetch(`/api/skill/resolve/pr?issueId=${encodeURIComponent(issueId)}`)
+        const pr = await prRes.json()
+        if (pr && pr.number) {
+          const badge = pr.draft ? 'DRAFT' : pr.state
+          prHtml = `<a href="${pr.url}" target="_blank" style="color:#60a5fa;text-decoration:none;font-size:12px;">PR #${pr.number} (${badge})</a>`
+        }
+      } catch {}
+
+      resultEl.innerHTML = `
+        ${coverageBanner}
+        <div class="sr-result-card success">
+          <div class="sr-result-icon">${coverage < 8 ? '⚠' : '✅'}</div>
+          <div class="sr-result-body">
+            <div class="sr-result-title" style="color:${coverage < 8 ? '#fbbf24' : '#34d399'};">
+              Issue #${issueId} ${coverage < 8 ? 'partially resolved' : 'resolved'}
+            </div>
+            <div class="sr-result-meta">
+              <span>${coverage}/8 steps completed</span>
+              ${prHtml ? `<span>•</span>${prHtml}` : ''}
+            </div>
+          </div>
+          <div class="sr-result-actions">
+            <button class="sr-result-btn sr-result-btn-primary" data-goto="/dashboard/instance/${issueId}">View Detail</button>
+            ${prHtml ? `<a class="sr-result-btn" href="${resultEl.querySelector?.('a')?.href || '#'}" target="_blank">Open PR</a>` : ''}
+          </div>
+        </div>
+      `
+      // Fix: get PR URL from the fetched data for the "Open PR" button
+      try {
+        const prLink = resultEl.querySelector('.sr-result-meta a')
+        const openPrBtn = resultEl.querySelector('.sr-result-actions a.sr-result-btn')
+        if (prLink && openPrBtn) openPrBtn.href = prLink.href
+      } catch {}
+
+    } else {
+      updateStepper(currentStep, 'failed')
+      stepInfo.textContent = ''
+      appendLine(out, `\n─── Failed (exit ${exitCode}) ───`, 'err')
+
+      // Prefer the server-reported last-completed step (trusted source — it
+      // ran the stream parser); fall back to the client stepper's view.
+      const lastCompleted = Math.max(
+        lastCompletedStepFromServer || 0,
+        stepsEnded.size > 0 ? Math.max(...stepsEnded) : 0,
+      )
+      const nextStep = Math.min(lastCompleted + 1, 8)
+      const canResume = lastCompleted > 0 && nextStep <= 8
+
+      resultEl.innerHTML = `
+        <div class="sr-result-card failure">
+          <div class="sr-result-icon">❌</div>
+          <div class="sr-result-body">
+            <div class="sr-result-title" style="color:#f87171;">Failed at Step ${currentStep}: ${stepNames[currentStep] || ''}</div>
+            <div class="sr-result-meta">
+              <span>Issue #${issueId} • exit code ${exitCode}</span>
+              ${canResume ? `<span>•</span><span style="color:#fbbf24;">Last completed: Step ${lastCompleted}</span>` : ''}
+            </div>
+          </div>
+          <div class="sr-result-actions">
+            ${canResume ? `<button class="sr-result-btn sr-result-btn-primary" data-resume="${issueId}" data-next-step="${nextStep}" title="Re-launch Claude with --resume and pick up from Step ${nextStep}">↻ Resume from Step ${nextStep}</button>` : ''}
+            <button class="sr-result-btn" data-goto="/dashboard/instance/${issueId}">View Detail</button>
+          </div>
+        </div>
+      `
+
+      // Wire the Resume button to stream into the same console
+      const resumeBtn = resultEl.querySelector('[data-resume]')
+      if (resumeBtn) {
+        resumeBtn.addEventListener('click', (ev) => {
+          ev.preventDefault()
+          resumeBtn.disabled = true
+          resumeBtn.textContent = 'Resuming…'
+          appendLine(out, `\n─── Resuming from Step ${nextStep} ───`, 'log')
+          // Launch a fresh EventSource against the resume endpoint.  The old
+          // `es` is already closed; its reference in the parent scope is no
+          // longer relevant for this run.
+          startResumeStream(issueId, out, stepInfo, updateStepper, resultEl, () => {
+            resumeBtn.disabled = false
+            resumeBtn.textContent = `↻ Resume from Step ${nextStep}`
+          })
+        })
+      }
+    }
+
+    // Wire any buttons with data-goto="/path" to use the router-aware nav helper
+    resultEl.querySelectorAll('[data-goto]').forEach((btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        goTo(btn.getAttribute('data-goto'))
+      })
+    })
+
+    // Scroll result card into view
+    resultEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+
+    try {
+      await fetch('/api/skill/resolve/finish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ issue, exitCode }),
+      })
+    } catch {}
+    if (onDone) onDone(exitCode)
+  })
+
+  es.addEventListener('error', (e) => {
+    let msg = 'Stream error'
+    try { msg = JSON.parse(e.data).message || msg } catch {}
+    updateStepper(currentStep, 'failed')
+    stepInfo.textContent = `Error at Step ${currentStep}`
+    stepInfo.style.color = '#f87171'
+    appendLine(out, `ERROR: ${msg}`, 'err')
+    es.close()
+    if (onDone) onDone(1)
+  })
+
+  return es
+}
+
+/**
+ * Open an SSE stream against /api/skill/resolve/resume/stream and pipe it
+ * into the same console + stepper used by the initial run.  Invokes
+ * onDone with the final exitCode.  Does not re-render the failure card
+ * itself — caller is responsible for swapping the card on completion.
+ */
+function startResumeStream(issueId, out, stepInfo, updateStepper, resultEl, onDone) {
+  const url = `/api/skill/resolve/resume/stream?issueId=${encodeURIComponent(issueId)}`
+  const es = new EventSource(url)
+  let currentStep = 0
+  const stepNames = {
+    1: 'Verify the issue',
+    2: 'Find root cause',
+    3: 'Implement the fix',
+    4: 'Independent review',
+    5: 'Provision environment',
+    6: 'Test and validate',
+    7: 'Prepare for merge',
+    8: 'Decision-ready output',
+  }
+  const stepsEnded = new Set()
+
+  es.addEventListener('log', (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      const line = data.line || ''
+      renderLine(out, line)
+      const startMatch = line.match(/###\s*STEP\s+(\d)\s+START/i)
+      const endMatch = line.match(/###\s*STEP\s+(\d)\s+END/i)
+      if (startMatch) {
+        const n = parseInt(startMatch[1])
+        if (n >= 1 && n <= 8) {
+          currentStep = n
+          updateStepper(n, 'active')
+          stepInfo.textContent = `Step ${n}: ${stepNames[n] || ''}`
+        }
+      } else if (endMatch) {
+        const n = parseInt(endMatch[1])
+        if (n >= 1 && n <= 8) {
+          stepsEnded.add(n)
+          updateStepper(n, 'done')
+        }
+      }
+    } catch {}
+  })
+
+  es.addEventListener('done', async (e) => {
+    let exitCode = 0
+    let last = 0
+    try {
+      const d = JSON.parse(e.data)
+      exitCode = d.exitCode ?? 0
+      last = d.lastCompletedStep ?? 0
+    } catch {}
+    es.close()
+
+    appendLine(out, `\n─── Resume done (exit ${exitCode}) ───`, exitCode === 0 ? 'ok' : 'err')
+
+    if (exitCode === 0) {
+      updateStepper(9, 'done')
+      stepInfo.textContent = ''
+      resultEl.innerHTML = `
+        <div class="sr-result-card success">
+          <div class="sr-result-icon">✅</div>
+          <div class="sr-result-body">
+            <div class="sr-result-title" style="color:#34d399;">Issue #${issueId} resolved (via resume)</div>
+            <div class="sr-result-meta"><span>Finished at Step ${Math.max(last, ...stepsEnded, 0)}</span></div>
+          </div>
+          <div class="sr-result-actions">
+            <button class="sr-result-btn sr-result-btn-primary" data-goto="/dashboard/instance/${issueId}">View Detail</button>
+          </div>
+        </div>
+      `
+      resultEl.querySelectorAll('[data-goto]').forEach((btn) => {
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault()
+          const target = btn.getAttribute('data-goto')
+          const clean = target.startsWith('/') ? target : `/${target}`
+          location.assign(`${location.pathname}${location.search}#${clean}`)
+          requestAnimationFrame(() => window.dispatchEvent(new HashChangeEvent('hashchange')))
+        })
+      })
+    } else {
+      // Still failed — update the card to reflect the new step and enable
+      // another resume attempt from there.
+      const lastCompleted = Math.max(last, stepsEnded.size > 0 ? Math.max(...stepsEnded) : 0)
+      const nextStep = Math.min(lastCompleted + 1, 8)
+      resultEl.innerHTML = `
+        <div class="sr-result-card failure">
+          <div class="sr-result-icon">❌</div>
+          <div class="sr-result-body">
+            <div class="sr-result-title" style="color:#f87171;">Still failing at Step ${currentStep}: ${stepNames[currentStep] || ''}</div>
+            <div class="sr-result-meta">
+              <span>Issue #${issueId} • exit ${exitCode}</span>
+              <span>•</span>
+              <span style="color:#fbbf24;">Last completed: Step ${lastCompleted}</span>
+            </div>
+          </div>
+          <div class="sr-result-actions">
+            <button class="sr-result-btn sr-result-btn-primary" data-resume-again="${issueId}" data-next-step="${nextStep}">↻ Retry from Step ${nextStep}</button>
+            <button class="sr-result-btn" data-goto="/dashboard/instance/${issueId}">View Detail</button>
+          </div>
+        </div>
+      `
+      const retryBtn = resultEl.querySelector('[data-resume-again]')
+      if (retryBtn) {
+        retryBtn.addEventListener('click', (ev) => {
+          ev.preventDefault()
+          retryBtn.disabled = true
+          retryBtn.textContent = 'Resuming…'
+          appendLine(out, `\n─── Retrying from Step ${nextStep} ───`, 'log')
+          startResumeStream(issueId, out, stepInfo, updateStepper, resultEl, () => {
+            retryBtn.disabled = false
+          })
+        })
+      }
+      resultEl.querySelectorAll('[data-goto]').forEach((btn) => {
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault()
+          const target = btn.getAttribute('data-goto')
+          const clean = target.startsWith('/') ? target : `/${target}`
+          location.assign(`${location.pathname}${location.search}#${clean}`)
+          requestAnimationFrame(() => window.dispatchEvent(new HashChangeEvent('hashchange')))
+        })
+      })
+    }
+
+    // Tell the server to update resolve-runs.json
+    try {
+      await fetch('/api/skill/resolve/finish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ issue: issueId, exitCode }),
+      })
+    } catch {}
+
+    if (onDone) onDone(exitCode)
+  })
+
+  es.addEventListener('error', (e) => {
+    let msg = 'Stream error'
+    try { msg = JSON.parse(e.data).message || msg } catch {}
+    appendLine(out, `ERROR: ${msg}`, 'err')
+    es.close()
+    if (onDone) onDone(1)
+  })
+
+  return es
+}
+
+function appendLine(pre, text, kind) {
+  // Simple, used for banners ("Resolve completed", "Failed", "Error") only.
+  // For live stream output, use renderLine which parses stream-json.
+  const span = document.createElement('div')
+  span.className = 'sr-log-row ' + (kind === 'ok' ? 'sr-log-banner-ok' : kind === 'err' ? 'sr-log-banner-err' : 'sr-log-banner')
+  span.textContent = text
+  pre.appendChild(span)
+  pre.scrollTop = pre.scrollHeight
+}
+
+/**
+ * Render one SSE log line into the console.  Claude Code's
+ * `--output-format stream-json` emits one JSON object per line; swctl's own
+ * messages ([swctl]/[scope]/### STEP markers) arrive as plain text.
+ */
+function renderLine(pre, raw) {
+  const row = (cls, text, attrs) => {
+    const el = document.createElement('div')
+    el.className = 'sr-log-row ' + cls
+    if (attrs) Object.entries(attrs).forEach(([k, v]) => { el[k] = v })
+    if (typeof text === 'string') el.textContent = text
+    else if (text) el.appendChild(text)
+    pre.appendChild(el)
+    pre.scrollTop = pre.scrollHeight
+    return el
+  }
+
+  // Non-JSON plain lines — swctl log, step markers, blank lines
+  const trimmed = String(raw || '').trim()
+  if (!trimmed) return
+
+  if (!trimmed.startsWith('{')) {
+    if (/^###\s*STEP\s+\d+\s+END\b/i.test(trimmed)) return row('sr-log-step-end', trimmed)
+    if (/^###\s*STEP\s+\d+\s+START\b/i.test(trimmed)) return row('sr-log-step', trimmed)
+    if (/^\[(swctl|scope|branch|claude)\]/i.test(trimmed)) return row('sr-log-swctl', trimmed)
+    return row('sr-log-text', trimmed)
+  }
+
+  let event
+  try { event = JSON.parse(raw) } catch { return row('sr-log-text', trimmed) }
+
+  const type = event.type
+
+  if (type === 'system') {
+    const model = event.model || event.config?.model || ''
+    const tools = Array.isArray(event.tools) ? ` tools=${event.tools.length}` : ''
+    return row('sr-log-banner', `● session started${model ? ` model=${model}` : ''}${tools}`)
+  }
+
+  if (type === 'result') {
+    const code = event.subtype === 'success' ? 0 : (event.is_error ? 1 : (event.exitCode ?? 0))
+    const ms = event.duration_ms ? ` in ${Math.round(event.duration_ms / 1000)}s` : ''
+    return row(code === 0 ? 'sr-log-banner-ok' : 'sr-log-banner-err', `● done exit ${code}${ms}`)
+  }
+
+  if (type === 'assistant' || type === 'user') {
+    const content = event.message?.content
+    const blocks = Array.isArray(content) ? content : []
+    for (const b of blocks) renderBlock(pre, row, b, type)
+    return
+  }
+
+  // Unknown event types: show a compact one-liner
+  row('sr-log-banner', `● ${type || 'event'}`)
+}
+
+function renderBlock(pre, row, block, eventType) {
+  if (!block || typeof block !== 'object') return
+
+  if (block.type === 'text' && typeof block.text === 'string') {
+    const lines = block.text.split('\n')
+    for (const line of lines) {
+      if (!line.trim()) { row('sr-log-text', '\u00A0'); continue }
+      if (/^###\s*STEP\s+\d+\s+END\b/i.test(line)) { row('sr-log-step-end', line); continue }
+      if (/^###\s*STEP\s+\d+\s+START\b/i.test(line)) { row('sr-log-step', line); continue }
+      row('sr-log-text', line)
+    }
+    return
+  }
+
+  if (block.type === 'thinking' && typeof block.thinking === 'string') {
+    const snippet = block.thinking.replace(/\s+/g, ' ').slice(0, 240)
+    row('sr-log-think', `💭 ${snippet}${block.thinking.length > 240 ? '…' : ''}`)
+    return
+  }
+
+  if (block.type === 'tool_use') {
+    const name = block.name || 'tool'
+    const input = block.input || {}
+    let kind = 'sr-log-tool-other'
+    let label = name
+    let detail = ''
+    if (name === 'Bash') {
+      kind = 'sr-log-tool-bash'
+      label = '▸ Bash'
+      detail = (input.command || '').replace(/\s+/g, ' ').slice(0, 240)
+    } else if (name === 'Edit' || name === 'Write') {
+      kind = 'sr-log-tool-edit'
+      label = name === 'Edit' ? '✎ Edit' : '✎ Write'
+      detail = input.file_path || ''
+    } else if (name === 'Read') {
+      kind = 'sr-log-tool-edit'
+      label = '📄 Read'
+      detail = input.file_path || ''
+    } else if (name === 'Grep' || name === 'Glob') {
+      kind = 'sr-log-tool-other'
+      label = `🔎 ${name}`
+      detail = input.pattern || input.path || ''
+    } else if (name === 'Task') {
+      kind = 'sr-log-tool-task'
+      label = '↻ Task'
+      detail = input.subagent_type || input.description || ''
+    } else if (name === 'WebFetch' || name === 'WebSearch') {
+      kind = 'sr-log-tool-web'
+      label = name === 'WebFetch' ? '🌐 WebFetch' : '🔍 WebSearch'
+      detail = input.url || input.query || ''
+    } else {
+      detail = Object.entries(input).slice(0, 1).map(([k, v]) =>
+        `${k}=${String(v).replace(/\s+/g, ' ').slice(0, 120)}`).join('')
+    }
+    row(kind, `${label}: ${detail}`)
+    return
+  }
+
+  if (block.type === 'tool_result') {
+    let text = ''
+    if (typeof block.content === 'string') text = block.content
+    else if (Array.isArray(block.content)) {
+      text = block.content.map(c => (c && typeof c === 'object' && typeof c.text === 'string') ? c.text : '').join('')
+    }
+    text = text.replace(/\r\n/g, '\n')
+    const firstLine = (text.split('\n').find(l => l.trim()) || '').slice(0, 200)
+    const totalLines = text.split('\n').length
+    const err = block.is_error ? ' (error)' : ''
+
+    const container = document.createElement('div')
+    container.className = 'sr-log-row sr-log-result'
+    const head = document.createElement('div')
+    head.innerHTML = `<span class="sr-log-caret"></span>⤷ <span>${escape(firstLine)}</span><span style="color:#475569;margin-left:6px;">…(${totalLines} line${totalLines === 1 ? '' : 's'})${err}</span>`
+    const body = document.createElement('div')
+    body.className = 'sr-log-result-body'
+    body.textContent = text
+    container.appendChild(head)
+    container.appendChild(body)
+    container.addEventListener('click', () => container.classList.toggle('open'))
+    pre.appendChild(container)
+    pre.scrollTop = pre.scrollHeight
+  }
+}
+
+// ---------- Route: /resolve (issues table + create form + console) ----------
+
+function renderResolvePage(el, ctx) {
+  const activeProject = ctx.activeProject.value || ''
+
+  el.innerHTML = `
+    <style>
+      .sr-wrap { font-family: ui-sans-serif, system-ui, sans-serif; color: #e5e7eb; max-width: 1200px; }
+      .sr-header { font-size: 20px; font-weight: 600; margin: 0 0 4px 0; }
+      .sr-sub    { color: #9ca3af; font-size: 13px; margin: 0 0 16px 0; }
+
+      /* Create form */
+      .sr-create { margin-bottom: 20px; padding: 12px; background: #111827; border: 1px solid #1f2937; border-radius: 6px; }
+      .sr-create-row { display: flex; gap: 8px; align-items: center; }
+      .sr-create input {
+        background: #0f172a; border: 1px solid #374151; border-radius: 4px;
+        padding: 8px 10px; font: 13px ui-sans-serif, system-ui, sans-serif; color: #e5e7eb; flex: 1;
+      }
+      .sr-create input:focus { outline: none; border-color: #3b82f6; }
+      .sr-create button {
+        background: #2563eb; border: none; border-radius: 4px; color: #fff; cursor: pointer;
+        padding: 8px 16px; font: 13px ui-sans-serif, system-ui, sans-serif; font-weight: 600;
+        white-space: nowrap;
+      }
+      .sr-create button:hover { background: #1d4ed8; }
+      .sr-create button:disabled { opacity: .4; cursor: not-allowed; }
+      .sr-fetch-btn {
+        background: #374151; border: none; border-radius: 4px; color: #d1d5db; cursor: pointer;
+        padding: 8px 12px; font: 13px ui-sans-serif, system-ui, sans-serif; white-space: nowrap;
+      }
+      .sr-fetch-btn:hover { background: #4b5563; }
+      .sr-fetch-btn:disabled { opacity: .4; cursor: not-allowed; }
+      .sr-issue-picker { margin-top: 10px; max-height: 300px; overflow-y: auto; border: 1px solid #1f2937; border-radius: 4px; }
+      .sr-issue-row {
+        display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+        border-bottom: 1px solid #1f2937; font-size: 12px; cursor: pointer; transition: background 0.1s;
+      }
+      .sr-issue-row:hover { background: #1e293b; }
+      .sr-issue-row.selected { background: #1e3a5f; }
+      .sr-issue-row input[type=checkbox] { accent-color: #3b82f6; cursor: pointer; }
+      .sr-issue-num { color: #60a5fa; font-weight: 600; min-width: 50px; }
+      .sr-issue-title { color: #d1d5db; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .sr-issue-labels { display: flex; gap: 3px; }
+      .sr-issue-label { font-size: 9px; padding: 1px 5px; border-radius: 8px; background: #1f2937; color: #9ca3af; }
+      .sr-selected-count { font-size: 12px; color: #9ca3af; margin-top: 8px; }
+
+      /* Label-button filter (populated from /api/github/labels/defaults) —
+         per-label colour families on the active state, matching how issue
+         labels render in the result list. */
+      /* GitHub-style smart filter bar: contenteditable with live token
+         highlighting + autocomplete dropdown. */
+      .sr-smart-wrap { position: relative; margin: 8px 0; }
+      .sr-smart-input {
+        min-height: 28px;
+        padding: 6px 10px;
+        border: 1px solid #374151; border-radius: 6px;
+        background: #0f172a; color: #d1d5db;
+        font: 12px/1.6 ui-monospace, SFMono-Regular, monospace;
+        outline: none;
+        white-space: pre-wrap; word-break: break-word;
+      }
+      .sr-smart-input:focus { border-color: #3b82f6; box-shadow: 0 0 0 1px #1e3a5f; }
+      .sr-smart-input:empty::before {
+        content: attr(data-placeholder);
+        color: #4b5563;
+        pointer-events: none;
+      }
+      .sr-tok {
+        display: inline-block;
+        padding: 0 4px; margin: 0 1px;
+        border-radius: 3px;
+        background: #1f2937;
+      }
+      .sr-tok-key { color: #93c5fd; font-weight: 600; }
+      .sr-tok-val { color: #d1d5db; }
+      .sr-tok.tk-label { background: #3730a3; }
+      .sr-tok.tk-label .sr-tok-key { color: #c7d2fe; }
+      .sr-tok.tk-label .sr-tok-val { color: #e0e7ff; }
+      .sr-tok.tk-is    { background: #1e40af; }
+      .sr-tok.tk-is    .sr-tok-key { color: #bfdbfe; }
+      .sr-tok.tk-is    .sr-tok-val { color: #dbeafe; }
+      .sr-tok.tk-state { background: #065f46; }
+      .sr-tok.tk-state .sr-tok-key { color: #a7f3d0; }
+      .sr-tok.tk-state .sr-tok-val { color: #d1fae5; }
+      .sr-tok.tk-sort  { background: #334155; }
+      .sr-tok.tk-sort  .sr-tok-key { color: #cbd5e1; }
+      .sr-tok.tk-sort  .sr-tok-val { color: #e2e8f0; }
+      .sr-tok.tk-assignee { background: #86198f; }
+      .sr-tok.tk-assignee .sr-tok-key { color: #f5d0fe; }
+      .sr-tok.tk-assignee .sr-tok-val { color: #fae8ff; }
+
+      .sr-smart-ac {
+        position: absolute; top: calc(100% + 2px); left: 0; z-index: 100;
+        background: #0f172a; border: 1px solid #374151; border-radius: 6px;
+        min-width: 260px; max-height: 280px; overflow-y: auto;
+        padding: 4px 0;
+        box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+        font: 12px ui-sans-serif, sans-serif;
+      }
+      .sr-smart-ac-item {
+        padding: 6px 10px; color: #d1d5db; cursor: pointer;
+        display: flex; align-items: baseline; gap: 6px;
+      }
+      .sr-smart-ac-item.active,
+      .sr-smart-ac-item:hover { background: #1e293b; }
+      .sr-smart-ac-item-display { color: #d1d5db; font: 11px ui-monospace, monospace; }
+      .sr-smart-ac-item-display .k { color: #93c5fd; font-weight: 600; }
+      .sr-smart-ac-item-display .v { color: #e5e7eb; }
+      .sr-smart-ac-item-hint { color: #6b7280; font-size: 10px; margin-left: auto; }
+
+      /* Issues table */
+      .sr-table { width: 100%; border-collapse: collapse; font: 12px ui-monospace, monospace; margin-bottom: 20px; }
+      .sr-table th { text-align: left; color: #6b7280; font-weight: 600; padding: 8px 6px; border-bottom: 2px solid #1f2937; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+      .sr-table td { padding: 8px 6px; border-bottom: 1px solid #1f2937; vertical-align: middle; }
+      .sr-table tr:hover td { background: #111827; }
+      .sr-pr-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
+      .sr-pr-open { background: #064e3b; color: #34d399; }
+      .sr-pr-draft { background: #1e293b; color: #94a3b8; }
+      .sr-pr-merged { background: #312e81; color: #a78bfa; }
+      .sr-pr-closed { background: #450a0a; color: #f87171; }
+      .sr-pr-none { background: #1f2937; color: #6b7280; }
+      .sr-btn {
+        background: #1f2937; border: 1px solid #374151; border-radius: 4px;
+        color: #9ca3af; font: 11px ui-sans-serif, sans-serif; padding: 3px 8px;
+        cursor: pointer; transition: all 0.15s;
+      }
+      .sr-btn:hover { background: #374151; color: #e5e7eb; }
+      .sr-btn-primary { background: #1e40af; border-color: #2563eb; color: #93c5fd; }
+      .sr-btn-primary:hover { background: #2563eb; color: #fff; }
+      .sr-btn-danger { background: #7f1d1d; border-color: #991b1b; color: #fca5a5; }
+      .sr-btn-danger:hover { background: #991b1b; color: #fff; }
+
+      /* Console */
+      .sr-console {
+        background: #0f172a; border: 1px solid #1f2937; border-radius: 6px;
+        padding: 12px; font: 12px/1.6 ui-monospace, SFMono-Regular, monospace;
+        color: #cbd5e1; min-height: 200px; max-height: 50vh; overflow-y: auto;
+        white-space: pre-wrap; word-break: break-word;
+      }
+      .sr-console:empty::before { content: 'Claude output will appear here...'; color: #4b5563; }
+
+      /* Rendered log blocks — structured view of Claude's stream-json */
+      .sr-log-row        { padding: 2px 8px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+                           line-height: 1.55; border-left: 3px solid transparent; font: 12px ui-monospace, SFMono-Regular, monospace; }
+      .sr-log-row + .sr-log-row { margin-top: 1px; }
+      .sr-log-text       { color: #cbd5e1; }
+      .sr-log-step       { color: #34d399; font-weight: 600; border-left-color: #065f46; background: #064e3b18; }
+      .sr-log-step-end   { color: #6ee7b7; border-left-color: #047857; }
+      .sr-log-swctl      { color: #fbbf24; border-left-color: #b45309; }
+      .sr-log-banner     { color: #94a3b8; font-style: italic; opacity: .8; }
+      .sr-log-banner-ok  { color: #34d399; }
+      .sr-log-banner-err { color: #f87171; }
+      .sr-log-tool-bash  { color: #86efac; border-left-color: #22c55e; }
+      .sr-log-tool-edit  { color: #93c5fd; border-left-color: #3b82f6; }
+      .sr-log-tool-task  { color: #d8b4fe; border-left-color: #a855f7; }
+      .sr-log-tool-web   { color: #67e8f9; border-left-color: #06b6d4; }
+      .sr-log-tool-other { color: #cbd5e1; border-left-color: #475569; }
+      .sr-log-result     { color: #9ca3af; border-left-color: #374151; cursor: pointer; }
+      .sr-log-result .sr-log-caret  { display: inline-block; width: 1em; }
+      .sr-log-result.open .sr-log-caret::before { content: '▾'; }
+      .sr-log-result      .sr-log-caret::before { content: '▸'; }
+      .sr-log-result-body { display: none; color: #94a3b8; padding: 4px 0 4px 1.5em;
+                            white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
+      .sr-log-result.open .sr-log-result-body { display: block; }
+      .sr-log-think      { color: #64748b; font-style: italic; }
+      .sr-log-prefix     { color: #475569; margin-right: 4px; }
+
+      .sr-section { margin-bottom: 24px; }
+      .sr-section-title { font-size: 14px; font-weight: 600; color: #d1d5db; margin: 0 0 10px 0; display: flex; align-items: center; gap: 8px; }
+      .sr-loading { display: inline-block; color: #6b7280; font-size: 11px; }
+
+      /* Stepper */
+      .sr-stepper { display: flex; gap: 0; margin-bottom: 16px; background: #111827; border: 1px solid #1f2937; border-radius: 6px; overflow: hidden; }
+      .sr-step {
+        flex: 1; padding: 10px 6px; text-align: center; font-size: 11px;
+        border-right: 1px solid #1f2937; transition: all 0.3s; position: relative;
+        color: #6b7280; background: #111827;
+      }
+      .sr-step:last-child { border-right: none; }
+      .sr-step-num { font-weight: 700; font-size: 13px; display: block; margin-bottom: 2px; }
+      .sr-step-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.3px; }
+      .sr-step.done { background: #064e3b; color: #34d399; }
+      .sr-step.done .sr-step-num::before { content: '✓ '; }
+      .sr-step.active { background: #1e3a5f; color: #60a5fa; }
+      .sr-step.active .sr-step-num::after { content: ''; display: inline-block; width: 6px; height: 6px; background: #60a5fa; border-radius: 50%; margin-left: 4px; animation: pulse 1.5s infinite; }
+      .sr-step.failed { background: #450a0a; color: #f87171; }
+      @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+      /* Result card */
+      .sr-result-card {
+        border: 1px solid #1f2937; border-radius: 6px; padding: 16px; margin-bottom: 12px;
+        display: flex; align-items: center; gap: 12px;
+      }
+      .sr-result-card.success { border-color: #065f46; background: #064e3b20; }
+      .sr-result-card.failure { border-color: #7f1d1d; background: #450a0a20; }
+      .sr-result-icon { font-size: 24px; flex-shrink: 0; }
+      .sr-result-body { flex: 1; }
+      .sr-result-title { font-size: 14px; font-weight: 600; margin: 0 0 4px 0; }
+      .sr-result-meta { font-size: 12px; color: #9ca3af; display: flex; gap: 12px; align-items: center; }
+      .sr-result-actions { display: flex; gap: 6px; flex-shrink: 0; }
+      .sr-result-btn {
+        padding: 6px 14px; border-radius: 4px; font: 12px ui-sans-serif, sans-serif;
+        font-weight: 600; cursor: pointer; text-decoration: none; display: inline-block;
+        border: 1px solid #374151; color: #d1d5db; background: #1f2937; transition: all 0.15s;
+      }
+      .sr-result-btn:hover { background: #374151; color: #fff; }
+      .sr-result-btn-primary { background: #1e40af; border-color: #2563eb; color: #93c5fd; }
+      .sr-result-btn-primary:hover { background: #2563eb; color: #fff; }
+    </style>
+    <div class="sr-wrap">
+      <h2 class="sr-header">Resolve</h2>
+      <p class="sr-sub">Resolve Shopware issues with Claude Code — create worktrees, review diffs, and manage PRs.</p>
+
+      <!-- Create -->
+      <div class="sr-section">
+        <div class="sr-create">
+          <div class="sr-create-row">
+            <input id="sr-repo" type="text" placeholder="Repository (e.g. shopware/shopware)" value="shopware/shopware" style="width:220px;flex:none;" />
+            <button id="sr-fetch" class="sr-fetch-btn">Fetch issues</button>
+            <button id="sr-run" disabled>Resolve selected</button>
+          </div>
+          <div class="sr-smart-wrap">
+            <div id="sr-smart-input" class="sr-smart-input" contenteditable="true" spellcheck="false" data-placeholder="Type filter: label:priority/low label:domain/inventory  (Enter to search, Tab to autocomplete)"></div>
+            <div id="sr-smart-autocomplete" class="sr-smart-ac" hidden></div>
+          </div>
+          <div id="sr-issue-picker" class="sr-issue-picker" style="display:none;"></div>
+          <div id="sr-selected-count" class="sr-selected-count" style="display:none;"></div>
+        </div>
+      </div>
+
+      <!-- Stepper + console (shown during resolve) -->
+      <div class="sr-section" id="sr-resolve-panel" style="display:none;">
+        <div id="sr-stepper" class="sr-stepper">
+          <div class="sr-step" data-step="1"><span class="sr-step-num">1</span><span class="sr-step-label">Verify</span></div>
+          <div class="sr-step" data-step="2"><span class="sr-step-num">2</span><span class="sr-step-label">Root cause</span></div>
+          <div class="sr-step" data-step="3"><span class="sr-step-num">3</span><span class="sr-step-label">Implement</span></div>
+          <div class="sr-step" data-step="4"><span class="sr-step-num">4</span><span class="sr-step-label">Review</span></div>
+          <div class="sr-step" data-step="5"><span class="sr-step-num">5</span><span class="sr-step-label">Flow impact</span></div>
+          <div class="sr-step" data-step="6"><span class="sr-step-num">6</span><span class="sr-step-label">Test</span></div>
+          <div class="sr-step" data-step="7"><span class="sr-step-num">7</span><span class="sr-step-label">PR</span></div>
+          <div class="sr-step" data-step="8"><span class="sr-step-num">8</span><span class="sr-step-label">Triage</span></div>
+        </div>
+        <div id="sr-step-info" style="color:#9ca3af;font-size:12px;margin-bottom:8px;"></div>
+        <div id="sr-result"></div>
+        <div id="sr-console" class="sr-console"></div>
+      </div>
+
+      <!-- Issues & PRs table -->
+      <div class="sr-section">
+        <h3 class="sr-section-title">Issues &amp; PRs <span id="sr-table-loading" class="sr-loading"></span></h3>
+        <div id="sr-table-container"></div>
+      </div>
+    </div>
+  `
+
+  // Wire create form
+  const btn = el.querySelector('#sr-run')
+  const fetchBtn = el.querySelector('#sr-fetch')
+  const repoInput = el.querySelector('#sr-repo')
+  const smartInput = el.querySelector('#sr-smart-input')
+  const smartAc = el.querySelector('#sr-smart-autocomplete')
+  const pickerEl = el.querySelector('#sr-issue-picker')
+  const countEl = el.querySelector('#sr-selected-count')
+  const out = el.querySelector('#sr-console')
+  const resolvePanel = el.querySelector('#sr-resolve-panel')
+  const stepInfo = el.querySelector('#sr-step-info')
+  const stepperEl = el.querySelector('#sr-stepper')
+
+  let currentStream = null
+  let selectedIssues = new Set()
+
+  // --- Smart filter: contenteditable with live token highlighting ---
+  //
+  // User types free-form tokens like `label:priority/low is:issue state:open`.
+  // Each `key:value` token is highlighted inline with a key-specific colour.
+  // Autocomplete drops down for the key/value currently under the caret.
+  // Enter re-fetches; any `label:*` tokens become the allowlist passed to
+  // /api/github/issues via the `labels=` query param.
+  let defaultLabels = []
+  let selectedLabels = []
+
+  const SMART_KEYS = ['label', 'is', 'state', 'sort', 'assignee']
+  const SMART_VALUES = {
+    is: ['issue', 'pr'],
+    state: ['open', 'closed'],
+    sort: ['updated-desc', 'updated-asc', 'created-desc', 'created-asc'],
+    assignee: ['@me'],
+  }
+
+  function tokenClass(key) {
+    if (!key) return ''
+    const k = key.toLowerCase()
+    if (['label', 'is', 'state', 'sort', 'assignee'].includes(k)) return 'tk-' + k
+    return ''
+  }
+
+  function tokenize(text) {
+    const out = []
+    const re = /\S+/g
+    let m
+    while ((m = re.exec(text)) !== null) {
+      const raw = m[0]
+      const colon = raw.indexOf(':')
+      if (colon > 0 && colon < raw.length - 1) {
+        out.push({ raw, key: raw.slice(0, colon), value: raw.slice(colon + 1), start: m.index, end: m.index + raw.length })
+      } else {
+        out.push({ raw, key: null, value: null, start: m.index, end: m.index + raw.length })
+      }
+    }
+    return out
+  }
+
+  function renderHighlighted(text) {
+    const tokens = tokenize(text)
+    let html = ''
+    let cur = 0
+    for (const t of tokens) {
+      if (cur < t.start) html += escape(text.slice(cur, t.start))
+      if (t.key) {
+        const cls = tokenClass(t.key)
+        html += `<span class="sr-tok ${cls}"><span class="sr-tok-key">${escape(t.key)}:</span><span class="sr-tok-val">${escape(t.value)}</span></span>`
+      } else {
+        html += escape(t.raw)
+      }
+      cur = t.end
+    }
+    if (cur < text.length) html += escape(text.slice(cur))
+    return html
+  }
+
+  function getCaretOffset(root) {
+    const sel = window.getSelection()
+    if (!sel || !sel.rangeCount) return 0
+    const range = sel.getRangeAt(0)
+    if (!root.contains(range.endContainer)) return 0
+    const pre = range.cloneRange()
+    pre.selectNodeContents(root)
+    pre.setEnd(range.endContainer, range.endOffset)
+    return pre.toString().length
+  }
+
+  function setCaretOffset(root, offset) {
+    const sel = window.getSelection()
+    const range = document.createRange()
+    let remaining = offset
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+    let node = walker.nextNode()
+    while (node) {
+      const len = node.textContent.length
+      if (remaining <= len) {
+        range.setStart(node, remaining)
+        range.collapse(true)
+        sel.removeAllRanges()
+        sel.addRange(range)
+        return
+      }
+      remaining -= len
+      node = walker.nextNode()
+    }
+    // Fallback: caret at end
+    range.selectNodeContents(root)
+    range.collapse(false)
+    sel.removeAllRanges()
+    sel.addRange(range)
+  }
+
+  function getText() { return smartInput.textContent || '' }
+
+  function setText(text, caretAt) {
+    smartInput.innerHTML = renderHighlighted(text)
+    if (caretAt !== undefined) setCaretOffset(smartInput, caretAt)
+  }
+
+  function getCurrentWord() {
+    const text = getText()
+    const caret = getCaretOffset(smartInput)
+    let start = caret
+    while (start > 0 && !/\s/.test(text[start - 1])) start--
+    return { word: text.slice(start, caret), start, end: caret }
+  }
+
+  function showAutocomplete() {
+    if (defaultLabels.length === 0) { hideAutocomplete(); return }
+    const { word } = getCurrentWord()
+    if (!word) { hideAutocomplete(); return }
+    const colon = word.indexOf(':')
+    let suggestions = []
+    if (colon === -1) {
+      const p = word.toLowerCase()
+      suggestions = SMART_KEYS
+        .filter(k => k.toLowerCase().startsWith(p))
+        .map(k => ({ display: `${k}:`, key: k, value: '' }))
+    } else {
+      const key = word.slice(0, colon).toLowerCase()
+      const partial = word.slice(colon + 1).toLowerCase()
+      const values = key === 'label' ? defaultLabels : (SMART_VALUES[key] || [])
+      suggestions = values
+        .filter(v => v.toLowerCase().includes(partial))
+        .map(v => ({ display: `${key}:${v}`, key, value: v }))
+    }
+    if (suggestions.length === 0) { hideAutocomplete(); return }
+    smartAc.innerHTML = suggestions.slice(0, 12).map((s, i) =>
+      `<div class="sr-smart-ac-item${i === 0 ? ' active' : ''}" data-text="${escape(s.display)}">` +
+        `<span class="sr-smart-ac-item-display"><span class="k">${escape(s.key)}:</span>${s.value ? `<span class="v">${escape(s.value)}</span>` : ''}</span>` +
+        `<span class="sr-smart-ac-item-hint">${s.value ? '' : 'key'}</span>` +
+      `</div>`,
+    ).join('')
+    smartAc.hidden = false
+    smartAc.querySelectorAll('.sr-smart-ac-item').forEach(item => {
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault()
+        const { start, end } = getCurrentWord()
+        applySuggestion(item.dataset.text, start, end)
+      })
+    })
+  }
+
+  function hideAutocomplete() { smartAc.hidden = true }
+
+  function applySuggestion(text, start, end) {
+    const current = getText()
+    const isPartialKey = !text.endsWith(':') && text.includes(':')
+    const sep = isPartialKey ? ' ' : ''
+    const newText = current.slice(0, start) + text + sep + current.slice(end)
+    const caretAt = start + text.length + sep.length
+    setText(newText, caretAt)
+    hideAutocomplete()
+    if (isPartialKey) submitQuery()
+  }
+
+  function submitQuery() {
+    const tokens = tokenize(getText())
+    selectedLabels = tokens
+      .filter(t => t.key && t.key.toLowerCase() === 'label' && t.value)
+      .map(t => t.value)
+    fetchBtn.click()
+  }
+
+  smartInput.addEventListener('input', () => {
+    const caret = getCaretOffset(smartInput)
+    const text = getText()
+    setText(text, caret)
+    showAutocomplete()
+  })
+
+  smartInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      hideAutocomplete()
+      submitQuery()
+      return
+    }
+    if (e.key === 'Escape') { hideAutocomplete(); return }
+    if (!smartAc.hidden && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      e.preventDefault()
+      const items = [...smartAc.querySelectorAll('.sr-smart-ac-item')]
+      if (items.length === 0) return
+      const cur = items.findIndex(i => i.classList.contains('active'))
+      const next = e.key === 'ArrowDown'
+        ? Math.min(cur + 1, items.length - 1)
+        : Math.max(cur - 1, 0)
+      if (cur >= 0) items[cur].classList.remove('active')
+      items[next].classList.add('active')
+      return
+    }
+    if (e.key === 'Tab' && !smartAc.hidden) {
+      e.preventDefault()
+      const active = smartAc.querySelector('.sr-smart-ac-item.active')
+      if (active) {
+        const { start, end } = getCurrentWord()
+        applySuggestion(active.dataset.text, start, end)
+      }
+    }
+  })
+
+  smartInput.addEventListener('blur', () => setTimeout(hideAutocomplete, 150))
+
+  // Show a placeholder immediately so the picker area isn't blank during the
+  // initial /labels/defaults + /github/issues round-trip (~2 s on cold cache).
+  pickerEl.style.display = ''
+  pickerEl.innerHTML = '<div style="padding:12px;color:#6b7280;font-size:12px;">Loading GitHub issues…</div>'
+
+  // Load defaults and pre-fetch the filtered issue list on first paint.
+  ;(async () => {
+    try {
+      const r = await fetch('/api/github/labels/defaults')
+      const data = await r.json()
+      defaultLabels = Array.isArray(data.labels) ? data.labels : []
+      selectedLabels = defaultLabels.slice()
+      const initial = defaultLabels.map(l => `label:${l}`).join(' ')
+      setText(initial)
+      if (defaultLabels.length > 0) {
+        fetchBtn.click()
+      } else {
+        pickerEl.innerHTML = '<div style="padding:12px;color:#6b7280;font-size:12px;">No default labels configured. Type <code>label:…</code> above and click Fetch.</div>'
+      }
+    } catch (err) {
+      pickerEl.innerHTML = `<div style="padding:12px;color:#f87171;font-size:12px;">Failed to load defaults: ${escape(err && err.message || String(err))}</div>`
+    }
+  })()
+
+  function updateStepper(step, status) {
+    stepperEl.querySelectorAll('.sr-step').forEach(s => {
+      const n = parseInt(s.dataset.step)
+      s.classList.remove('done', 'active', 'failed')
+      if (status === 'failed' && n === step) {
+        s.classList.add('failed')
+      } else if (n < step) {
+        s.classList.add('done')
+      } else if (n === step) {
+        s.classList.add('active')
+      }
+    })
+  }
+
+  function updateSelectedCount() {
+    if (selectedIssues.size === 0) {
+      countEl.style.display = 'none'
+      btn.disabled = true
+      btn.textContent = 'Resolve selected'
+    } else {
+      countEl.style.display = ''
+      countEl.textContent = `${selectedIssues.size} issue${selectedIssues.size !== 1 ? 's' : ''} selected`
+      btn.disabled = false
+      btn.textContent = `Resolve ${selectedIssues.size} issue${selectedIssues.size !== 1 ? 's' : ''}`
+    }
+  }
+
+  // Fetch issues from GitHub
+  fetchBtn.addEventListener('click', async () => {
+    const repo = repoInput.value.trim() || 'shopware/shopware'
+    fetchBtn.disabled = true
+    fetchBtn.textContent = 'Fetching...'
+    selectedIssues.clear()
+
+    try {
+      const params = new URLSearchParams({ repo })
+      // Pass the label param whenever defaults are loaded (even if the user
+      // has removed every chip — empty string = "no assigned issues shown").
+      // Omitting the param entirely would bypass the filter, which is not
+      // what the user wants here.
+      if (defaultLabels.length > 0) params.set('labels', selectedLabels.join(','))
+      const res = await fetch(`/api/github/issues?${params}`)
+      const data = await res.json()
+      const issues = (data.items || []).filter(i => !i.isPR)
+
+      if (issues.length === 0) {
+        pickerEl.innerHTML = '<div style="padding:12px;color:#6b7280;font-size:12px;">No issues found.</div>'
+        pickerEl.style.display = ''
+        updateSelectedCount()
+        return
+      }
+
+      pickerEl.style.display = ''
+      pickerEl.innerHTML = issues.map(i => `
+        <div class="sr-issue-row" data-number="${i.number}" data-url="${escape(i.url || '')}">
+          <input type="checkbox" />
+          <span class="sr-issue-num">#${i.number}</span>
+          <span class="sr-issue-title">${escape(i.title)}</span>
+          <span class="sr-issue-labels">${(i.labels || []).slice(0, 3).map(l =>
+            `<span class="sr-issue-label" style="border-left:2px solid #${l.color || '666'}">${escape(l.name)}</span>`
+          ).join('')}</span>
+        </div>
+      `).join('')
+
+      // Wire checkboxes
+      pickerEl.querySelectorAll('.sr-issue-row').forEach(row => {
+        const cb = row.querySelector('input[type=checkbox]')
+        const num = row.dataset.number
+        const url = row.dataset.url
+
+        row.addEventListener('click', (e) => {
+          if (e.target === cb) return // let checkbox handle itself
+          cb.checked = !cb.checked
+          cb.dispatchEvent(new Event('change'))
+        })
+
+        cb.addEventListener('change', () => {
+          if (cb.checked) {
+            selectedIssues.add(url || num)
+            row.classList.add('selected')
+          } else {
+            selectedIssues.delete(url || num)
+            row.classList.remove('selected')
+          }
+          updateSelectedCount()
+        })
+      })
+    } catch (e) {
+      pickerEl.innerHTML = `<div style="padding:12px;color:#f87171;font-size:12px;">Failed to fetch: ${escape(e.message)}</div>`
+      pickerEl.style.display = ''
+    } finally {
+      fetchBtn.disabled = false
+      fetchBtn.textContent = 'Fetch issues'
+      updateSelectedCount()
+    }
+  })
+
+  // Resolve selected issues
+  btn.addEventListener('click', () => {
+    if (selectedIssues.size === 0) return
+    const issues = [...selectedIssues]
+    const issueArg = issues.join(' ')
+
+    resolvePanel.style.display = ''
+    out.textContent = ''
+    updateStepper(1, 'active')
+    stepInfo.textContent = `Resolving ${issues.length} issue${issues.length !== 1 ? 's' : ''}...`
+    btn.disabled = true
+    btn.textContent = 'Running...'
+
+    // Resolve the first issue with stepper (batch resolves sequentially via Claude)
+    const firstIssue = issues[0]
+    const resultEl = el.querySelector('#sr-result')
+    resultEl.innerHTML = ''
+    // Derive the swctl project from the selected repo. `shopware/shopware` is
+    // the platform (project=trunk by default); everything else is treated as
+    // a plugin-external project with the repo name as the plugin name.
+    const repo = (repoInput.value || 'shopware/shopware').trim()
+    const repoName = repo.split('/').pop() || ''
+    const derivedProject = (repo === 'shopware/shopware' || !repoName) ? '' : repoName
+    currentStream = startStreamWithSteps(firstIssue, derivedProject, 'qa', out, stepInfo, updateStepper, resultEl, () => {
+      btn.disabled = false
+      btn.textContent = 'Resolve selected'
+      paintTable()
+    })
+  })
+
+  // Wire issues table
+  const tableContainer = el.querySelector('#sr-table-container')
+  const tableLoading = el.querySelector('#sr-table-loading')
+
+  // Initial placeholder so the table area isn't empty during the first fetch
+  // (fetchInstances + N parallel fetchPr can take a few seconds on cold cache).
+  tableContainer.innerHTML = '<div style="color:#6b7280;font-size:12px;padding:8px;">Loading resolved issues…</div>'
+
+  // Prevent overlapping paints (15 s refresh timer can race a slow fetch).
+  let painting = false
+
+  async function paintTable() {
+    if (painting) return
+    painting = true
+    tableLoading.textContent = '(loading...)'
+
+    let instances
+    try {
+      instances = await fetchInstances()
+    } catch (err) {
+      tableContainer.innerHTML = `<div style="color:#f87171;font-size:12px;padding:8px;">Failed to load instances: ${escape(err && err.message || String(err))}</div>`
+      tableLoading.textContent = ''
+      painting = false
+      return
+    }
+
+    const resolveInstances = instances.filter(i =>
+      i.kind === 'managed' && (i.branch?.startsWith('fix/') || i.branch?.startsWith('resolve/'))
+    )
+
+    if (resolveInstances.length === 0) {
+      tableContainer.innerHTML = '<div style="color:#6b7280;font-size:12px;padding:8px;">No resolved issues yet. Use the form above to start.</div>'
+      tableLoading.textContent = ''
+      painting = false
+      return
+    }
+
+    // Fetch PR info in one batched call (grouped by repo on the server).
+    const prs = await fetchPrsBatch(resolveInstances.map(i => i.issueId))
+    const items = resolveInstances.map(inst => ({ ...inst, pr: prs[inst.issueId] || null }))
+    tableLoading.textContent = ''
+
+    tableContainer.innerHTML = `
+      <table class="sr-table">
+        <thead>
+          <tr>
+            <th>Issue</th>
+            <th>Branch</th>
+            <th>Status</th>
+            <th>PR</th>
+            <th style="text-align:right;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${items.map(item => {
+            const pr = item.pr
+            const hasPr = pr && !pr.notFound && pr.number
+
+            let statusHtml = '<span class="sr-pr-badge sr-pr-none">pending</span>'
+            if (item.claudeResolveStatus === 'done' || (item.status === 'complete' && hasPr)) {
+              statusHtml = '<span class="sr-pr-badge sr-pr-open">resolved</span>'
+            } else if (item.claudeResolveStatus === 'running') {
+              statusHtml = '<span class="sr-pr-badge" style="background:#1e3a5f;color:#60a5fa;">running</span>'
+            } else if (item.claudeResolveStatus === 'failed' || item.status === 'failed') {
+              statusHtml = '<span class="sr-pr-badge sr-pr-closed">failed</span>'
+            } else if (item.status === 'complete') {
+              statusHtml = '<span class="sr-pr-badge" style="background:#1f2937;color:#9ca3af;">complete</span>'
+            }
+
+            let prCell = '<span class="sr-pr-badge sr-pr-none">no PR</span>'
+            if (hasPr) {
+              const cls = pr.draft ? 'sr-pr-draft' : pr.state === 'MERGED' ? 'sr-pr-merged' : pr.state === 'CLOSED' ? 'sr-pr-closed' : 'sr-pr-open'
+              const label = pr.draft ? 'DRAFT' : pr.state
+              prCell = `<a href="${escape(pr.url)}" target="_blank" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;">
+                <span class="sr-pr-badge ${cls}">${label}</span>
+                <span style="color:#60a5fa;font-size:11px;">#${pr.number}</span>
+              </a>`
+            }
+
+            const actions = []
+            actions.push(`<button class="sr-btn" data-goto="/dashboard/instance/${escape(item.issueId)}" style="text-decoration:none;">Detail</button>`)
+            actions.push(`<button class="sr-btn" data-action="push" data-issue="${escape(item.issueId)}">Push</button>`)
+            if (!hasPr) {
+              actions.push(`<button class="sr-btn sr-btn-primary" data-action="create" data-issue="${escape(item.issueId)}">Create PR</button>`)
+            } else if (pr.draft) {
+              actions.push(`<button class="sr-btn sr-btn-primary" data-action="ready" data-issue="${escape(item.issueId)}">Ready</button>`)
+            }
+
+            return `<tr>
+              <td><span style="color:#60a5fa;font-weight:600;">#${escape(item.issueId)}</span></td>
+              <td style="color:#9ca3af;font-size:11px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escape(item.branch || '—')}</td>
+              <td>${statusHtml}</td>
+              <td>${prCell}</td>
+              <td style="text-align:right;display:flex;gap:4px;justify-content:flex-end;">${actions.join('')}</td>
+            </tr>`
+          }).join('')}
+        </tbody>
+      </table>
+    `
+
+    // Wire navigation buttons (data-goto)
+    tableContainer.querySelectorAll('[data-goto]').forEach(btn => {
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        const target = btn.getAttribute('data-goto') || ''
+        if (!target) return
+        const clean = target.startsWith('/') ? target : `/${target}`
+        location.assign(`${location.pathname}${location.search}#${clean}`)
+        requestAnimationFrame(() => window.dispatchEvent(new HashChangeEvent('hashchange')))
+      })
+    })
+
+    // Wire action buttons
+    tableContainer.querySelectorAll('.sr-btn[data-action]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const action = e.target.dataset.action
+        const issueId = e.target.dataset.issue
+        const origText = e.target.textContent
+        e.target.disabled = true
+        e.target.textContent = '...'
+        const result = await doPrAction(issueId, action)
+        if (result.ok) {
+          e.target.textContent = '✓'
+          e.target.style.color = '#34d399'
+          setTimeout(paintTable, 1500)
+        } else {
+          e.target.textContent = '✗'
+          e.target.style.color = '#f87171'
+          e.target.title = result.output || 'Failed'
+          setTimeout(() => { e.target.textContent = origText; e.target.disabled = false; e.target.style.color = '' }, 3000)
+        }
+      })
+    })
+
+    painting = false
+  }
+
+  paintTable()
+  const refreshTimer = setInterval(paintTable, 15000)
+
+  return () => {
+    clearInterval(refreshTimer)
+    if (currentStream) try { currentStream.close() } catch {}
+  }
+}
+
+// ---------- Widget: resolved issues with PR status ----------
+
+async function fetchInstances() {
+  try {
+    const res = await fetch('/api/instances')
+    return res.ok ? await res.json() : []
+  } catch { return [] }
+}
+
+async function fetchPr(issueId) {
+  try {
+    const res = await fetch(`/api/skill/resolve/pr?issueId=${encodeURIComponent(issueId)}`)
+    return res.ok ? await res.json() : null
+  } catch { return null }
+}
+
+async function fetchPrsBatch(issueIds) {
+  if (!issueIds || issueIds.length === 0) return {}
+  try {
+    const q = encodeURIComponent(issueIds.join(','))
+    const res = await fetch(`/api/skill/resolve/pr/batch?issueIds=${q}`)
+    return res.ok ? await res.json() : {}
+  } catch { return {} }
+}
+
+async function doPrAction(issueId, action) {
+  try {
+    const res = await fetch(`/api/skill/resolve/pr/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ issueId }),
+    })
+    return res.ok ? await res.json() : { ok: false, output: 'Request failed' }
+  } catch (e) { return { ok: false, output: e.message } }
+}
+
+function renderRecentRuns(el) {
+  async function paint() {
+    const instances = await fetchInstances()
+    // Filter to instances with fix/resolve branches (created by resolve workflow)
+    const resolveInstances = instances.filter(i =>
+      i.kind === 'managed' && (i.branch?.startsWith('fix/') || i.branch?.startsWith('resolve/'))
+    )
+
+    if (resolveInstances.length === 0) {
+      el.innerHTML = `<div style="color:#6b7280;font:12px ui-sans-serif,system-ui,sans-serif;">No resolved issues yet.</div>`
+      return
+    }
+
+    // Fetch PR info for all instances in parallel
+    const prPromises = resolveInstances.map(async (inst) => {
+      const pr = await fetchPr(inst.issueId)
+      return { ...inst, pr }
+    })
+    const items = await Promise.all(prPromises)
+
+    el.innerHTML = `
+      <style>
+        .sr-issues { font: 12px ui-monospace, monospace; color: #e5e7eb; }
+        .sr-issue-row {
+          display: grid; grid-template-columns: 80px 1fr 160px 100px;
+          align-items: center; gap: 8px; padding: 6px 4px;
+          border-bottom: 1px solid #1f2937;
+        }
+        .sr-issue-row:hover { background: #111827; }
+        .sr-pr-badge {
+          display: inline-block; padding: 1px 6px; border-radius: 10px;
+          font-size: 10px; font-weight: 600;
+        }
+        .sr-pr-open { background: #064e3b; color: #34d399; }
+        .sr-pr-draft { background: #1f2937; color: #9ca3af; }
+        .sr-pr-merged { background: #312e81; color: #a78bfa; }
+        .sr-pr-closed { background: #450a0a; color: #f87171; }
+        .sr-pr-none { background: #1f2937; color: #6b7280; }
+        .sr-action-btn {
+          background: #1f2937; border: 1px solid #374151; border-radius: 3px;
+          color: #9ca3af; font: 10px ui-sans-serif, sans-serif; padding: 2px 6px;
+          cursor: pointer;
+        }
+        .sr-action-btn:hover { background: #374151; color: #e5e7eb; }
+      </style>
+      <div class="sr-issues">
+        <div class="sr-issue-row" style="color:#6b7280;font-weight:600;border-bottom:2px solid #1f2937;">
+          <span>Issue</span>
+          <span>Branch</span>
+          <span>PR</span>
+          <span>Actions</span>
+        </div>
+        ${items.map(item => {
+          const pr = item.pr
+          const hasPr = pr && !pr.notFound && pr.number
+          let prBadge = '<span class="sr-pr-badge sr-pr-none">no PR</span>'
+          let prLink = ''
+          if (hasPr) {
+            const cls = pr.draft ? 'sr-pr-draft' : pr.state === 'MERGED' ? 'sr-pr-merged' : pr.state === 'CLOSED' ? 'sr-pr-closed' : 'sr-pr-open'
+            const label = pr.draft ? 'DRAFT' : pr.state
+            prBadge = `<span class="sr-pr-badge ${cls}">${label}</span>`
+            prLink = `<a href="${escape(pr.url)}" target="_blank" style="color:#60a5fa;text-decoration:none;margin-left:4px;">#${pr.number}</a>`
+          }
+          const actions = hasPr
+            ? `<button class="sr-action-btn" data-action="push" data-issue="${escape(item.issueId)}" title="Push latest">Push</button>
+               <button class="sr-action-btn" data-action="merge" data-issue="${escape(item.issueId)}" title="Squash merge">Merge</button>`
+            : `<button class="sr-action-btn" data-action="push" data-issue="${escape(item.issueId)}" title="Push branch">Push</button>
+               <button class="sr-action-btn" data-action="create" data-issue="${escape(item.issueId)}" title="Create draft PR">Create PR</button>`
+
+          return `
+            <div class="sr-issue-row">
+              <span style="color:#60a5fa;font-weight:600;">#${escape(item.issueId)}</span>
+              <span style="color:#9ca3af;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escape(item.branch || '—')}</span>
+              <span>${prBadge}${prLink}</span>
+              <span>${actions}</span>
+            </div>
+          `
+        }).join('')}
+      </div>
+    `
+
+    // Wire up action buttons
+    el.querySelectorAll('.sr-action-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const action = e.target.dataset.action
+        const issueId = e.target.dataset.issue
+        e.target.disabled = true
+        e.target.textContent = '...'
+        const result = await doPrAction(issueId, action)
+        if (result.ok) {
+          e.target.textContent = '✓'
+          e.target.style.color = '#34d399'
+          // Refresh after a short delay
+          setTimeout(paint, 1500)
+        } else {
+          e.target.textContent = '✗'
+          e.target.style.color = '#f87171'
+          e.target.title = result.output || 'Failed'
+        }
+      })
+    })
+  }
+
+  paint()
+  const timer = setInterval(paint, 10000)
+  return () => { clearInterval(timer) }
+}
+
+function statusIcon(s) {
+  if (s === 'running') return '⏳'
+  if (s === 'done') return '✅'
+  return '❌'
+}
+
+function shortIssue(s) {
+  const m = /\/issues\/(\d+)/.exec(s)
+  if (m) return `#${m[1]}`
+  return s.length > 50 ? s.slice(0, 47) + '…' : s
+}
+
+function timeAgo(iso) {
+  if (!iso) return ''
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000)
+  if (s < 60) return `${s}s ago`
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`
+  return `${Math.floor(s / 86400)}d ago`
+}
+
+// ---------- Action: "Resolve with Claude" on instance rows ----------
+
+const plugin = {
+  id: 'shopware-resolve',
+
+  routes: [
+    {
+      path: '/resolve',
+      label: 'Resolve',
+      icon: '🩺',
+      render: renderResolvePage,
+    },
+  ],
+
+  widgets: [],
+
+  // No row-level actions for now — the /resolve page is the single entry
+  // point for triggering a resolve. Keeping row actions empty avoids cluttering
+  // the instance list with buttons that would require state we don't track.
+  actions: [],
+}
+
+function escape(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ))
+}
+
+export default plugin

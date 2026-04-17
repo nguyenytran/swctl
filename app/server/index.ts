@@ -8,22 +8,31 @@ import os from 'os'
 import fs from 'fs'
 import path from 'path'
 import { readAllInstances } from './lib/metadata.js'
+import { computeCleanupState, computeCleanupStateBatch } from './lib/worktree-state.js'
 import { getContainerStatuses } from './lib/docker.js'
 import { readProjects, readProjectConfig, addProjectEntry, removeProjectEntry } from './lib/projects.js'
 import { listWorkflows } from './lib/workflows.js'
 import { streamSwctl, spawnSwctl, isStreamActive, cancelStream, streamCommand } from './lib/stream.js'
 import { subscribe } from './lib/events.js'
+import { cacheGet, installCacheInvalidators } from './lib/cache.js'
 import { listBranches, listGitWorktrees, discoverToolWorktrees, discoverPluginWorktrees } from './lib/git.js'
 import {
   fetchGitHubIssues,
+  DEFAULT_ISSUE_LABEL_FILTERS,
   isDeviceFlowConfigured,
   requestDeviceCode,
   pollDeviceAuth,
   fetchGitHubUser,
   resolveUsername,
 } from './lib/github.js'
+import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
+import { startResolveStream, startResolveResumeStream, listResolveRuns, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
 
 const app = new Hono()
+
+// Wire event → cache-tag invalidation once at boot.  Keep this BEFORE any
+// route definitions so the listeners are in place when requests arrive.
+installCacheInvalidators()
 
 // Resolve GitHub token: cookie → env var → token file (written by `swctl auth login`)
 function resolveGitHubToken(cookieToken?: string): { token: string; source: string } {
@@ -68,7 +77,7 @@ app.get('/api/events', (c) => {
   })
 })
 
-app.get('/api/instances', async (c) => {
+app.get('/api/instances', cacheGet({ ttlMs: 5_000, tag: 'instances' }), async (c) => {
   const [instances, statuses, projects] = await Promise.all([
     readAllInstances(),
     getContainerStatuses(),
@@ -595,6 +604,25 @@ app.get('/api/branches', async (c) => {
   return c.json(branches)
 })
 
+// Batch cleanup state (disk size, last activity, dirty, ahead/behind, PR state)
+// for the /worktrees page's cleanup-focused UI. Capped at CLEANUP_BATCH_LIMIT
+// ids per call to cap the `du` cost.
+app.get('/api/instances/cleanup-state', async (c) => {
+  const csv = c.req.query('issues') || ''
+  const ids = csv.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
+  if (ids.length === 0) return c.json({})
+  const out = await computeCleanupStateBatch(ids)
+  return c.json(out)
+})
+
+// Single-instance cleanup state — used for targeted refreshes.
+app.get('/api/instances/:issueId/cleanup-state', async (c) => {
+  const issueId = c.req.param('issueId')
+  const state = await computeCleanupState(issueId)
+  if (!state) return c.json({ error: 'not_found' }, 404)
+  return c.json(state)
+})
+
 app.post('/api/instances/:issueId/exec', async (c) => {
   const issueId = c.req.param('issueId')
   const { command } = await c.req.json<{ command: string }>()
@@ -685,8 +713,28 @@ app.post('/api/github/logout', (c) => {
   return c.json({ ok: true })
 })
 
-// Fetch issues/PRs relevant to the authenticated user
-app.get('/api/github/issues', async (c) => {
+// Return the default label allowlist the UI initialises its chip filter with.
+app.get('/api/github/labels/defaults', cacheGet({ ttlMs: 5 * 60_000, tag: 'labels' }), async (c) => {
+  return c.json({ labels: DEFAULT_ISSUE_LABEL_FILTERS })
+})
+
+// Fetch issues/PRs relevant to the authenticated user.
+// Cached per (org, labels) — GitHub is the slow dependency here (~2 s), and
+// the 60 s TTL is well under any meaningful label/assignment churn.  Key
+// includes the gh token cookie so two users sharing a process don't collide.
+app.get(
+  '/api/github/issues',
+  cacheGet({
+    ttlMs: 60_000,
+    tag: 'github',
+    keyFn: (c) => {
+      const url = new URL(c.req.url)
+      const token = getCookie(c, 'gh_token') || ''
+      const tokenHash = token ? token.slice(0, 8) : 'notoken'
+      return `GET ${url.pathname}?${url.searchParams.toString()}#${tokenHash}`
+    },
+  }),
+  async (c) => {
   // Read org from query param, or fall back to config, or default 'shopware'
   const org = c.req.query('org') || readProjectConfig()['SWCTL_GITHUB_ORG'] || 'shopware'
 
@@ -700,7 +748,15 @@ app.get('/api/github/issues', async (c) => {
     return c.json({ items: [], error: 'auth_required' })
   }
 
-  const result = await fetchGitHubIssues(org, username, token)
+  // Parse `labels` query string: comma-separated allowlist. Presence of the
+  // param (even empty) opts into filtering; absence means "no filter" so
+  // first-load callers that don't know about labels still see everything.
+  const labelsRaw = c.req.query('labels')
+  const labelFilter = labelsRaw === undefined
+    ? undefined
+    : labelsRaw.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
+
+  const result = await fetchGitHubIssues(org, username, token, 50, labelFilter)
   return c.json(result)
 })
 
@@ -906,7 +962,10 @@ app.get('/api/diff', async (c) => {
     diff = execSync(`git diff "${baseRef}...${ref}"`, { cwd: diffCwd, encoding: 'utf-8', timeout: 30000 })
   } catch {}
 
-  return c.json({ stat, diff, ref })
+  // Return the cwd + baseRef so the UI can render accurate "no commits"
+  // hints (the diff scope differs between platform and plugin-external
+  // instances).
+  return c.json({ stat, diff, ref, baseRef, cwd: diffCwd })
 })
 
 app.get('/api/stream/status', (c) => {
@@ -1127,6 +1186,132 @@ app.get('/api/stream/refresh-external', async (c) => {
   ].join(' && ')
 
   return streamCommand(c, worktreePath, command, streamId)
+})
+
+// --- shopware-resolve skill: spawn Claude Code and stream output ---
+
+app.get('/api/skill/resolve/stream', (c) => {
+  const issue = c.req.query('issue') || ''
+  const project = c.req.query('project') || ''
+  const mode = (c.req.query('mode') as 'qa' | 'dev') || 'dev'
+  if (!issue) return c.json({ error: 'Missing issue parameter' }, 400)
+  return startResolveStream(c, { issue, project: project || undefined, mode })
+})
+
+app.get('/api/skill/resolve/runs', (c) => {
+  return c.json(listResolveRuns())
+})
+
+// Resume a previously-interrupted resolve run for an issue, re-using
+// the stored Claude session id.  Streams the continuation transcript.
+app.get('/api/skill/resolve/resume/stream', (c) => {
+  const issueId = c.req.query('issueId') || ''
+  if (!issueId) return c.json({ error: 'Missing issueId parameter' }, 400)
+  return startResolveResumeStream(c, { issueId })
+})
+
+app.post('/api/skill/resolve/finish', async (c) => {
+  const body = await c.req.json().catch(() => ({})) as { issue?: string; exitCode?: number }
+  if (!body.issue) return c.json({ error: 'Missing issue' }, 400)
+  finishResolveRun(body.issue, body.exitCode ?? 0)
+  return c.json({ ok: true })
+})
+
+// Ask Claude a follow-up question for a resolve session (SSE stream)
+app.get('/api/skill/resolve/ask', (c) => {
+  const issueId = c.req.query('issueId') || ''
+  const message = c.req.query('message') || ''
+  if (!issueId || !message) return c.json({ error: 'Missing issueId or message' }, 400)
+  return askResolveStream(c, { issueId, message })
+})
+
+// Get PR info for an issue.  Cached briefly on top of the per-repo pulls
+// cache already inside resolve.ts — collapses repeated clicks on the same
+// issue to a single resolve call.
+app.get('/api/skill/resolve/pr', cacheGet({ ttlMs: 10_000, tag: 'pr' }), async (c) => {
+  const issueId = c.req.query('issueId') || ''
+  if (!issueId) return c.json({ error: 'Missing issueId' }, 400)
+  const pr = await getPrForIssue(issueId)
+  return c.json(pr || { notFound: true })
+})
+
+// Batched variant: accept `issueIds=a,b,c` and return `{a: pr|null, ...}`.
+// Groups by target repo and issues one /pulls listing call per repo, so the
+// resolve page's table paint collapses N round-trips into one.
+//
+// HTTP-layer cache (15 s) matches the resolve page's 15 s repaint timer —
+// the second paint tick serves from here without even entering the batching
+// logic.  Tagged `pr` so PR-mutating actions can flush it explicitly.
+app.get('/api/skill/resolve/pr/batch', cacheGet({ ttlMs: 15_000, tag: 'pr' }), async (c) => {
+  const raw = c.req.query('issueIds') || ''
+  const ids = raw.split(',').map((s) => s.trim()).filter(Boolean)
+  if (!ids.length) return c.json({})
+  return c.json(await getPrsForIssues(ids))
+})
+
+// PR create preview: returns the title/body/base/etc. the create flow WOULD use,
+// without mutating anything.  Used by the UI's edit-before-create modal.
+app.get('/api/skill/resolve/pr/preview-create', async (c) => {
+  const issueId = c.req.query('issueId') || ''
+  if (!issueId) return c.json({ ok: false, error: 'Missing issueId' }, 400)
+  const preview = await previewPrCreate(issueId)
+  return c.json(preview)
+})
+
+// PR actions: push, create, merge, approve, ready.
+// For `create`, the body may include user-edited overrides from the preview modal.
+app.post('/api/skill/resolve/pr/:action', async (c) => {
+  const action = c.req.param('action') as 'push' | 'create' | 'merge' | 'approve' | 'ready'
+  const body = await c.req.json().catch(() => ({})) as {
+    issueId?: string
+    title?: string
+    body?: string
+    baseBranch?: string
+  }
+  if (!body.issueId) return c.json({ error: 'Missing issueId' }, 400)
+  if (!['push', 'create', 'merge', 'approve', 'ready'].includes(action)) {
+    return c.json({ error: `Invalid action: ${action}` }, 400)
+  }
+  const overrides = action === 'create'
+    ? { title: body.title, body: body.body, baseBranch: body.baseBranch }
+    : undefined
+  const result = await prAction(body.issueId, action as any, overrides)
+  return c.json(result)
+})
+
+// --- Plugins: list manifests + serve static plugin assets ---
+
+// List all plugin manifests from ~/.swctl/plugins/
+app.get('/api/plugins/list', cacheGet({ ttlMs: 60_000, tag: 'plugins' }), (c) => {
+  try {
+    const manifests = listPlugins().map((m) => ({
+      ...m,
+      // URL the browser should import to load the plugin entry
+      entryUrl: `/api/plugins/${m.id}/${m.entry.replace(/^\/+/, '')}`,
+    }))
+    return c.json(manifests)
+  } catch (err: any) {
+    return c.json({ error: err?.message || 'Failed to list plugins' }, 500)
+  }
+})
+
+// Serve a file from a plugin directory (entry script, assets, etc.)
+app.get('/api/plugins/:id/*', (c) => {
+  const id = c.req.param('id')
+  // Everything after /api/plugins/:id/ is the file path
+  const prefix = `/api/plugins/${id}/`
+  const reqPath = new URL(c.req.url).pathname
+  const rel = reqPath.startsWith(prefix) ? reqPath.slice(prefix.length) : ''
+  const abs = resolvePluginFile(id, rel)
+  if (!abs) return c.notFound()
+
+  const body = fs.readFileSync(abs)
+  return new Response(body, {
+    headers: {
+      'Content-Type': mimeForFile(abs),
+      'Cache-Control': 'no-cache',
+    },
+  })
 })
 
 // --- Static files (production: serve built Vue app) ---

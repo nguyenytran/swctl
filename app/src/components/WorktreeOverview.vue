@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useInstances } from '@/composables/useInstances'
 import { useActiveProject } from '@/composables/useActiveProject'
 import { useStream } from '@/composables/useStream'
+import { useWorktreeCleanupState } from '@/composables/useWorktreeCleanupState'
 import { buildStreamUrl, stopInstance, startInstance } from '@/api'
+import { formatBytes, formatRelativeTime } from '@/lib/format'
 import type { Instance } from '@/types'
 import LogPanel from './LogPanel.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
@@ -17,6 +19,7 @@ const router = useRouter()
 const { filteredInstances, loading, refresh } = useInstances()
 const { activeProjectName } = useActiveProject()
 const stream = useStream()
+const cleanup = useWorktreeCleanupState()
 
 const showBatchCreate = computed(() => route.meta.modal === 'batch-create')
 const showBatchDelete = ref(false)
@@ -24,13 +27,24 @@ const batchDeleteInstances = ref<Instance[]>([])
 const search = ref('')
 const filterProject = ref('')
 const filterStatus = ref('')
+const sortBy = ref<'created' | 'size' | 'activity' | 'status'>('created')
 const selected = ref<Set<string>>(new Set())
 const copiedId = ref('')
 const confirmAction = ref<{ title: string; message: string; onConfirm: () => void } | null>(null)
 
+const STALE_THRESHOLD_MS = 14 * 24 * 60 * 60 * 1000
+
 onMounted(() => {
   refresh()
 })
+
+// Prefetch cleanup metadata for every visible instance. Watching
+// filteredInstances means re-fetches happen on refresh (fills in newly
+// provisioned worktrees) without spamming on every keystroke in search.
+watch(filteredInstances, (list) => {
+  const ids = list.map((i) => i.issueId)
+  if (ids.length > 0) cleanup.refreshAll(ids)
+}, { immediate: true, flush: 'post' })
 
 // Unique project slugs for filter dropdown
 const projectSlugs = computed(() => {
@@ -38,7 +52,7 @@ const projectSlugs = computed(() => {
   return Array.from(slugs).sort()
 })
 
-// Filtered instances
+// Filtered + sorted instances
 const filtered = computed(() => {
   let list = filteredInstances.value
   if (search.value) {
@@ -62,7 +76,24 @@ const filtered = computed(() => {
       return true
     })
   }
-  return list
+
+  const sorted = [...list]
+  if (sortBy.value === 'size') {
+    sorted.sort((a, b) => (cleanup.stateFor(b.issueId)?.diskSizeBytes ?? -1) - (cleanup.stateFor(a.issueId)?.diskSizeBytes ?? -1))
+  } else if (sortBy.value === 'activity') {
+    sorted.sort((a, b) => {
+      const ta = new Date(cleanup.stateFor(a.issueId)?.lastActivity || 0).getTime()
+      const tb = new Date(cleanup.stateFor(b.issueId)?.lastActivity || 0).getTime()
+      return ta - tb
+    })
+  } else if (sortBy.value === 'status') {
+    const rank = (s: Instance) => s.status === 'failed' ? 0 : s.containerStatus === 'running' ? 1 : s.containerStatus === 'exited' ? 2 : 3
+    sorted.sort((a, b) => rank(a) - rank(b))
+  } else {
+    // created (default): newest first
+    sorted.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime())
+  }
+  return sorted
 })
 
 // Stats
@@ -90,6 +121,41 @@ function toggleAll() {
     selected.value = new Set(filtered.value.map(i => i.issueId))
   }
 }
+
+// Cleanup-focused smart-selects. Reference `filtered` so search/project
+// filters scope what gets pre-selected — feels less surprising than
+// reaching into the full instance list.
+const mergedCandidates = computed(() => {
+  const out: string[] = []
+  for (const inst of filtered.value) {
+    const st = cleanup.stateFor(inst.issueId)
+    if (st?.prState === 'merged' && !st.dirty) out.push(inst.issueId)
+  }
+  return out
+})
+
+const stoppedCandidates = computed(() =>
+  filtered.value.filter(i => i.containerStatus !== 'running').map(i => i.issueId),
+)
+
+const staleCandidates = computed(() => {
+  const out: string[] = []
+  const now = Date.now()
+  for (const inst of filtered.value) {
+    const st = cleanup.stateFor(inst.issueId)
+    if (!st?.lastActivity) continue
+    const ageMs = now - new Date(st.lastActivity).getTime()
+    if (ageMs < STALE_THRESHOLD_MS) continue
+    if (st.prState === 'open' || st.prState === 'draft') continue
+    out.push(inst.issueId)
+  }
+  return out
+})
+
+function selectMerged() { selected.value = new Set(mergedCandidates.value) }
+function selectStopped() { selected.value = new Set(stoppedCandidates.value) }
+function selectStale() { selected.value = new Set(staleCandidates.value) }
+function clearSelection() { selected.value = new Set() }
 
 async function bulkStop() {
   for (const id of selected.value) {
@@ -163,7 +229,6 @@ function formatDate(iso: string) {
 }
 
 // Auto-refresh on stream done
-import { watch } from 'vue'
 watch(() => stream.result.value, (val) => {
   if (val) refresh()
 })
@@ -221,12 +286,63 @@ watch(() => stream.result.value, (val) => {
         <option value="stopped">Stopped</option>
         <option value="failed">Failed</option>
       </select>
+      <select
+        v-model="sortBy"
+        class="bg-surface border border-border rounded px-3 py-2 text-sm text-gray-300 outline-none"
+        title="Sort order"
+      >
+        <option value="created">Newest</option>
+        <option value="size">Size (largest)</option>
+        <option value="activity">Oldest activity</option>
+        <option value="status">Status</option>
+      </select>
       <button
         class="px-3 py-2 text-sm text-gray-400 hover:text-white transition-colors"
         :class="{ 'animate-spin': loading }"
         @click="refresh()"
         title="Refresh"
       >&#8635;</button>
+    </div>
+
+    <!-- Cleanup helpers — persistent, shown whenever list is non-empty -->
+    <div v-if="filtered.length" class="flex items-center flex-wrap gap-2 mb-3 text-xs">
+      <span class="text-gray-500">Quick select:</span>
+      <button
+        class="px-2 py-0.5 rounded border transition-colors"
+        :class="mergedCandidates.length > 0
+          ? 'border-emerald-600/40 text-emerald-400 hover:bg-emerald-600/20'
+          : 'border-border text-gray-600 cursor-not-allowed'"
+        :disabled="mergedCandidates.length === 0"
+        title="PR merged and no uncommitted changes"
+        @click="selectMerged"
+      >Merged ({{ mergedCandidates.length }})</button>
+      <button
+        class="px-2 py-0.5 rounded border transition-colors"
+        :class="stoppedCandidates.length > 0
+          ? 'border-yellow-600/40 text-yellow-400 hover:bg-yellow-600/20'
+          : 'border-border text-gray-600 cursor-not-allowed'"
+        :disabled="stoppedCandidates.length === 0"
+        @click="selectStopped"
+      >Stopped ({{ stoppedCandidates.length }})</button>
+      <button
+        class="px-2 py-0.5 rounded border transition-colors"
+        :class="staleCandidates.length > 0
+          ? 'border-gray-600/40 text-gray-400 hover:bg-gray-600/20'
+          : 'border-border text-gray-600 cursor-not-allowed'"
+        :disabled="staleCandidates.length === 0"
+        title="No activity in 14+ days and no open/draft PR"
+        @click="selectStale"
+      >Stale 14d+ ({{ staleCandidates.length }})</button>
+      <span
+        v-if="!cleanup.hasAny.value && filtered.length > 0"
+        class="text-[10px] text-gray-600 italic"
+        title="Disk size / PR state / activity are still loading"
+      >loading metadata…</span>
+      <button
+        v-if="selected.size > 0"
+        class="px-2 py-0.5 rounded border border-border text-gray-500 hover:text-gray-300 hover:border-gray-500 transition-colors"
+        @click="clearSelection"
+      >Clear ({{ selected.size }})</button>
     </div>
 
     <!-- Bulk actions bar -->
@@ -278,8 +394,13 @@ watch(() => stream.result.value, (val) => {
             />
             <span class="w-2 h-2 rounded-full shrink-0" :class="statusDot(inst)"></span>
             <div class="min-w-0">
-              <div class="text-white font-medium text-sm truncate">
+              <div class="text-white font-medium text-sm truncate flex items-center gap-1.5">
                 {{ inst.issue || inst.issueId }}
+                <span
+                  v-if="cleanup.stateFor(inst.issueId)?.dirty"
+                  class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"
+                  title="Uncommitted changes — destructive ops will lose them"
+                ></span>
                 <span v-if="inst.pluginName" class="text-purple-400 text-xs ml-1">{{ inst.pluginName }}</span>
               </div>
               <div class="text-xs text-gray-500 truncate" :title="inst.branch">{{ inst.branch || 'no branch' }}</div>
@@ -305,6 +426,41 @@ watch(() => stream.result.value, (val) => {
             class="text-[11px] font-mono text-gray-500 truncate mb-2"
             :title="inst.worktreePath"
           >{{ inst.worktreePath }}</div>
+          <div class="flex items-center flex-wrap gap-1.5 mb-1.5">
+            <span
+              class="text-[10px] px-1.5 py-0.5 rounded border border-border text-gray-400"
+              :title="`Disk usage${cleanup.stateFor(inst.issueId)?.diskSizeBytes ? '' : ' — measuring…'}`"
+            >{{ formatBytes(cleanup.stateFor(inst.issueId)?.diskSizeBytes ?? null) }}</span>
+            <span
+              class="text-[10px] px-1.5 py-0.5 rounded border border-border text-gray-400"
+              :title="`Last activity: ${cleanup.stateFor(inst.issueId)?.lastActivity || 'unknown'}`"
+            >{{ formatRelativeTime(cleanup.stateFor(inst.issueId)?.lastActivity ?? null) }}</span>
+            <template v-if="cleanup.stateFor(inst.issueId)">
+              <span
+                v-if="(cleanup.stateFor(inst.issueId)!.ahead || 0) + (cleanup.stateFor(inst.issueId)!.behind || 0) > 0"
+                class="text-[10px] px-1.5 py-0.5 rounded border border-border text-gray-400 font-mono"
+                title="Ahead / behind origin"
+              >
+                ↑{{ cleanup.stateFor(inst.issueId)!.ahead }} ↓{{ cleanup.stateFor(inst.issueId)!.behind }}
+              </span>
+              <span
+                v-if="cleanup.stateFor(inst.issueId)!.prState === 'merged'"
+                class="text-[10px] px-1.5 py-0.5 rounded border border-emerald-600/40 text-emerald-400"
+              >PR merged</span>
+              <span
+                v-else-if="cleanup.stateFor(inst.issueId)!.prState === 'closed'"
+                class="text-[10px] px-1.5 py-0.5 rounded border border-gray-600/40 text-gray-400"
+              >PR closed</span>
+              <span
+                v-else-if="cleanup.stateFor(inst.issueId)!.prState === 'draft'"
+                class="text-[10px] px-1.5 py-0.5 rounded border border-blue-600/40 text-blue-400"
+              >PR draft</span>
+              <span
+                v-else-if="cleanup.stateFor(inst.issueId)!.prState === 'open'"
+                class="text-[10px] px-1.5 py-0.5 rounded border border-blue-600/40 text-blue-400"
+              >PR open</span>
+            </template>
+          </div>
           <div class="text-[11px] text-gray-600">{{ formatDate(inst.createdAt) }}</div>
         </div>
 

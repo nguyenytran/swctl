@@ -13,6 +13,14 @@ services:
       SWCTL_EDITOR: ${SWCTL_EDITOR:-phpstorm}
       SWCTL_BROWSE_ROOT: ${SWCTL_BROWSE_ROOT:-}
       SWCTL_GITHUB_CLIENT_ID: ${SWCTL_GITHUB_CLIENT_ID:-}
+      # Plugin roots — colon-separated list (PATH convention). Paths should
+      # live under HOME (already bind-mounted below). If you point at a path
+      # outside HOME, add a matching bind mount manually.
+      SWCTL_PLUGINS_DIR: ${SWCTL_PLUGINS_DIR}
+      # HOME is set to the host user's home so Claude Code (installed inside
+      # the container by the Dockerfile) can find its auth at ~/.claude/.
+      # The host HOME is bind-mounted read/write below so auth writes persist.
+      HOME: ${HOME}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${SWCTL_SCRIPT_DIR}:/swctl:ro
@@ -22,5 +30,21 @@ services:
       - ${SWCTL_PROJECT_ROOT}:${SWCTL_PROJECT_ROOT}
       - ${SWCTL_WORKTREE_ROOT}:${SWCTL_WORKTREE_ROOT}
       - ${SWCTL_STATE_DIR}:${SWCTL_STATE_DIR}
+      # Plugin roots are not bind-mounted explicitly because SWCTL_PLUGINS_DIR
+      # can be a colon-separated list (which docker-compose would misparse).
+      # Default paths live under HOME, which is already bind-mounted above.
+      # Dev hot-reload: bind-mount server + mcp source over the image's copy
+      # so tsx watch picks up host edits without a container rebuild.
+      - ./server:/app/server:ro
+      - ./mcp:/app/mcp:ro
+      # Serve the freshly-built dist/ straight from the host so `npm run build`
+      # on the host updates the UI without a container rebuild.
+      - ./dist:/app/dist:ro
+      # SSH: mount host's .ssh at /root/.ssh so ssh (called by `git push`
+      # against git@github.com:…) finds the user's keys.  ssh resolves ~
+      # from /etc/passwd for the effective UID, which is root (/root) in
+      # the container — not the HOME env var we set elsewhere.  Read-only
+      # so the container can't accidentally corrupt host keys.
+      - ${HOME}/.ssh:/root/.ssh:ro
     labels:
       - "dev.orbstack.domains=swctl.orb.local"

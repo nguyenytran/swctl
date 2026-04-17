@@ -17,6 +17,7 @@ import {
   startStop,
   clean,
   refresh,
+  setup,
   githubIssues,
 } from './tools.js'
 
@@ -121,6 +122,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'swctl_setup',
+      description: 'Complete provisioning (database clone, Docker container, Shopware install) for a worktree created with --no-provision. Call this AFTER the fix has been implemented and reviewed in the resolve workflow, so heavy setup only happens when you are ready to test.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          issueId: { type: 'string', description: 'Instance issue ID to provision' },
+        },
+        required: ['issueId'],
+      },
+    },
+    {
       name: 'swctl_smart_create',
       description: 'Smart worktree creation with automatic optimization: runs pre-flight validation, analyzes branch diff to preview which steps will run or be skipped (composer install, frontend builds, database setup), creates the worktree, and reports estimated time saved. Shows a detailed create plan before execution.',
       inputSchema: {
@@ -168,6 +180,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return clean(args as any)
     case 'swctl_refresh':
       return refresh(args as any)
+    case 'swctl_setup':
+      return setup(args as any)
     case 'swctl_smart_create':
       return smartCreate(args as any)
     case 'swctl_github_issues':
