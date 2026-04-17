@@ -47,12 +47,56 @@ export function useBatchCreate() {
 
   const selectedJobId = ref<string | null>(null)
   const isStarted = ref(false)
-  const concurrency = ref(2)
+
+  // Concurrency + stagger persist in localStorage so reloads don't flicker
+  // from a default → auto-detected value while the user watches.
+  //   - If the user has chosen a value before, use it immediately (no jump).
+  //   - Else keep the safe default of 2 until onMounted's /system-info
+  //     response arrives, then adopt the suggestion AND mark it as auto.
+  //   - Any manual slider change clears the "auto" label.
+  const LS_CONCURRENCY = 'swctl.batch.concurrency'
+  const LS_STAGGER = 'swctl.batch.staggerDelay'
+  const _readLs = (key: string, fallback: number): number => {
+    try {
+      const raw = localStorage.getItem(key)
+      if (raw == null) return fallback
+      const n = parseInt(raw, 10)
+      return Number.isFinite(n) && n >= 0 ? n : fallback
+    } catch { return fallback }
+  }
+  const concurrency = ref(_readLs(LS_CONCURRENCY, 2))
   const concurrencyAutoDetected = ref(false)
-  // Stagger delay between job starts (seconds) to avoid resource contention
-  // When heavy phases (composer install, npm builds) overlap, all jobs slow down.
-  // Staggering spreads the load so each job gets dedicated resources during its heavy phase.
-  const staggerDelay = ref(30)
+  const _concurrencyIsUserChosen = ref(localStorage.getItem(LS_CONCURRENCY) != null)
+  const staggerDelay = ref(_readLs(LS_STAGGER, 30))
+  const _staggerIsUserChosen = ref(localStorage.getItem(LS_STAGGER) != null)
+
+  // User-interaction markers: components call these from the slider's
+  // @input handler so we don't mistake our own `concurrency.value = …`
+  // (in onMounted) for a user choice.  Once called, all future changes
+  // persist and the "auto" label disappears.
+  function markConcurrencyUserChosen(): void {
+    _concurrencyIsUserChosen.value = true
+    try { localStorage.setItem(LS_CONCURRENCY, String(concurrency.value)) } catch {}
+    concurrencyAutoDetected.value = false
+  }
+  function markStaggerUserChosen(): void {
+    _staggerIsUserChosen.value = true
+    try { localStorage.setItem(LS_STAGGER, String(staggerDelay.value)) } catch {}
+  }
+
+  // Persist on every change once the user has taken ownership, so
+  // programmatic updates from the UI (e.g. reacting to related state)
+  // also survive a reload.
+  watch(concurrency, (v) => {
+    if (_concurrencyIsUserChosen.value) {
+      try { localStorage.setItem(LS_CONCURRENCY, String(v)) } catch {}
+    }
+  })
+  watch(staggerDelay, (v) => {
+    if (_staggerIsUserChosen.value) {
+      try { localStorage.setItem(LS_STAGGER, String(v)) } catch {}
+    }
+  })
 
   // Batch timing
   const batchStartedAt = ref(0)
@@ -62,15 +106,22 @@ export function useBatchCreate() {
   let _mode = ''
 
   // --- Auto-detect concurrency on mount ---
+  // Only override the ref when the user has no saved preference.  This
+  // prevents a reload-flicker (ref starts at user's saved value, never
+  // jumps to a suggestion later) and prevents the "auto" label from
+  // appearing on a value the user explicitly chose before.
   onMounted(async () => {
     try {
       const info = await fetchSystemInfo()
-      concurrency.value = info.suggestedConcurrency
-      concurrencyAutoDetected.value = true
-      // Auto-set stagger based on available resources: more cores = less stagger needed
-      staggerDelay.value = info.suggestedConcurrency >= 3 ? 30 : 20
+      if (!_concurrencyIsUserChosen.value) {
+        concurrency.value = info.suggestedConcurrency
+        concurrencyAutoDetected.value = true
+      }
+      if (!_staggerIsUserChosen.value) {
+        staggerDelay.value = info.suggestedConcurrency >= 3 ? 30 : 20
+      }
     } catch {
-      // Keep default of 2
+      // Keep default of 2 / 30
     }
   })
 
@@ -428,7 +479,9 @@ export function useBatchCreate() {
     selectedStatus,
     concurrency,
     concurrencyAutoDetected,
+    markConcurrencyUserChosen,
     staggerDelay,
+    markStaggerUserChosen,
     isStarted,
     totalCount,
     pendingCount,

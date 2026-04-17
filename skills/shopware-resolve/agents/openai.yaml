@@ -1,0 +1,3 @@
+interface:
+  display_name: "Shopware Resolve"
+  short_description: "8-step gated workflow: triage, root-cause, fix, review, Flow Builder impact, validation, and PR prep for Shopware issues"

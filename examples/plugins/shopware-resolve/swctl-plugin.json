@@ -1,0 +1,8 @@
+{
+  "id": "shopware-resolve",
+  "name": "Shopware Resolve",
+  "version": "1.0.0",
+  "entry": "index.js",
+  "description": "Drive the Shopware issue resolution skill from swctl. Spawns Claude Code with /shopware-resolve and streams the 8-step workflow into the UI.",
+  "author": "swctl"
+}

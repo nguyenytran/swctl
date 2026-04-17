@@ -2,22 +2,54 @@
 import { ref, computed, watch, onUnmounted } from 'vue'
 import type { Instance, StreamEvent } from '@/types'
 import { useStream } from '@/composables/useStream'
-import { stopInstance, startInstance, restartInstance, buildStreamUrl, killExec, killWorktreeExec, fetchDiff } from '@/api'
+import { stopInstance, startInstance, restartInstance, buildStreamUrl, killExec, killWorktreeExec, fetchDiff, setupInstance } from '@/api'
+import { usePlugins } from '@/composables/usePlugins'
+import { useFeatures } from '@/composables/useFeatures'
+import PluginSlot from './PluginSlot.vue'
 
 const props = defineProps<{ instance: Instance }>()
 const emit = defineEmits<{ close: []; refresh: [] }>()
 
-type TabName = 'logs' | 'exec' | 'worktree' | 'diff' | 'info'
+// Feature flag: the "Submit Review" diff-tab action uses Claude Code via
+// the resolve skill.  Hidden unless SWCTL_RESOLVE_ENABLED=1 on the server.
+const { features } = useFeatures()
+
+type BuiltinTab = 'logs' | 'exec' | 'worktree' | 'diff' | 'info'
+type TabName = BuiltinTab | string  // plugin tabs use `plugin:<pluginId>:<tabId>`
+
+const pluginsApi = usePlugins()
+
 const activeTab = ref<TabName>('logs')
-const availableTabs = computed<Array<{ id: TabName; label: string }>>(() => {
-  const tabs: Array<{ id: TabName; label: string }> = [
+
+interface UiTab { id: TabName; label: string; isPlugin?: boolean; pluginId?: string; tabId?: string }
+
+const availableTabs = computed<UiTab[]>(() => {
+  const tabs: UiTab[] = [
     { id: 'logs', label: 'Logs' },
     { id: 'exec', label: 'Console' },
   ]
   if (props.instance.worktreePath) tabs.push({ id: 'worktree', label: 'Worktree' })
   if (props.instance.worktreePath) tabs.push({ id: 'diff', label: 'Diff' })
   tabs.push({ id: 'info', label: 'Info' })
+
+  // Append plugin-provided tabs (respecting each plugin's `condition`)
+  for (const t of pluginsApi.tabs.value) {
+    if (t.condition && !t.condition(props.instance)) continue
+    tabs.push({
+      id: `plugin:${t.pluginId}:${t.id}`,
+      label: t.label,
+      isPlugin: true,
+      pluginId: t.pluginId,
+      tabId: t.id,
+    })
+  }
   return tabs
+})
+
+const activePluginTab = computed(() => {
+  const found = availableTabs.value.find(t => t.id === activeTab.value)
+  if (!found?.isPlugin) return null
+  return pluginsApi.tabs.value.find(t => t.pluginId === found.pluginId && t.id === found.tabId) || null
 })
 const logStream = useStream()
 const execStream = useStream()
@@ -37,21 +69,218 @@ const diffStat = ref('')
 const diffContent = ref('')
 const diffLoading = ref(false)
 const diffLoaded = ref(false)
+// Server-reported scope of the diff (differs for plugin-external vs platform)
+const diffBaseRef = ref('')
+const diffCwd = ref('')
+
+interface DiffLine {
+  type: 'add' | 'del' | 'context' | 'hunk-header' | 'file-header'
+  content: string
+  oldLine: number | null
+  newLine: number | null
+}
+interface DiffHunk { header: string; lines: DiffLine[] }
+interface DiffFile { path: string; hunks: DiffHunk[]; additions: number; deletions: number; collapsed: boolean }
+interface ReviewComment { file: string; line: number; lineContent: string; comment: string }
+
+const parsedFiles = ref<DiffFile[]>([])
+const reviewComments = ref<ReviewComment[]>([])
+const commentingAt = ref<{ file: string; line: number; content: string } | null>(null)
+const commentInput = ref('')
+const reviewStream = useStream()
+const reviewSubmitting = ref(false)
+const reviewBanner = ref<{ kind: 'ok' | 'warn' | 'err'; text: string } | null>(null)
+const reviewCommittedSha = ref('')
+
+function parseDiff(raw: string): DiffFile[] {
+  const files: DiffFile[] = []
+  let current: DiffFile | null = null
+  let hunk: DiffHunk | null = null
+  let oldLine = 0, newLine = 0
+
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('diff --git')) {
+      const m = line.match(/b\/(.+)$/)
+      current = { path: m?.[1] || '?', hunks: [], additions: 0, deletions: 0, collapsed: false }
+      files.push(current)
+      hunk = null
+      continue
+    }
+    if (!current) continue
+    if (line.startsWith('---') || line.startsWith('+++') || line.startsWith('index ') || line.startsWith('new file') || line.startsWith('deleted file')) continue
+
+    if (line.startsWith('@@')) {
+      const m = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+      oldLine = m ? parseInt(m[1]) : 0
+      newLine = m ? parseInt(m[2]) : 0
+      hunk = { header: line, lines: [{ type: 'hunk-header', content: line, oldLine: null, newLine: null }] }
+      current.hunks.push(hunk)
+      continue
+    }
+    if (!hunk) continue
+
+    if (line.startsWith('+')) {
+      hunk.lines.push({ type: 'add', content: line.slice(1), oldLine: null, newLine: newLine++ })
+      current.additions++
+    } else if (line.startsWith('-')) {
+      hunk.lines.push({ type: 'del', content: line.slice(1), oldLine: oldLine++, newLine: null })
+      current.deletions++
+    } else {
+      hunk.lines.push({ type: 'context', content: line.startsWith(' ') ? line.slice(1) : line, oldLine: oldLine++, newLine: newLine++ })
+    }
+  }
+  return files
+}
 
 async function loadDiff() {
-  if (diffLoaded.value || diffLoading.value) return
   diffLoading.value = true
+  diffLoaded.value = false
   try {
     const result = await fetchDiff(props.instance.issueId)
     diffStat.value = result.stat || ''
     diffContent.value = result.diff || ''
+    diffBaseRef.value = (result as any).baseRef || props.instance.baseRef || ''
+    diffCwd.value = (result as any).cwd || props.instance.worktreePath || ''
+    parsedFiles.value = parseDiff(result.diff || '')
     diffLoaded.value = true
   } catch {
     diffContent.value = ''
     diffStat.value = ''
+    parsedFiles.value = []
   } finally {
     diffLoading.value = false
   }
+}
+
+function startComment(file: string, line: number, content: string) {
+  commentingAt.value = { file, line, content }
+  commentInput.value = ''
+}
+
+function addComment() {
+  if (!commentingAt.value || !commentInput.value.trim()) return
+  reviewComments.value.push({
+    file: commentingAt.value.file,
+    line: commentingAt.value.line,
+    lineContent: commentingAt.value.content,
+    comment: commentInput.value.trim(),
+  })
+  commentingAt.value = null
+  commentInput.value = ''
+}
+
+function cancelComment() {
+  commentingAt.value = null
+  commentInput.value = ''
+}
+
+function removeComment(idx: number) {
+  reviewComments.value.splice(idx, 1)
+}
+
+function hasCommentAt(file: string, line: number): ReviewComment | undefined {
+  return reviewComments.value.find(c => c.file === file && c.line === line)
+}
+
+async function submitReview() {
+  if (reviewComments.value.length === 0) return
+  reviewSubmitting.value = true
+
+  // Determine the git directory Claude should edit & commit into.  For
+  // plugin-external instances the fix commit lives in the nested plugin
+  // worktree, not the trunk worktree.  Mirrors the prAction() logic.
+  const inst = props.instance as any
+  const gitCwd = (inst.projectType === 'plugin-external' && inst.pluginName)
+    ? `${props.instance.worktreePath}/custom/plugins/${inst.pluginName}`
+    : props.instance.worktreePath
+
+  // Build a map of { file → { line → { content, hunk } } } so we can
+  // enrich the prompt with the actual line text + surrounding context.
+  function contextWindow(filePath: string, targetLine: number, radius = 3): string[] {
+    const file = parsedFiles.value.find(f => f.path === filePath)
+    if (!file) return []
+    const picked: string[] = []
+    for (const hunk of file.hunks) {
+      for (const l of hunk.lines) {
+        const num = l.newLine ?? l.oldLine
+        if (num == null) continue
+        if (num >= targetLine - radius && num <= targetLine + radius) {
+          const marker = num === targetLine ? '  ← target' : ''
+          picked.push(`${String(num).padStart(5)}: ${l.content}${marker}`)
+        }
+      }
+    }
+    return picked
+  }
+
+  const grouped: Record<string, ReviewComment[]> = {}
+  for (const c of reviewComments.value) {
+    ;(grouped[c.file] ??= []).push(c)
+  }
+
+  let prompt = ''
+  prompt += `You are acting on Diff-tab review comments for branch "${props.instance.branch}" in worktree "${gitCwd}". `
+  prompt += `Apply each comment as a real file edit, then commit on the CURRENT branch.\n\n`
+
+  prompt += 'REVIEW COMMENTS (each line shown with its exact content so there is no ambiguity):\n\n'
+  for (const [file, comments] of Object.entries(grouped)) {
+    prompt += `File: ${file}\n`
+    for (const c of comments) {
+      const safeContent = (c.lineContent || '').replace(/`/g, "'")
+      prompt += `  Line ${c.line}  (content: \`${safeContent}\`)  — "${c.comment}"\n`
+    }
+    prompt += '\n'
+    // Add a small context window (±3 lines) around each target so Claude
+    // can locate the edit without grep guesswork.
+    prompt += `CONTEXT for ${file}:\n`
+    for (const c of comments) {
+      const lines = contextWindow(file, c.line, 3)
+      if (lines.length) {
+        prompt += `  --- around line ${c.line} ---\n`
+        for (const l of lines) prompt += `  ${l}\n`
+      }
+    }
+    prompt += '\n'
+  }
+
+  prompt += 'REQUIRED ACTIONS:\n'
+  prompt += `1. Use the Edit tool to apply every review comment exactly. Do not guess on ambiguous comments — skip them and note why.\n`
+  prompt += `2. After all edits: run \`git -C "${gitCwd}" add -A && git -C "${gitCwd}" commit -m "review: apply review comments on ${props.instance.branch}"\`.\n`
+  prompt += `3. End your reply with exactly one line in this format:\n`
+  prompt += `     Applied: <N> file(s), committed as <short-sha>\n`
+  prompt += `   OR\n`
+  prompt += `     No changes made — <reason>\n`
+
+  const url = `/api/skill/resolve/ask?issueId=${encodeURIComponent(props.instance.issueId)}&message=${encodeURIComponent(prompt)}`
+  reviewStream.start(url)
+
+  // Wait for stream to finish, then surface committed/not-committed
+  // from the SSE 'done' payload and refresh the diff only if Claude
+  // actually committed.
+  const checkDone = setInterval(() => {
+    if (!reviewStream.running.value) {
+      clearInterval(checkDone)
+      reviewSubmitting.value = false
+      reviewComments.value = []
+
+      const result = reviewStream.result.value as any
+      const committed = !!(result && result.committed)
+      reviewCommittedSha.value = result?.headAfter ? String(result.headAfter).slice(0, 7) : ''
+
+      if (committed) {
+        reviewBanner.value = { kind: 'ok', text: `Applied review — ${reviewCommittedSha.value}` }
+        setTimeout(() => loadDiff(), 800)
+      } else {
+        reviewBanner.value = {
+          kind: 'warn',
+          text: `Claude finished but no commit landed on "${props.instance.branch}". ` +
+                `Check the transcript above and retry, or run \`git -C "${gitCwd}" add -A && git commit\` manually.`,
+        }
+      }
+      // Clear the banner after 30s so it doesn't linger forever
+      setTimeout(() => { reviewBanner.value = null }, 30_000)
+    }
+  }, 500)
 }
 
 function classForDiffLine(line: string): string {
@@ -184,6 +413,43 @@ function handleRefresh() {
   logStream.start(buildStreamUrl('refresh', { issueId: props.instance.issueId }))
 }
 
+// Handles the "Container missing" banner's Rebuild button.
+// Flow mirrors Dashboard.vue:handleSetup — flip STATUS=creating so the
+// subsequent refresh triggers full provisioning (docker compose up,
+// DB clone verification, frontend build if needed).
+const isProvisioning = ref(false)
+async function handleProvision() {
+  if (isProvisioning.value) return
+  isProvisioning.value = true
+  try {
+    const res = await setupInstance(props.instance.issueId)
+    if (!res.ok) {
+      // Surface failure via the logs pane so the user sees why.
+      activeTab.value = 'logs'
+      logStream.stop()
+      // Best-effort: append a synthetic error line; users usually also
+      // see the actionable message in a toast from handleStop/handleStart
+      // patterns elsewhere, so keep it simple.
+      console.error('[provision] setupInstance failed:', res.error)
+      isProvisioning.value = false
+      return
+    }
+    activeTab.value = 'logs'
+    logStream.stop()
+    logStream.start(buildStreamUrl('refresh', { issueId: props.instance.issueId }))
+    // Clear the provisioning flag when the stream ends so the button
+    // text reverts. useStream exposes `running` which tracks that.
+  } finally {
+    // Don't unset here — the running stream will keep the button in
+    // "Rebuilding…" state; we clear it via a watcher below.
+  }
+}
+// Track when the refresh stream finishes so the banner's button can
+// recover from "Rebuilding…" to "Rebuild container".
+watch(() => logStream.running.value, (running) => {
+  if (!running) isProvisioning.value = false
+})
+
 function handleCheckout() {
   if (isCheckingOut.value) return
   isCheckingOut.value = true
@@ -260,14 +526,17 @@ function formatDate(iso: string) {
         </div>
       </div>
       <div class="flex items-center gap-2">
+        <!-- Hide Open links when the container is missing — both would
+             serve a 404 and mislead the user into thinking the app is
+             broken rather than just not running. -->
         <a
-          v-if="instance.appUrl"
+          v-if="instance.appUrl && instance.containerStatus !== 'missing'"
           :href="instance.appUrl"
           target="_blank"
           class="px-3 py-1 text-xs bg-surface-dark text-blue-400 border border-border rounded hover:bg-surface-hover transition-colors"
         >Open Store</a>
         <a
-          v-if="instance.appUrl"
+          v-if="instance.appUrl && instance.containerStatus !== 'missing'"
           :href="instance.appUrl + '/admin'"
           target="_blank"
           class="px-3 py-1 text-xs bg-surface-dark text-blue-400 border border-border rounded hover:bg-surface-hover transition-colors"
@@ -303,6 +572,30 @@ function formatDate(iso: string) {
           @click="handleCheckout"
         >{{ isCheckingOut ? 'Switching...' : instance.checkedOut ? 'Return Branch' : 'Checkout' }}</button>
       </div>
+    </div>
+
+    <!-- Container-missing banner: metadata says STATUS=complete but
+         docker has no container for COMPOSE_PROJECT.  Offer a one-click
+         rebuild via the existing setup+refresh flow. -->
+    <div
+      v-if="instance.containerStatus === 'missing'"
+      class="mx-6 mt-4 p-3 border border-yellow-500/40 bg-yellow-500/10 rounded-lg flex items-start gap-3"
+    >
+      <span class="text-yellow-400 text-lg leading-none mt-0.5">&#x26A0;</span>
+      <div class="flex-1">
+        <p class="text-sm text-white font-medium">Container missing</p>
+        <p class="text-xs text-gray-300 mt-0.5">
+          This worktree's metadata says it was fully set up, but the docker compose project
+          <code class="text-blue-400">{{ instance.composeProject }}</code>
+          is gone. Rebuild it to restore
+          <code class="text-blue-400">{{ instance.appUrl }}</code>.
+        </p>
+      </div>
+      <button
+        class="px-3 py-1 text-xs bg-yellow-600/20 text-yellow-400 border border-yellow-600/30 rounded hover:bg-yellow-600/30 transition-colors disabled:opacity-50 whitespace-nowrap"
+        :disabled="isProvisioning"
+        @click="handleProvision"
+      >{{ isProvisioning ? 'Rebuilding…' : 'Rebuild container' }}</button>
     </div>
 
     <!-- Tabs -->
@@ -377,23 +670,186 @@ function formatDate(iso: string) {
         </form>
       </div>
 
-      <!-- Diff tab -->
+      <!-- Diff tab (GitHub-style review) -->
       <div v-if="activeTab === 'diff'" class="flex-1 overflow-y-auto font-mono text-xs leading-5">
         <div v-if="diffLoading" class="p-4 text-gray-500">Loading diff...</div>
-        <div v-else-if="diffLoaded && !diffContent" class="p-4 text-gray-500">No changes between {{ instance.baseRef }} and {{ instance.branch }}</div>
-        <template v-else-if="diffLoaded">
-          <!-- Stat summary -->
-          <div v-if="diffStat" class="p-4 border-b border-border bg-surface">
-            <pre class="text-gray-300 whitespace-pre-wrap">{{ diffStat }}</pre>
+        <div v-else-if="diffLoaded && parsedFiles.length === 0" class="p-4 text-gray-500">
+          <div>
+            No commits on <code class="text-gray-400">{{ instance.branch }}</code>
+            vs <code class="text-gray-400">{{ diffBaseRef || instance.baseRef }}</code>
+            <span v-if="instance.projectType === 'plugin-external' && instance.pluginName">
+              in plugin <code class="text-gray-400">{{ instance.pluginName }}</code>
+            </span>.
           </div>
-          <!-- Unified diff -->
-          <div class="p-4">
+          <div class="mt-2 text-xs">
+            The diff tab shows committed changes only. If you ran <code class="text-gray-400">Resolve</code> and expected a diff,
+            check the {{ instance.projectType === 'plugin-external' ? 'plugin' : 'worktree' }} log:
+            <code class="text-gray-400">git -C {{ diffCwd || instance.worktreePath }} log --oneline {{ diffBaseRef || instance.baseRef }}..HEAD</code>.
+            Claude may have reported no fix was needed, or may have made edits but not committed them.
+          </div>
+        </div>
+        <template v-else-if="diffLoaded">
+          <!-- Toolbar -->
+          <div class="px-4 py-2 border-b border-border bg-surface flex items-center justify-between sticky top-0 z-10">
+            <div class="text-gray-400 text-xs">
+              {{ parsedFiles.length }} file{{ parsedFiles.length !== 1 ? 's' : '' }} changed
+              <span v-if="diffStat" class="ml-2 text-gray-600">({{ diffStat.split('\n').pop()?.trim() }})</span>
+            </div>
+            <!-- Post-review result banner: shows whether Claude's run
+                 actually committed a change.  Replaces the silent
+                 "no diff appeared" UX. -->
             <div
-              v-for="(line, i) in diffContent.split('\n')"
-              :key="i"
-              class="px-2 whitespace-pre-wrap break-all"
-              :class="classForDiffLine(line)"
-            >{{ line || ' ' }}</div>
+              v-if="reviewBanner"
+              class="mx-4 my-2 px-3 py-2 rounded text-xs border"
+              :class="{
+                'bg-emerald-600/10 border-emerald-600/40 text-emerald-300': reviewBanner.kind === 'ok',
+                'bg-yellow-600/10 border-yellow-600/40 text-yellow-300':    reviewBanner.kind === 'warn',
+                'bg-red-600/10 border-red-600/40 text-red-300':             reviewBanner.kind === 'err',
+              }"
+            >{{ reviewBanner.text }}</div>
+            <div class="flex items-center gap-2">
+              <button
+                v-if="reviewComments.length > 0 && features.resolveEnabled"
+                class="px-3 py-1 text-xs bg-emerald-600 text-white rounded hover:bg-emerald-500 transition-colors"
+                :disabled="reviewSubmitting"
+                @click="submitReview"
+              >
+                {{ reviewSubmitting ? 'Submitting...' : `Submit Review (${reviewComments.length})` }}
+              </button>
+              <button
+                class="px-2 py-1 text-xs text-gray-500 hover:text-gray-300 border border-border rounded transition-colors"
+                @click="loadDiff"
+              >Refresh</button>
+            </div>
+          </div>
+
+          <!-- File-by-file diff -->
+          <div v-for="file in parsedFiles" :key="file.path" class="border-b border-border">
+            <!-- File header -->
+            <div
+              class="px-4 py-2 bg-surface-dark flex items-center gap-2 cursor-pointer hover:bg-surface sticky top-[33px] z-[5] border-b border-border"
+              @click="file.collapsed = !file.collapsed"
+            >
+              <span class="text-gray-500 text-[10px]">{{ file.collapsed ? '▶' : '▼' }}</span>
+              <span class="text-white font-semibold text-xs">{{ file.path }}</span>
+              <span class="text-emerald-400 text-[10px]">+{{ file.additions }}</span>
+              <span class="text-red-400 text-[10px]">-{{ file.deletions }}</span>
+            </div>
+
+            <!-- Hunks -->
+            <div v-if="!file.collapsed">
+              <template v-for="hunk in file.hunks" :key="hunk.header">
+                <template v-for="(line, li) in hunk.lines" :key="li">
+                  <!-- Hunk header -->
+                  <div v-if="line.type === 'hunk-header'" class="flex bg-blue-900/10 text-blue-400 border-b border-border/30">
+                    <div class="w-[100px] flex-shrink-0" />
+                    <div class="flex-1 px-2 py-0.5">{{ line.content }}</div>
+                  </div>
+
+                  <!-- Code line -->
+                  <div
+                    v-else
+                    class="flex group"
+                    :class="{
+                      'bg-emerald-900/20': line.type === 'add',
+                      'bg-red-900/20': line.type === 'del',
+                    }"
+                  >
+                    <!-- Line numbers -->
+                    <div class="w-[50px] flex-shrink-0 text-right pr-1 select-none border-r border-border/30"
+                      :class="line.type === 'del' ? 'text-red-700' : line.type === 'add' ? 'text-emerald-700' : 'text-gray-700'"
+                    >{{ line.oldLine ?? '' }}</div>
+                    <div class="w-[50px] flex-shrink-0 text-right pr-1 select-none border-r border-border/30"
+                      :class="line.type === 'del' ? 'text-red-700' : line.type === 'add' ? 'text-emerald-700' : 'text-gray-700'"
+                    >{{ line.newLine ?? '' }}</div>
+
+                    <!-- Content + comment button -->
+                    <div class="flex-1 px-2 whitespace-pre-wrap break-all relative"
+                      :class="{
+                        'text-emerald-300': line.type === 'add',
+                        'text-red-300': line.type === 'del',
+                        'text-gray-400': line.type === 'context',
+                      }"
+                    >
+                      <span>{{ line.content || ' ' }}</span>
+                      <!-- Comment trigger (+ button on hover) -->
+                      <button
+                        v-if="line.newLine && line.type !== 'del'"
+                        class="absolute left-[-8px] top-0 w-4 h-4 text-[10px] leading-4 text-center bg-blue-600 text-white rounded-sm opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+                        @click.stop="startComment(file.path, line.newLine!, line.content)"
+                        title="Add review comment"
+                      >+</button>
+                    </div>
+
+                    <!-- Existing comment indicator -->
+                    <div v-if="line.newLine && hasCommentAt(file.path, line.newLine)" class="w-6 flex-shrink-0 flex items-center justify-center">
+                      <span class="text-[10px] text-yellow-400" title="Has comment">💬</span>
+                    </div>
+                  </div>
+
+                  <!-- Inline comment form -->
+                  <div
+                    v-if="commentingAt && commentingAt.file === file.path && commentingAt.line === line.newLine"
+                    class="bg-surface border-y border-blue-500/30 px-4 py-3"
+                  >
+                    <div class="text-gray-500 text-[10px] mb-1">Comment on line {{ line.newLine }}</div>
+                    <textarea
+                      v-model="commentInput"
+                      class="w-full bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 resize-y"
+                      rows="2"
+                      placeholder="Leave a review comment or suggestion..."
+                      @keydown.meta.enter="addComment"
+                      @keydown.ctrl.enter="addComment"
+                    />
+                    <div class="flex gap-2 mt-1">
+                      <button
+                        class="px-2 py-0.5 text-[10px] bg-emerald-600 text-white rounded hover:bg-emerald-500"
+                        @click="addComment"
+                      >Add comment</button>
+                      <button
+                        class="px-2 py-0.5 text-[10px] text-gray-500 hover:text-gray-300"
+                        @click="cancelComment"
+                      >Cancel</button>
+                    </div>
+                  </div>
+
+                  <!-- Existing comment display -->
+                  <div
+                    v-if="line.newLine && hasCommentAt(file.path, line.newLine) && !(commentingAt && commentingAt.file === file.path && commentingAt.line === line.newLine)"
+                    class="bg-yellow-900/10 border-l-2 border-yellow-500/50 px-4 py-2 ml-[100px]"
+                  >
+                    <div class="text-yellow-300 text-xs">{{ hasCommentAt(file.path, line.newLine)!.comment }}</div>
+                    <button
+                      class="text-[10px] text-gray-600 hover:text-red-400 mt-0.5"
+                      @click="removeComment(reviewComments.indexOf(hasCommentAt(file.path, line.newLine)!))"
+                    >Remove</button>
+                  </div>
+                </template>
+              </template>
+            </div>
+          </div>
+
+          <!-- Pending review summary -->
+          <div v-if="reviewComments.length > 0 && !reviewSubmitting" class="p-4 border-t border-border bg-surface">
+            <div class="text-xs text-gray-400 mb-2">{{ reviewComments.length }} pending comment{{ reviewComments.length !== 1 ? 's' : '' }}</div>
+            <div v-for="(c, idx) in reviewComments" :key="idx" class="flex items-start gap-2 text-xs mb-1">
+              <span class="text-gray-600 shrink-0">{{ c.file.split('/').pop() }}:{{ c.line }}</span>
+              <span class="text-gray-300 flex-1">{{ c.comment }}</span>
+              <button class="text-gray-600 hover:text-red-400" @click="removeComment(idx)">✕</button>
+            </div>
+          </div>
+
+          <!-- Claude response stream -->
+          <div v-if="reviewStream.lines.value.length > 0 || reviewStream.running.value" class="border-t border-border p-4">
+            <div class="text-xs text-gray-500 mb-2">Claude's response:</div>
+            <div class="bg-surface-dark rounded p-3 max-h-[300px] overflow-y-auto">
+              <div
+                v-for="(ev, idx) in reviewStream.lines.value"
+                :key="idx"
+                class="text-xs text-gray-300 whitespace-pre-wrap"
+              >{{ (ev as any).line }}</div>
+              <div v-if="reviewStream.running.value" class="text-xs text-yellow-400 animate-pulse mt-1">Claude is updating code...</div>
+            </div>
           </div>
         </template>
       </div>
@@ -447,8 +903,23 @@ function formatDate(iso: string) {
           <dd class="text-white">{{ formatDate(instance.createdAt) }}</dd>
 
           <template v-if="instance.pluginName">
-            <dt class="text-gray-500">Plugin</dt>
-            <dd class="text-purple-400">{{ instance.pluginName }}</dd>
+            <dt class="text-gray-500 pt-2 border-t border-border mt-2">Plugin</dt>
+            <dd class="text-purple-400 pt-2 border-t border-border mt-2">{{ instance.pluginName }}</dd>
+
+            <dt class="text-gray-500">Plugin path</dt>
+            <dd class="text-white font-mono text-xs">
+              {{ instance.worktreePath }}/custom/plugins/{{ instance.pluginName }}
+            </dd>
+
+            <dt class="text-gray-500">Plugin branch</dt>
+            <dd class="text-white font-mono text-xs">{{ instance.branch }}</dd>
+          </template>
+
+          <template v-if="instance.linkedPlugins && instance.linkedPlugins.length > 1">
+            <dt class="text-gray-500">Linked plugins</dt>
+            <dd class="text-purple-400 text-xs">
+              {{ instance.linkedPlugins.join(', ') }}
+            </dd>
           </template>
 
           <template v-if="instance.changes">
@@ -462,6 +933,15 @@ function formatDate(iso: string) {
             </dd>
           </template>
         </dl>
+      </div>
+
+      <!-- Plugin-provided tab -->
+      <div v-if="activePluginTab" class="flex-1 overflow-y-auto">
+        <PluginSlot
+          :render="activePluginTab.render"
+          :instance="instance"
+          :key="activeTab"
+        />
       </div>
     </div>
   </div>

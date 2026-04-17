@@ -285,6 +285,34 @@ The target also prints a SHA256 checksum.
 
 The formula currently uses a `file://` URL for local testing. To publish, switch the `url` to a GitHub Releases archive and replace `sha256`.
 
+## Feature Flags
+
+### `SWCTL_RESOLVE_ENABLED`
+
+The GitHub-issue → fix → PR Claude Code workflow (the `resolve` feature) is
+hidden by default. Set `SWCTL_RESOLVE_ENABLED=1` in your shell profile, per
+invocation, or in the `swctl-ui` compose service environment to enable it:
+
+```
+export SWCTL_RESOLVE_ENABLED=1
+```
+
+With the flag off (default):
+
+- `swctl resolve …` and all subcommands exit with a clean error.
+- `/api/skill/resolve/*` endpoints return 404.
+- The `/resolve` route and the dashboard resolve widget are not registered
+  in the UI.
+- The "Submit Review" action on the Instance Detail diff tab is hidden.
+
+With the flag on:
+
+- Full resolve workflow is available via UI (`/#/resolve`), CLI (`swctl
+  resolve <issue>`), and Claude Code (`/shopware-resolve …`).
+
+The rest of swctl is unaffected — worktree creation, doctor, nuke, plugin
+support, MCP server, and the build cache all work regardless of this flag.
+
 ## Troubleshooting
 
 ### Traefik route does not resolve

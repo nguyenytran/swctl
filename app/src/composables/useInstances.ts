@@ -6,6 +6,10 @@ import { useActiveProject } from './useActiveProject'
 
 const allItems = ref<WorktreeItem[]>([])
 const loading = ref(false)
+// `loaded` stays false until the first successful refresh so components
+// can render a skeleton placeholder instead of the "No instances"
+// empty state during the initial fetch — prevents layout shift.
+const loaded = ref(false)
 
 export function useInstances() {
   const { activeProjectName } = useActiveProject()
@@ -14,6 +18,7 @@ export function useInstances() {
     loading.value = true
     try {
       allItems.value = await fetchInstances()
+      loaded.value = true
     } finally {
       loading.value = false
     }
@@ -55,6 +60,7 @@ export function useInstances() {
     filteredInstances,
     filteredExternalWorktrees,
     loading,
+    loaded,
     refresh,
     grouped,
   }

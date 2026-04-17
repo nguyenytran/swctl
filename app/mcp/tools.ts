@@ -203,6 +203,22 @@ export async function refresh(args: { issueId: string }): Promise<ToolResult> {
   return error(`Failed to refresh instance ${args.issueId}:\n${result.output}`)
 }
 
+/**
+ * Complete provisioning (database clone, Docker container, Shopware install)
+ * for an instance that was created with `--no-provision`.  Mechanically this
+ * is the same as `refresh` (both resume provisioning when STATUS is
+ * creating/failed/provisioning-deferred), but the semantic distinction helps
+ * Claude pick the right tool: use `swctl_setup` after Step 4 review passes
+ * in the resolve workflow.
+ */
+export async function setup(args: { issueId: string }): Promise<ToolResult> {
+  const result = await callStream(`/api/stream/refresh?issueId=${encodeURIComponent(args.issueId)}`)
+  if (result.ok) {
+    return text(`Instance ${args.issueId} provisioned successfully (container + DB ready).\n${result.output}`)
+  }
+  return error(`Failed to provision instance ${args.issueId}:\n${result.output}`)
+}
+
 export async function smartCreate(args: {
   issue: string
   branch?: string

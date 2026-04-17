@@ -160,6 +160,83 @@ export function streamCommand(c: Context, cwd: string, command: string, streamId
   })
 }
 
+/**
+ * Like streamCommand, but takes an explicit binary + args array instead of a
+ * shell command string. Preferred when arguments contain shell-unsafe chars
+ * (URLs, quoted phrases). Optionally accepts an env override.
+ */
+export function streamSpawn(
+  c: Context,
+  cwd: string,
+  cmd: string,
+  args: string[],
+  streamId: string,
+  opts?: { env?: NodeJS.ProcessEnv },
+) {
+  const existing = activeStreams.get(streamId)
+  if (existing) {
+    if (existing.exitCode !== null || existing.killed) {
+      activeStreams.delete(streamId)
+    } else {
+      try {
+        process.kill(existing.pid!, 0)
+        return c.json({ error: `Operation already in progress for '${streamId}'` }, 409)
+      } catch {
+        activeStreams.delete(streamId)
+      }
+    }
+  }
+
+  const startTime = Date.now()
+  const child = spawn(cmd, args, {
+    cwd,
+    env: opts?.env
+      ? { ...process.env, ...opts.env, TERM: 'dumb', GIT_TERMINAL_PROMPT: '0' }
+      : { ...process.env, TERM: 'dumb', GIT_TERMINAL_PROMPT: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+
+  activeStreams.set(streamId, child)
+
+  const cleanup = () => { activeStreams.delete(streamId) }
+
+  return streamSSE(c, async (stream) => {
+    const sendEvent = async (event: string, data: object) => {
+      try {
+        await stream.writeSSE({ event, data: JSON.stringify(data) })
+      } catch {}
+    }
+
+    const onData = (chunk: Buffer) => {
+      for (const line of chunk.toString().split('\n')) {
+        if (line) sendEvent('log', { line, ts: Date.now() })
+      }
+    }
+
+    child.stdout!.on('data', onData)
+    child.stderr!.on('data', onData)
+
+    stream.onAbort(() => {
+      cleanup()
+      child.kill()
+    })
+
+    await new Promise<void>((resolve) => {
+      child.on('close', (code) => {
+        cleanup()
+        sendEvent('done', { exitCode: code || 0, elapsed: Date.now() - startTime })
+          .then(resolve)
+      })
+
+      child.on('error', (err) => {
+        cleanup()
+        sendEvent('error', { message: err.message })
+          .then(resolve)
+      })
+    })
+  })
+}
+
 export function spawnSwctl(args: string[]): Promise<{ ok: boolean; output: string }> {
   return new Promise((resolve) => {
     const child = spawn('bash', [SWCTL_PATH, ...args], {

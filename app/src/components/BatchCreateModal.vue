@@ -292,6 +292,9 @@ async function fetchFromGitHub() {
   try {
     // Ensure instances are loaded so we can cross-reference existing worktrees
     await refreshInstances()
+    // Batch-create shows everything the user is assigned to. Label-based
+    // narrowing is the Resolve page's concern — batch-create is for bulk
+    // operations (stop/start/delete/create) where exhaustive lists help.
     const result = await fetchGitHubIssues()
     ghFetched.value = true
     if (result.rateLimit) ghRateLimit.value = result.rateLimit
@@ -443,7 +446,9 @@ function handleNewBatch() {
       <div class="flex items-center justify-between px-6 py-4 border-b border-border bg-surface">
         <div class="flex items-center gap-4">
           <button class="text-gray-400 hover:text-white transition-colors text-lg" @click="handleClose">&larr;</button>
-          <div>
+          <!-- Reserve a stable subtitle height so idle → validating →
+               running states don't change modal header geometry. -->
+          <div class="[&>p]:min-h-[1.25em]">
             <h2 class="text-lg font-bold text-white">Batch Create Worktrees</h2>
             <p class="text-xs text-gray-400 mt-0.5" v-if="batch.isStarted.value">
               <span class="text-emerald-400">{{ batch.successCount.value }} done</span> &middot;
@@ -519,7 +524,13 @@ function handleNewBatch() {
                 <option v-for="p in availablePlugins" :key="p" :value="p">{{ p }}</option>
               </select>
             </div>
-            <div v-if="availableDeps.length" class="w-52">
+            <!-- Dependencies column always reserves 208 px; hides via
+                 visibility when no deps are available so switching
+                 projects doesn't reflow neighbours. -->
+            <div
+              class="w-52"
+              :class="{ 'invisible pointer-events-none': !availableDeps.length }"
+            >
               <label class="block text-xs text-gray-400 mb-1">Dependencies</label>
               <div class="relative">
                 <button
@@ -562,9 +573,14 @@ function handleNewBatch() {
               </select>
             </div>
             <div class="w-36">
-              <label class="block text-xs text-gray-400 mb-1">
+              <label class="block text-xs text-gray-400 mb-1 flex items-center gap-1">
                 Concurrency ({{ batch.concurrency.value }})
-                <span v-if="batch.concurrencyAutoDetected.value" class="text-gray-600">auto</span>
+                <!-- Reserve space for "auto" even when hidden so the slider
+                     doesn't shift when /api/system-info resolves. -->
+                <span
+                  class="text-gray-600 min-w-[28px] inline-block"
+                  :class="{ 'invisible': !batch.concurrencyAutoDetected.value }"
+                >auto</span>
               </label>
               <input
                 type="range"
@@ -572,9 +588,14 @@ function handleNewBatch() {
                 min="1" max="4"
                 :disabled="batch.isRunning.value"
                 class="w-full accent-blue-500"
+                @input="batch.markConcurrencyUserChosen"
               />
             </div>
-            <div v-if="batch.concurrency.value > 1" class="w-32">
+            <!-- Stagger column always reserves its 128 px; slider is
+                 disabled (instead of hidden) when concurrency is 1.
+                 Prevents the whole settings row from reflowing when
+                 the saved concurrency flips between 1 and 2+. -->
+            <div class="w-32">
               <label class="block text-xs text-gray-400 mb-1">
                 Stagger ({{ batch.staggerDelay.value }}s)
               </label>
@@ -582,13 +603,18 @@ function handleNewBatch() {
                 type="range"
                 v-model.number="batch.staggerDelay.value"
                 min="0" max="60" step="10"
-                :disabled="batch.isRunning.value"
+                :disabled="batch.isRunning.value || batch.concurrency.value <= 1"
                 class="w-full accent-blue-500"
                 title="Delay between job starts to avoid resource contention. Set to 0 for simultaneous starts."
+                @input="batch.markStaggerUserChosen"
               />
             </div>
-            <!-- Tab switcher -->
-            <div v-if="!batch.isRunning.value" class="ml-auto">
+            <!-- Tab switcher — hide via visibility so the ml-auto spacer
+                 keeps pushing neighbours to the right during a running batch. -->
+            <div
+              class="ml-auto"
+              :class="{ 'invisible pointer-events-none': batch.isRunning.value }"
+            >
               <div class="inline-flex bg-surface-dark rounded-full p-0.5 border border-border">
                 <button
                   class="px-4 py-1.5 text-xs font-medium rounded-full transition-all"

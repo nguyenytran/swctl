@@ -7,6 +7,36 @@ export async function fetchInstances(): Promise<WorktreeItem[]> {
   return res.json()
 }
 
+export interface CleanupState {
+  diskSizeBytes: number | null
+  lastActivity: string | null
+  dirty: boolean
+  ahead: number
+  behind: number
+  prState: 'open' | 'draft' | 'merged' | 'closed' | null
+}
+
+export async function fetchCleanupState(issueId: string): Promise<CleanupState | null> {
+  try {
+    const res = await fetch(`${BASE}/instances/${encodeURIComponent(issueId)}/cleanup-state`)
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+export async function fetchCleanupStateBatch(issueIds: string[]): Promise<Record<string, CleanupState>> {
+  if (issueIds.length === 0) return {}
+  try {
+    const res = await fetch(`${BASE}/instances/cleanup-state?issues=${encodeURIComponent(issueIds.join(','))}`)
+    if (!res.ok) return {}
+    return await res.json() as Record<string, CleanupState>
+  } catch {
+    return {}
+  }
+}
+
 export async function fetchConfig(): Promise<ProjectConfig> {
   const res = await fetch(`${BASE}/config`)
   return res.json()
@@ -149,11 +179,28 @@ export async function fetchGitHubStatus(): Promise<GitHubAuthStatus> {
   return res.json()
 }
 
-export async function fetchGitHubIssues(org?: string): Promise<GitHubResult> {
+export async function fetchGitHubIssues(
+  org?: string,
+  labels?: string[],
+): Promise<GitHubResult> {
   const params = new URLSearchParams()
   if (org) params.set('org', org)
+  // Passing an empty string is intentional: the server treats "labels present
+  // but empty" as "user removed every chip" → no assigned items. Omit the
+  // param entirely to disable the label filter.
+  if (labels !== undefined) params.set('labels', labels.join(','))
   const res = await fetch(`${BASE}/github/issues?${params}`)
   return res.json()
+}
+
+export async function fetchDefaultIssueLabels(): Promise<string[]> {
+  try {
+    const res = await fetch(`${BASE}/github/labels/defaults`)
+    const body = await res.json() as { labels?: string[] }
+    return body.labels || []
+  } catch {
+    return []
+  }
 }
 
 export async function githubLogout(): Promise<void> {

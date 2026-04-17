@@ -22,6 +22,11 @@ services:
       - project
     volumes:
       - ${SW_WORKTREE_PATH}:/var/www/html:cached
+      # Docker volume overlays for vendor + admin/storefront node_modules are
+      # appended by write_compose_volume_override in swctl — it decides per
+      # instance whether to mount the shared base (ro, fast) or a dedicated
+      # volume (rw, populated from base cache). Keeping them out of this base
+      # template lets the override vary RO/RW without compose-merge clashes.
     labels:
       - "swctl.managed=true"
       - "swctl.project=${SW_PROJECT_SLUG}"

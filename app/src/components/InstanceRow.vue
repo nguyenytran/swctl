@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import type { Instance } from '@/types'
+import { usePlugins, buildPluginContext } from '@/composables/usePlugins'
+import { computed } from 'vue'
 
-defineProps<{ instance: Instance; selected: boolean }>()
+const props = defineProps<{ instance: Instance; selected: boolean }>()
 const emit = defineEmits<{
   delete: []
   retry: []
@@ -12,6 +14,22 @@ const emit = defineEmits<{
   'switch-mode': [mode: string]
   'toggle-select': []
 }>()
+
+// Plugin actions that apply to this instance
+const plugins = usePlugins()
+const pluginActions = computed(() => plugins.actions.value.filter(a =>
+  a.scope === 'instance' && (!a.condition || a.condition(props.instance))
+))
+
+async function runPluginAction(actionId: string, pluginId: string) {
+  const action = plugins.actions.value.find(a => a.id === actionId && a.pluginId === pluginId)
+  if (!action) return
+  try {
+    await action.handler(buildPluginContext({ instance: props.instance }))
+  } catch (err) {
+    console.error(`[plugin action ${pluginId}:${actionId}]`, err)
+  }
+}
 
 function statusColor(status: string) {
   if (status === 'running') return 'text-emerald-400'
@@ -189,6 +207,16 @@ function provisionBadge(status: string) {
           Delete
         </button>
       </template>
+      <!-- Plugin-provided actions -->
+      <button
+        v-for="a in pluginActions"
+        :key="`${a.pluginId}:${a.id}`"
+        class="text-xs text-gray-400 hover:text-white transition-colors"
+        :title="`${a.label} (${a.pluginId})`"
+        @click="runPluginAction(a.id, a.pluginId)"
+      >
+        <span v-if="a.icon">{{ a.icon }}</span>{{ a.label }}
+      </button>
     </td>
   </tr>
 </template>

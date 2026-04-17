@@ -5,7 +5,15 @@
 
 set -euo pipefail
 
+# QA mode: skip theme:refresh (the synced theme is fine) but still run
+# cache:clear so the DI container is fresh after plugin:refresh +
+# plugin:install (and after the build.sh tail cache:clear was removed).
 if [ "$SWCTL_MODE" = "qa" ]; then
+    if [ "$((BACKEND_CHANGES + ADMIN_CHANGES + STOREFRONT_CHANGES + COMPOSER_CHANGES + PACKAGE_CHANGES))" -gt 0 ] \
+       && [ "${DB_STATE:-}" != "fresh" ]; then
+        run_app_command "$COMPOSE_PROJECT" "$WORKFLOW_CONSOLE cache:clear" \
+            || warn "cache:clear failed."
+    fi
     return 0 2>/dev/null || exit 0
 fi
 

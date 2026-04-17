@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useInstances } from '@/composables/useInstances'
 import { useProjects } from '@/composables/useProjects'
@@ -12,16 +12,23 @@ import ProjectsModal from './ProjectsModal.vue'
 import LogPanel from './LogPanel.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import InstanceDetail from './InstanceDetail.vue'
+import PluginSlot from './PluginSlot.vue'
+import { usePlugins } from '@/composables/usePlugins'
 import { buildStreamUrl, buildCreateUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject } from '@/api'
 import type { Instance, ExternalWorktree } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
 
-const { filteredInstances, filteredExternalWorktrees, instances, loading, refresh, grouped } = useInstances()
+const { filteredInstances, filteredExternalWorktrees, instances, loading, loaded: instancesLoaded, refresh, grouped } = useInstances()
 const { projects } = useProjects()
 const stream = useStream()
 const { lastEvent } = useEvents()
+const plugins = usePlugins()
+
+// Plugin widgets split by slot location
+const sidebarWidgets = computed(() => plugins.widgets.value.filter(w => w.location === 'dashboard-sidebar'))
+const bottomWidgets = computed(() => plugins.widgets.value.filter(w => w.location === 'dashboard-bottom'))
 
 // Route-driven modal state
 const showBatchCreate = computed(() => route.meta.modal === 'batch-create')
@@ -217,6 +224,17 @@ watch(() => stream.result.value, (val) => {
 watch(lastEvent, (event) => {
   if (event?.type === 'instance-changed') refresh()
 })
+
+// Re-fetch on mount so navigating here from another route (e.g. from
+// the /resolve plugin page after a run just finished) always shows the
+// latest instances without a manual page reload.
+onMounted(() => { refresh() })
+
+// If the user lands on /dashboard/instance/<id> for an instance we haven't
+// loaded yet (e.g. just-created), refresh so the detail view can render it.
+watch(() => route.params.issueId, (id) => {
+  if (id && !instances.value.find(i => i.issueId === id)) refresh()
+})
 </script>
 
 <template>
@@ -276,8 +294,16 @@ watch(lastEvent, (event) => {
       >Clear</button>
     </div>
 
+    <!-- Instances area — render a reserved-space skeleton while the
+         initial /api/instances is in flight so the content below
+         doesn't jump up once data arrives. -->
+    <div
+      v-if="!instancesLoaded"
+      class="border border-border rounded-lg bg-surface min-h-[180px] animate-pulse opacity-40"
+      aria-hidden="true"
+    />
     <!-- Instances table grouped by project -->
-    <div v-if="filteredInstances.length > 0" class="border border-border rounded-lg overflow-hidden">
+    <div v-else-if="filteredInstances.length > 0" class="border border-border rounded-lg overflow-hidden">
       <table class="w-full text-sm">
         <thead>
           <tr class="bg-surface text-gray-400 text-xs uppercase tracking-wider">
@@ -453,10 +479,35 @@ watch(lastEvent, (event) => {
       </table>
     </div>
 
-    <!-- Empty state -->
-    <div v-if="!hasInstances && !loading" class="text-center py-16 text-gray-500">
+    <!-- Empty state — only after initial load resolves so the skeleton
+         block above stays in place during the first fetch. -->
+    <div v-if="instancesLoaded && !hasInstances" class="text-center py-16 text-gray-500 min-h-[180px] flex flex-col items-center justify-center">
       <p class="text-lg mb-2">No worktrees</p>
       <p class="text-sm">Click <strong>+ Create</strong> to get started.</p>
+    </div>
+
+    <!-- Plugin widgets: dashboard-sidebar (above list) -->
+    <div v-if="sidebarWidgets.length > 0" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
+      <div
+        v-for="w in sidebarWidgets"
+        :key="`${w.pluginId}:${w.id}`"
+        class="bg-surface border border-border rounded p-3"
+      >
+        <div v-if="w.title" class="text-xs text-gray-500 mb-2">{{ w.title }}</div>
+        <PluginSlot :render="w.render" :key="`${w.pluginId}:${w.id}`" />
+      </div>
+    </div>
+
+    <!-- Plugin widgets: dashboard-bottom -->
+    <div v-if="bottomWidgets.length > 0" class="mt-6 space-y-3">
+      <div
+        v-for="w in bottomWidgets"
+        :key="`${w.pluginId}:${w.id}`"
+        class="bg-surface border border-border rounded p-3"
+      >
+        <div v-if="w.title" class="text-xs text-gray-500 mb-2">{{ w.title }}</div>
+        <PluginSlot :render="w.render" :key="`${w.pluginId}:${w.id}`" />
+      </div>
     </div>
 
     <!-- Modals -->

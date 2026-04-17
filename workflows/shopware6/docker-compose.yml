@@ -21,8 +21,9 @@ services:
       - proxy
     volumes:
       - ${SW_WORKTREE_PATH}:/var/www/html:cached
-      - vendor:/var/www/html/vendor:cached
-      - node_modules:/var/www/html/node_modules:cached
+      # vendor + admin/storefront node_modules are mounted as docker volumes
+      # by write_compose_volume_override in swctl (RO shared base when possible,
+      # RW dedicated when dependency changes were detected).
     labels:
       - "traefik.enable=true"
       # Traefik routes each worktree to <project>-<issue>.<domain suffix>.
@@ -32,12 +33,6 @@ services:
       - "swctl.managed=true"
       - "swctl.project=${SW_PROJECT_SLUG}"
       - "swctl.issue=${SW_ISSUE}"
-
-volumes:
-  vendor:
-    name: ${SW_VENDOR_VOLUME}
-  node_modules:
-    name: ${SW_NODE_MODULES_VOLUME}
 
 networks:
   proxy:
