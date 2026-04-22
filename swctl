@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.5.2"
+SWCTL_VERSION="0.5.3"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -1037,6 +1037,34 @@ init_infra() {
             --entrypoints.web.address=:80
     else
         info "OrbStack detected. Skipping Traefik — OrbStack handles DNS routing."
+    fi
+
+    # Guard: refuse to create swctl-mariadb when the project network
+    # (trunk_default or whatever SW_PROJECT_NETWORK is set to) already
+    # has another container aliased as `database`.  Two containers
+    # sharing a DNS alias → Docker round-robins → intermittent
+    # "Unknown database" errors at runtime.  Skip silently when not in
+    # Traefik mode (OrbStack users almost always use their own compose).
+    if [ "$runtime" != "traefik" ]; then
+        local _proj_net="${SW_PROJECT_NETWORK:-trunk_default}"
+        if docker network inspect "$_proj_net" >/dev/null 2>&1; then
+            local _existing_db
+            _existing_db="$(docker network inspect "$_proj_net" --format '{{range .Containers}}{{.Name}}
+{{end}}' 2>/dev/null | while read -r n; do
+                [ -n "$n" ] || continue
+                if docker inspect "$n" --format '{{with (index .NetworkSettings.Networks "'"$_proj_net"'")}}{{range .Aliases}}{{.}}
+{{end}}{{end}}' 2>/dev/null | grep -Fxq database; then
+                    printf '%s\n' "$n"
+                fi
+            done | head -1)"
+            if [ -n "$_existing_db" ]; then
+                warn "Network '$_proj_net' already has '$_existing_db' aliased as 'database'."
+                warn "  Skipping swctl-mariadb — your project compose already provides it."
+                warn "  (Having two 'database' aliases on one network causes DNS round-robin + intermittent 'Unknown database' errors.)"
+                ok "Shared infrastructure: reusing '$_existing_db' for database on network '$_proj_net'."
+                return 0
+            fi
+        fi
     fi
 
     start_or_create_container "$SW_INFRA_DB_CONTAINER" \
@@ -4812,7 +4840,92 @@ cmd_doctor() {
         done < <(find "${SWCTL_REGISTRY_DIR:-${HOME}/.local/state/swctl/instances}" -type f -name '*.env' 2>/dev/null)
     fi
 
-    # 8. Disk free (/ and $HOME).
+    # 8. DNS-alias collisions on project networks.
+    # Symptom: docker's embedded DNS round-robins across all containers
+    # sharing an alias on a network.  If `swctl init` created
+    # `swctl-mariadb` (aliased as `database` on the trunk network) AND
+    # the project's own compose also starts a `database` service on the
+    # same network, connections intermittently land on the wrong
+    # MariaDB — resulting in 50 % of requests failing with "Unknown
+    # database 'shopware_<id>'" while the other 50 % work.  Catches this
+    # for every network attached to a tracked swctl instance.
+    local _doctor_seen_networks=""
+    if [ -d "${SWCTL_REGISTRY_DIR:-${HOME}/.local/state/swctl/instances}" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            local _compose_project
+            _compose_project="$(awk -F= '/^COMPOSE_PROJECT=/ {gsub(/[\047"]/, "", $2); print $2; exit}' "$f" 2>/dev/null)"
+            [ -n "$_compose_project" ] || continue
+            # Pull every network the compose project is attached to
+            local _nets
+            # shellcheck disable=SC2016
+            _nets="$(docker ps -q --filter "label=com.docker.compose.project=${_compose_project}" 2>/dev/null \
+                | xargs -I{} docker inspect {} --format '{{range $net, $_ := .NetworkSettings.Networks}}{{$net}}
+{{end}}' 2>/dev/null | sort -u)"
+            local _net
+            while IFS= read -r _net; do
+                [ -n "$_net" ] || continue
+                # Dedup: only check each network once
+                case ",$_doctor_seen_networks," in *",$_net,"*) continue ;; esac
+                _doctor_seen_networks="${_doctor_seen_networks:+${_doctor_seen_networks},}${_net}"
+                # For every alias that appears on ≥ 2 containers in this network,
+                # warn with the remedy.  `docker network inspect` gives us
+                # a flat list of "<name>\t<aliases-comma-separated>" per
+                # container.
+                local _conflicts
+                _conflicts="$(docker network inspect "$_net" --format '{{range .Containers}}{{.Name}}
+{{end}}' 2>/dev/null)"
+                # Build an aliases-by-network-member map
+                local _tmp="${SWCTL_TMP_DIR:-/tmp}/doctor-aliases.$$"
+                : >"$_tmp"
+                local _cname
+                while IFS= read -r _cname; do
+                    [ -n "$_cname" ] || continue
+                    docker inspect "$_cname" --format '{{with (index .NetworkSettings.Networks "'"$_net"'")}}{{range .Aliases}}{{.}} '"$_cname"'
+{{end}}{{end}}' 2>/dev/null >>"$_tmp"
+                done <<< "$_conflicts"
+                # Find aliases that appear more than once
+                local _dupes
+                _dupes="$(awk '{print $1}' "$_tmp" | sort | uniq -d)"
+                rm -f "$_tmp"
+                local _alias
+                while IFS= read -r _alias; do
+                    [ -n "$_alias" ] || continue
+                    # Skip the automatic container-id-shortform alias (12-char hex)
+                    case "$_alias" in [0-9a-f]*) [ ${#_alias} -le 12 ] && continue ;; esac
+                    # Only warn about aliases that matter to the app boot —
+                    # database/redis/opensearch/etc.  Generic aliases like
+                    # `web` or `app` are naturally shared across multiple
+                    # compose projects joining one network (each worktree
+                    # names its service `web`) and don't cause the
+                    # round-robin "Unknown database" class of bug because
+                    # nothing inside the container looks up `web` via DNS.
+                    case "$_alias" in
+                        database|mysql|mariadb|postgres|postgresql|\
+                        redis|valkey|\
+                        opensearch|elasticsearch|es|\
+                        mailer|mailhog|mailpit|\
+                        rabbitmq|messagebus) ;;
+                        *) continue ;;
+                    esac
+                    local _owners
+                    _owners="$(docker network inspect "$_net" --format '{{range .Containers}}{{.Name}}|{{end}}' 2>/dev/null \
+                        | tr '|' '\n' | while read -r n; do
+                            [ -n "$n" ] || continue
+                            if docker inspect "$n" --format '{{with (index .NetworkSettings.Networks "'"$_net"'")}}{{range .Aliases}}{{.}}
+{{end}}{{end}}' 2>/dev/null | grep -Fxq "$_alias"; then
+                                printf '%s ' "$n"
+                            fi
+                        done)"
+                    warn "network '$_net': alias '$_alias' is claimed by multiple containers (${_owners}) — DNS will round-robin, causing intermittent 'Unknown database' / connection errors."
+                    warn "  Remedy: keep one container attached; run 'docker network disconnect $_net <stale-container>'"
+                    rc=1
+                done <<< "$_dupes"
+            done <<< "$_nets"
+        done < <(find "${SWCTL_REGISTRY_DIR:-${HOME}/.local/state/swctl/instances}" -type f -name '*.env' 2>/dev/null)
+    fi
+
+    # 9. Disk free (/ and $HOME).
     local free
     free="$(df -h "${HOME}" 2>/dev/null | awk 'NR==2 {print $4}')"
     info "disk free in HOME   : ${free:-unknown}"
