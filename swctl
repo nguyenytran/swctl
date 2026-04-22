@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.5.1"
+SWCTL_VERSION="0.5.2"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -3211,16 +3211,21 @@ cmd_create() {
 
             provision_database_and_app "$COMPOSE_PROJECT"
 
-            # Ensure the nested plugin is properly registered before the admin
-            # build.  The cloned DB has the plugin record but plugin:refresh
-            # updates paths/metadata to match the current worktree filesystem.
-            # (Safe here because the plugin IS at custom/plugins/<Name>/ — the
-            # same relative path as in trunk.)
+            # Ensure the nested plugin is properly registered AND activated
+            # before the admin build.  plugin:refresh alone is not enough —
+            # if trunk's source DB happens to have the plugin row as
+            # active=0 (deactivated at some point, reset, etc.), every
+            # cloned worktree inherits active=0.  Without active=1, the
+            # DbalKernelPluginLoader never requires the plugin's composer.json,
+            # never registers its PSR-4 autoload, never instantiates its
+            # Bundle class → /api/_info/config silently omits the plugin and
+            # the admin UI can't load it.  `plugin:install --activate` is
+            # idempotent, so running it unconditionally is safe.
             #
-            # Chain plugin:refresh with any dependency activations under ONE
-            # docker exec — each bin/console invocation costs ~3 s of PHP
-            # kernel boot; batching saves (1 + N_deps) × ~3 s per create.
-            local _plugin_prep_cmd="$SW_BIN_CONSOLE plugin:refresh"
+            # Chain plugin:refresh + primary activate + dep activates under
+            # ONE docker exec — each bin/console invocation costs ~3 s of
+            # PHP kernel boot; batching saves (2 + N_deps) × ~3 s per create.
+            local _plugin_prep_cmd="$SW_BIN_CONSOLE plugin:refresh && $SW_BIN_CONSOLE plugin:install --activate $PLUGIN_NAME"
             if [ -n "$dep_plugins" ]; then
                 local _old_ifs="$IFS"
                 IFS=','
@@ -3230,7 +3235,7 @@ cmd_create() {
                 IFS="$_old_ifs"
             fi
             run_app_command "$COMPOSE_PROJECT" "$_plugin_prep_cmd" 2>/dev/null \
-                || warn "plugin:refresh / dep activation failed."
+                || warn "plugin:refresh / activation failed."
 
             if [ "$PLUGIN_BUILD_CACHE_HIT" = "1" ]; then
                 # Cache hit — Resources/public/ is already mounted from the
