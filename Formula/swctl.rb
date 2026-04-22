@@ -47,14 +47,11 @@ class Swctl < Formula
       Start the web UI with:
         swctl ui
 
-      Optional: install the bundled shopware-resolve skill + swctl MCP into
-      your host Claude Code so `claude /shopware-resolve` works directly:
+      Optional: install bundled Claude Code skills + MCP server:
         swctl skill install --user
         swctl mcp install --user
 
       Requires Docker (or OrbStack) to be installed and running.
-      Claude Code (https://claude.com/claude-code) is required for the
-      resolve workflow; MCP helpers also need `jq` (auto-installed).
     EOS
   end
 
