@@ -135,29 +135,32 @@ SH
 }
 
 @test "ai fallback: binary missing (ENOENT) → method=fallback" {
-    # No stub — point at a guaranteed-missing path.
+    # No stub — point at a guaranteed-missing path.  Label chosen so the
+    # heuristic finds a plugin match but branchPrefixFromLabels stays at
+    # the default 'fix' — that way the fast-path check (prefix !== 'fix')
+    # is false and the test actually exercises the AI-spawn + ENOENT
+    # fallback path we care about.
     input='{
         "issueTitle":"x",
         "issueBody":"",
-        "labels":["extension/swag-commercial"],
+        "labels":["extension/custom-widget"],
         "backend":"claude",
-        "pluginNames":["SwagCommercial"]
+        "pluginNames":["CustomWidget"]
     }'
     SWCTL_CLAUDE_BIN=/nonexistent/definitely-not-a-binary \
         run bash -c "cd '$_repo' && printf '%s' '$input' | '$_tsx' '$_probe'"
-    # Dump the actual output when the assertions fail so CI logs show us
-    # what the probe returned (this test flaked on Linux and macOS +
-    # Linux node have different ENOENT-on-spawn timing).
+    # Keep a diagnostic: if this ever regresses, the CI log shows exactly
+    # what the probe returned instead of an opaque bash-pattern failure.
     if [ "$status" -ne 0 ] \
        || [[ "$output" != *'"method":"fallback"'* ]] \
-       || [[ "$output" != *'"project":"SwagCommercial"'* ]]; then
+       || [[ "$output" != *'"project":"CustomWidget"'* ]]; then
         echo "status: $status" >&2
         echo "output: $output" >&2
     fi
     [ "$status" -eq 0 ]
     [[ "$output" == *'"method":"fallback"'* ]]
-    # Heuristic should still populate plugin — extension/swag-commercial → SwagCommercial.
-    [[ "$output" == *'"project":"SwagCommercial"'* ]]
+    # Heuristic should still populate the plugin — extension/custom-widget → CustomWidget.
+    [[ "$output" == *'"project":"CustomWidget"'* ]]
 }
 
 @test "tolerates leading prose around JSON block" {

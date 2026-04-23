@@ -265,8 +265,19 @@ function labelWords(label: string): string[] {
  */
 export function branchPrefixFromLabels(labels: string[]): 'fix' | 'feat' | 'chore' {
   const lower = labels.map((l) => l.toLowerCase())
+  // Match `n` as a whole word inside `l` — non-alphanumeric boundaries or
+  // start/end of string on both sides.  The previous `l.includes(n)` check
+  // was too loose: short keywords like "ci" matched any label containing
+  // that 2-char substring (e.g. "extension/swag-commercial" → "chore"
+  // because "commercial" contains "ci").  The regex escapes nothing —
+  // callers pass literal latin keywords — but we still anchor on
+  // non-alphanumerics so "bug-report" keeps matching "bug".
   const has = (...needles: string[]) =>
-    lower.some((l) => needles.some((n) => l === n || l.endsWith('/' + n) || l.includes(n)))
+    lower.some((l) => needles.some((n) =>
+      l === n ||
+      l.endsWith('/' + n) ||
+      new RegExp(`(^|[^a-z0-9])${n}([^a-z0-9]|$)`).test(l)
+    ))
 
   // Feature / enhancement indicators
   if (has('feature', 'enhancement', 'new feature', 'improvement')) return 'feat'
