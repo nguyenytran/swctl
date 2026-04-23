@@ -1,5 +1,9 @@
 # swctl
 
+[![CI](https://github.com/nguyenytran/swctl/actions/workflows/ci.yml/badge.svg)](https://github.com/nguyenytran/swctl/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/nguyenytran/swctl)](https://github.com/nguyenytran/swctl/releases)
+[![License](https://img.shields.io/github/license/nguyenytran/swctl)](LICENSE)
+
 `swctl` is a pure Bash CLI for managing Shopware 6 Git worktrees with Docker or OrbStack, Traefik routing, MariaDB/Redis shared infra, and an ANSI-only TUI dashboard.
 
 ## Features
@@ -284,6 +288,37 @@ The target also prints a SHA256 checksum.
    ```
 
 The formula currently uses a `file://` URL for local testing. To publish, switch the `url` to a GitHub Releases archive and replace `sha256`.
+
+### Cutting a release (automated)
+
+Once `SWCTL_VERSION` in `swctl` and `VERSION` in `Makefile` match the new version, the `Release` workflow handles the rest:
+
+```bash
+# 1. Bump the version in swctl + Makefile, commit, push.
+vim swctl Makefile
+git commit -am "release: v0.5.6 — <summary>"
+git push
+
+# 2. Tag + push.  Must match pattern v*.*.*
+git tag v0.5.6
+git push origin v0.5.6
+```
+
+The `.github/workflows/release.yml` workflow then:
+
+1. Re-runs the full CI (lint + unit tests + integration tests — fails fast if anything is red).
+2. Builds `dist/swctl-0.5.6.tar.gz` via `make release`.
+3. Creates a GitHub release with auto-generated notes from commit messages since the previous tag.
+4. Updates `Formula/swctl.rb` with the new URL + SHA256 and commits it back to `main`.
+5. Pushes the same Formula update to `nguyenytran/homebrew-tap` (so `brew upgrade` picks it up).
+
+The last step requires a repo secret `TAP_DEPLOY_TOKEN` — a fine-grained Personal Access Token with **Contents: Read and write** permission on `nguyenytran/homebrew-tap`. Without the secret, the step is skipped with a warning and the maintainer updates the tap manually.
+
+To set it up once:
+
+1. GitHub → your profile → *Settings* → *Developer settings* → *Fine-grained personal access tokens* → *Generate new token*.
+2. Resource owner: `nguyenytran`. Repository access: only select `homebrew-tap`. Permissions: **Contents: Read and write**.
+3. In the `swctl` repo: *Settings* → *Secrets and variables* → *Actions* → *New repository secret* named `TAP_DEPLOY_TOKEN`.
 
 ## Feature Flags
 

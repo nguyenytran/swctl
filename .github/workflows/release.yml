@@ -1,0 +1,190 @@
+name: Release
+
+# Triggered when a v*.*.* tag is pushed to the repo.  Runs the full test
+# suite first (nothing ships broken), builds the distribution tarball,
+# creates a GitHub release with auto-generated notes, then syncs the
+# Formula SHA256 into both this repo (Formula/swctl.rb on main) and the
+# homebrew-tap (Formula/swctl.rb on main).
+#
+# Release flow for the maintainer shrinks to:
+#
+#   vim swctl Makefile         # bump SWCTL_VERSION + VERSION
+#   git commit -am "release: vX.Y.Z ..."
+#   git push
+#   git tag vX.Y.Z && git push origin vX.Y.Z
+#
+# … and this workflow takes care of the rest.
+#
+# Required repo secrets:
+#   TAP_DEPLOY_TOKEN  Fine-grained PAT with "Contents: Read+Write" on
+#                     nguyenytran/homebrew-tap.  If unset, the cross-repo
+#                     step is skipped and the workflow logs a warning.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write       # create GitHub releases + commit Formula update
+
+jobs:
+  verify:
+    # Gate the release on a clean test run — the same checks CI runs on
+    # every PR.  Belt-and-braces; tags usually point at an already-CI'd
+    # commit, but this catches "tagged the wrong commit" accidents.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate bash syntax
+        run: bash -n swctl
+
+      - name: ShellCheck
+        run: shellcheck swctl
+
+      - name: Install BATS
+        run: |
+          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats
+          sudo /tmp/bats/install.sh /usr/local
+
+      - name: Run unit tests
+        run: bats tests/*.bats
+
+      - name: Verify docker
+        run: docker info >/dev/null
+
+      - name: Pre-pull alpine image
+        run: docker pull alpine:latest
+
+      - name: Run integration tests
+        run: bats tests/integration/*.bats
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0         # full history for release-notes generation
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Sanity-check version alignment
+        # swctl, Makefile, and the tag must all agree.  Prevents a tag
+        # from shipping a tarball with a stale SWCTL_VERSION.
+        run: |
+          script_v=$(awk -F'"' '/^SWCTL_VERSION=/ {print $2; exit}' swctl)
+          make_v=$(awk -F'?= ' '/^VERSION \?=/ {print $2; exit}' Makefile)
+          echo "tag=${{ steps.version.outputs.version }}  script=$script_v  make=$make_v"
+          if [ "$script_v" != "${{ steps.version.outputs.version }}" ] \
+             || [ "$make_v" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::SWCTL_VERSION / Makefile VERSION must match the tag before tagging."
+            exit 1
+          fi
+
+      - name: Build release tarball
+        run: make release
+
+      - name: Capture SHA256
+        id: sha
+        run: |
+          sha="$(shasum -a 256 dist/swctl-${{ steps.version.outputs.version }}.tar.gz | awk '{print $1}')"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes from commits
+        id: notes
+        run: |
+          prev="$(git describe --tags --abbrev=0 --match='v*.*.*' '${{ steps.version.outputs.tag }}^' 2>/dev/null || echo '')"
+          {
+            echo "## What's changed"
+            echo
+            if [ -n "$prev" ]; then
+              git log --no-merges --pretty='- %s' "$prev..${{ steps.version.outputs.tag }}"
+              echo
+              echo "**Full changelog**: https://github.com/${{ github.repository }}/compare/$prev...${{ steps.version.outputs.tag }}"
+            else
+              git log --no-merges --pretty='- %s' '${{ steps.version.outputs.tag }}' | head -50
+            fi
+          } > RELEASE_NOTES.md
+          echo "file=RELEASE_NOTES.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create '${{ steps.version.outputs.tag }}' \
+            dist/swctl-${{ steps.version.outputs.version }}.tar.gz \
+            --title '${{ steps.version.outputs.tag }}' \
+            --notes-file '${{ steps.notes.outputs.file }}'
+
+      - name: Update Formula URL + SHA in this repo
+        run: |
+          sed -i -E \
+            -e "s|url \"https://github.com/[^/]+/swctl/releases/download/v[0-9.]+/swctl-[0-9.]+\.tar\.gz\"|url \"https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/swctl-${{ steps.version.outputs.version }}.tar.gz\"|" \
+            -e "s|sha256 \"[0-9a-f]{64}\"|sha256 \"${{ steps.sha.outputs.sha }}\"|" \
+            Formula/swctl.rb
+          grep -q '${{ steps.sha.outputs.sha }}' Formula/swctl.rb \
+            || { echo "::error::Formula SHA substitution failed"; exit 1; }
+
+      - name: Commit Formula update to main
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git fetch origin main
+          git checkout main
+          git merge --ff-only FETCH_HEAD || true
+          git add Formula/swctl.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date on main."
+          else
+            MSG="chore: update formula SHA for ${{ steps.version.outputs.tag }} (auto-committed by Release workflow)"
+            git commit -m "$MSG"
+            git push origin main
+          fi
+
+      - name: Update Formula in homebrew-tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_DEPLOY_TOKEN }}
+        # Uses the GitHub Contents API to PUT an updated Formula/swctl.rb
+        # in the tap.  Requires TAP_DEPLOY_TOKEN (fine-grained PAT with
+        # Contents: write on nguyenytran/homebrew-tap).  Without it, the
+        # step is skipped with a warning so the release still succeeds.
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::TAP_DEPLOY_TOKEN secret not set — skipping homebrew-tap update."
+            echo "::warning::Update nguyenytran/homebrew-tap:Formula/swctl.rb manually, or add the PAT and re-run."
+            exit 0
+          fi
+          content_b64=$(base64 -w0 < Formula/swctl.rb)
+          current_sha=$(curl -sS \
+              -H "Authorization: token $TAP_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/nguyenytran/homebrew-tap/contents/Formula/swctl.rb" \
+              | jq -r .sha)
+          if [ -z "$current_sha" ] || [ "$current_sha" = "null" ]; then
+            echo "::error::Failed to fetch current Formula/swctl.rb SHA from tap."
+            exit 1
+          fi
+          msg="chore: bump swctl to ${{ steps.version.outputs.tag }} (auto-committed by Release workflow)"
+          payload=$(jq -n \
+              --arg m "$msg" --arg c "$content_b64" --arg s "$current_sha" \
+              '{message:$m, content:$c, sha:$s, branch:"main"}')
+          response=$(curl -sS -X PUT \
+              -H "Authorization: token $TAP_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -d "$payload" \
+              "https://api.github.com/repos/nguyenytran/homebrew-tap/contents/Formula/swctl.rb")
+          commit_sha=$(printf '%s' "$response" | jq -r '.commit.sha // empty')
+          if [ -n "$commit_sha" ]; then
+            echo "tap updated: $commit_sha"
+          else
+            echo "::error::tap update failed: $response"
+            exit 1
+          fi
