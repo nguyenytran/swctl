@@ -16,8 +16,13 @@ const features = ref<Features>({ resolveEnabled: false })
 let loaded = false
 let inflight: Promise<void> | null = null
 
-async function load(): Promise<void> {
-  if (loaded) return
+/**
+ * Fetch (or refetch) /api/features.  `force=true` bypasses the one-shot
+ * cache — used by ConfigPage after the user toggles a flag so the nav
+ * + router pick up the new state without a full page reload.
+ */
+async function load(force = false): Promise<void> {
+  if (loaded && !force) return
   if (inflight) return inflight
   inflight = (async () => {
     try {

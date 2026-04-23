@@ -1,6 +1,7 @@
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
+import { isResolveEnabled } from './config.js'
 
 export interface PluginManifest {
   id: string
@@ -116,9 +117,10 @@ export function listPlugins(): PluginManifest[] {
 
   // Feature flag: the resolve plugin adds a `/resolve` route + dashboard
   // widget + instance-row action. Hide it from the manifest list unless
-  // SWCTL_RESOLVE_ENABLED=1 — without the plugin in the list, the UI
-  // never instantiates its route or fetches `/api/skill/resolve/*`.
-  if (process.env.SWCTL_RESOLVE_ENABLED !== '1') {
+  // the feature is enabled via env or ~/.swctl/config.json — without
+  // the plugin in the list, the UI never instantiates its route or
+  // fetches `/api/skill/resolve/*`.
+  if (!isResolveEnabled()) {
     seen.delete('shopware-resolve')
   }
 
@@ -140,10 +142,10 @@ export function resolvePluginFile(pluginId: string, file: string): string | null
   // Reject plugin IDs that are anything other than a safe slug
   if (!/^[a-z0-9][a-z0-9._-]*$/i.test(pluginId)) return null
 
-  // Feature flag — resolve plugin is hidden unless SWCTL_RESOLVE_ENABLED=1.
+  // Feature flag — resolve plugin is hidden unless explicitly enabled.
   // Mirrors the filter in listPlugins so the asset endpoint can't bypass
   // the manifest check.
-  if (pluginId === 'shopware-resolve' && process.env.SWCTL_RESOLVE_ENABLED !== '1') {
+  if (pluginId === 'shopware-resolve' && !isResolveEnabled()) {
     return null
   }
 

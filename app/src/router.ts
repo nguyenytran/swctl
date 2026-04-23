@@ -14,6 +14,9 @@ const router = createRouter({
     // Worktrees routes
     { path: '/worktrees', name: 'worktrees', component: () => import('@/components/WorktreeOverview.vue') },
     { path: '/worktrees/batch-create', name: 'worktrees-batch-create', component: () => import('@/components/WorktreeOverview.vue'), meta: { modal: 'batch-create' } },
+
+    // Config (~/.swctl/config.json) — AI backend, feature flags, CLI paths
+    { path: '/config', name: 'config', component: () => import('@/components/ConfigPage.vue') },
   ],
 })
 

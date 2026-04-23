@@ -348,6 +348,39 @@ With the flag on:
 The rest of swctl is unaffected — worktree creation, doctor, nuke, plugin
 support, MCP server, and the build cache all work regardless of this flag.
 
+### `SWCTL_RESOLVE_BACKEND` / `--backend`
+
+The resolve workflow can drive either Anthropic's Claude Code CLI (default)
+or OpenAI's Codex CLI. The backend is picked per-issue at create time and
+persisted into the instance metadata (`RESOLVE_BACKEND=…`), so `swctl
+resolve resume`, `ask`, and `chat` all route back to the same binary.
+
+```bash
+# Explicit flag per invocation
+swctl resolve --backend=codex SW-1234
+
+# Process-wide default via env var
+export SWCTL_RESOLVE_BACKEND=codex
+swctl resolve SW-1234
+```
+
+Precedence: `--backend` &gt; `SWCTL_RESOLVE_BACKEND` &gt; `claude` (default).
+
+Override the binary location with `SWCTL_CLAUDE_BIN` / `SWCTL_CODEX_BIN`
+(useful in CI, or when running a forked build from a non-PATH location).
+
+Install the skill and MCP server into a chosen backend's config dir:
+
+```bash
+swctl skill install --user --target codex    # ~/.codex/skills/shopware-resolve
+swctl skill install --user --target all      # every detected backend
+swctl mcp install   --user --target all      # swctl MCP in every detected backend
+```
+
+Status: Codex support is MVP — the CLI flow works end-to-end, the UI flow
+currently falls back to Claude with a warning while we finalise the Codex
+stream-json flag surface.
+
 ## Troubleshooting
 
 ### Traefik route does not resolve
