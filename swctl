@@ -4736,6 +4736,12 @@ cmd_nuke() {
 cmd_doctor() {
     local rc=0
 
+    # Step 8 (DNS alias collision) writes a temp file to SWCTL_TMP_DIR.
+    # Ensure the dir exists even when cmd_doctor is called directly as a
+    # shell function (integration tests) rather than via the dispatcher,
+    # which already calls ensure_state_dirs.
+    mkdir -p "$SWCTL_TMP_DIR" 2>/dev/null || true
+
     printf '\nswctl doctor — dependency health\n'
     printf -- '---\n'
 
@@ -7559,6 +7565,7 @@ main() {
             cmd_nuke "${1:-}"
             ;;
         doctor|health)
+            ensure_state_dirs
             cmd_doctor
             ;;
         volume)
