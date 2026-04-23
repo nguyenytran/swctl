@@ -57,6 +57,14 @@ jobs:
       - name: Pre-pull alpine image
         run: docker pull alpine:latest
 
+      - name: Install app dependencies (tsx for ai_scope.bats)
+        # Mirrors ci.yml — without tsx the ai-scope integration tests
+        # self-skip and provide no regression coverage.  Release gating
+        # should exercise the same surface CI does.
+        run: |
+          cd app
+          npm ci --no-audit --no-fund
+
       - name: Run integration tests
         run: bats tests/integration/*.bats
 

@@ -32,7 +32,13 @@ setup() {
 }
 
 teardown() {
-    rm -rf "$_stub_dir"
+    # Guard against `set -u` (inherited from `source swctl` in
+    # integration_helper).  When setup() `skip`s early, `_stub_dir` is
+    # never assigned — referencing it unguarded would make teardown exit
+    # non-zero, which bats silently swallows and prints no TAP line for
+    # the test.  That's what caused CI to emit
+    # "Executed 41 instead of expected 47" before this guard.
+    rm -rf "${_stub_dir:-}"
 }
 
 # Helper: run the probe with stdin JSON.  Prints stdout (the decision JSON),

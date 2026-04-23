@@ -60,6 +60,16 @@ jobs:
         # issues early.
         run: docker pull alpine:latest
 
+      - name: Install app dependencies (for ai_scope.bats)
+        # tests/integration/ai_scope.bats drives `detectScopeWithAI` via
+        # a tsx-executed probe harness.  Without tsx the tests `skip`
+        # themselves (safe, no failure) but CI then provides no
+        # regression coverage for the AI-scope module.  `tsx` lives in
+        # devDependencies, so plain `npm ci` (no --omit) is what we want.
+        run: |
+          cd app
+          npm ci --no-audit --no-fund
+
       - name: Run integration tests
         run: bats tests/integration/*.bats
 
