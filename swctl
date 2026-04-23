@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.5.4"
+SWCTL_VERSION="0.5.5"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -21,8 +21,8 @@ _swctl_resolve_script() {
 SCRIPT_DIR="$(_swctl_resolve_script)"
 SWCTL_TEMPLATE_DIR="${SWCTL_TEMPLATE_DIR:-$SCRIPT_DIR}"
 SWCTL_STATE_DIR="${SWCTL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/swctl}"
-SWCTL_REGISTRY_DIR="$SWCTL_STATE_DIR/instances"
-SWCTL_INFRA_DIR="$SWCTL_STATE_DIR/infra"
+SWCTL_REGISTRY_DIR="${SWCTL_REGISTRY_DIR:-$SWCTL_STATE_DIR/instances}"
+SWCTL_INFRA_DIR="${SWCTL_INFRA_DIR:-$SWCTL_STATE_DIR/infra}"
 SWCTL_PROJECTS_FILE="$SWCTL_STATE_DIR/projects.conf"
 SWCTL_TMP_DIR="${TMPDIR:-/tmp}/swctl"
 
@@ -1047,23 +1047,14 @@ init_infra() {
     # Traefik mode (OrbStack users almost always use their own compose).
     if [ "$runtime" != "traefik" ]; then
         local _proj_net="${SW_PROJECT_NETWORK:-trunk_default}"
-        if docker network inspect "$_proj_net" >/dev/null 2>&1; then
-            local _existing_db
-            _existing_db="$(docker network inspect "$_proj_net" --format '{{range .Containers}}{{.Name}}
-{{end}}' 2>/dev/null | while read -r n; do
-                [ -n "$n" ] || continue
-                if docker inspect "$n" --format '{{with (index .NetworkSettings.Networks "'"$_proj_net"'")}}{{range .Aliases}}{{.}}
-{{end}}{{end}}' 2>/dev/null | grep -Fxq database; then
-                    printf '%s\n' "$n"
-                fi
-            done | head -1)"
-            if [ -n "$_existing_db" ]; then
-                warn "Network '$_proj_net' already has '$_existing_db' aliased as 'database'."
-                warn "  Skipping swctl-mariadb — your project compose already provides it."
-                warn "  (Having two 'database' aliases on one network causes DNS round-robin + intermittent 'Unknown database' errors.)"
-                ok "Shared infrastructure: reusing '$_existing_db' for database on network '$_proj_net'."
-                return 0
-            fi
+        local _existing_db
+        _existing_db="$(_find_alias_owner "$_proj_net" database)"
+        if [ -n "$_existing_db" ]; then
+            warn "Network '$_proj_net' already has '$_existing_db' aliased as 'database'."
+            warn "  Skipping swctl-mariadb — your project compose already provides it."
+            warn "  (Having two 'database' aliases on one network causes DNS round-robin + intermittent 'Unknown database' errors.)"
+            ok "Shared infrastructure: reusing '$_existing_db' for database on network '$_proj_net'."
+            return 0
         fi
     fi
 
@@ -1642,13 +1633,14 @@ _ensure_base_volume_populated() {
     # explicit chown, www-data can't write into node_modules/.vite-temp/
     # during admin builds (EACCES).  We chown -R to 1000:1000 at the end.
     #
-    # `.ready` is touched LAST (chained with && so it only appears after
-    # cp + chown both succeed) — hit checks gate on it to avoid
-    # mid-populate reads.
+    # `.ready` is touched BEFORE the chown so that the final chown covers
+    # the sentinel too — keeping the invariant that every file in the
+    # populated volume is owned by uid 1000.  The chown is LAST so any
+    # concurrent reader that sees `.ready` finds a fully-chowned tree.
     if ! docker run --rm \
         -v "${src}:/src:ro" \
         -v "${vol}:/dst" \
-        alpine sh -c 'cp -a /src/. /dst/ && chown -R 1000:1000 /dst && touch /dst/.ready' 2>/dev/null; then
+        alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>/dev/null; then
         err "Failed to populate volume '$vol' from '$src'."
         return 1
     fi
@@ -1673,7 +1665,7 @@ _clone_docker_volume() {
     docker run --rm \
         -v "${src}:/src:ro" \
         -v "${dst}:/dst" \
-        alpine sh -c 'cp -a /src/. /dst/ && chown -R 1000:1000 /dst && touch /dst/.ready' 2>/dev/null || return 1
+        alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>/dev/null || return 1
 }
 
 # Plugin build cache — skip `composer build:js:admin` when the same plugin
@@ -1749,7 +1741,7 @@ _populate_plugin_build_cache() {
     if ! docker run --rm \
         -v "${pub}:/src:ro" \
         -v "${vol}:/dst" \
-        alpine sh -c 'cp -a /src/. /dst/ && chown -R 1000:1000 /dst && touch /dst/.ready' 2>/dev/null; then
+        alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>/dev/null; then
         err "Failed to populate plugin build cache '$vol'."
         return 1
     fi
@@ -2729,6 +2721,27 @@ resolve_project_context() {
             PLUGIN_DIR="$plugin_dir"
             ;;
     esac
+}
+
+# Return the name of the first container on $1 that owns alias $2, or
+# empty if no such container exists.  Used by init_infra to refuse
+# attaching swctl-mariadb to a network where `database` already resolves,
+# and by cmd_doctor to print who owns a colliding alias.
+_find_alias_owner() {
+    local net="$1"
+    local alias_name="$2"
+    [ -n "$net" ] && [ -n "$alias_name" ] || return 0
+    docker network inspect "$net" >/dev/null 2>&1 || return 0
+
+    docker network inspect "$net" --format '{{range .Containers}}{{.Name}}
+{{end}}' 2>/dev/null | while read -r n; do
+        [ -n "$n" ] || continue
+        if docker inspect "$n" --format '{{with (index .NetworkSettings.Networks "'"$net"'")}}{{range .Aliases}}{{.}}
+{{end}}{{end}}' 2>/dev/null | grep -Fxq "$alias_name"; then
+            printf '%s\n' "$n"
+            return 0
+        fi
+    done | head -1
 }
 
 # Is this DNS alias one that an app container is likely to resolve at runtime
@@ -4938,8 +4951,15 @@ cmd_doctor() {
                 local _alias
                 while IFS= read -r _alias; do
                     [ -n "$_alias" ] || continue
-                    # Skip the automatic container-id-shortform alias (12-char hex)
-                    case "$_alias" in [0-9a-f]*) [ ${#_alias} -le 12 ] && continue ;; esac
+                    # Skip the automatic container-id-shortform alias —
+                    # exactly 12 chars of lowercase hex.  Earlier glob
+                    # `[0-9a-f]*` incorrectly matched words like "database"
+                    # (starts with 'd' ∈ hex) whose length also happened
+                    # to be ≤ 12.
+                    case "$_alias" in
+                        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+                            continue ;;
+                    esac
                     # Only warn about aliases that matter to the app boot —
                     # _is_critical_alias filters out generic shared aliases
                     # like `web`/`app` that many compose projects joining
