@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.5.3"
+SWCTL_VERSION="0.5.4"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -2731,6 +2731,25 @@ resolve_project_context() {
     esac
 }
 
+# Is this DNS alias one that an app container is likely to resolve at runtime
+# for a CRITICAL dependency (DB, cache, search, mail)?  Used by cmd_doctor to
+# filter out naturally-shared generic aliases like `web`/`app` that many
+# compose projects joining one network will always collide on — those don't
+# cause the "Unknown database" class of bug because nothing in-container
+# calls `getent hosts web` during boot.
+#
+# Returns 0 when the alias is critical (worth warning about), 1 otherwise.
+_is_critical_alias() {
+    case "$1" in
+        database|mysql|mariadb|postgres|postgresql|\
+        redis|valkey|\
+        opensearch|elasticsearch|es|\
+        mailer|mailhog|mailpit|\
+        rabbitmq|messagebus) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 activate_plugin() {
     local compose_project="$1" plugin_name="$2"
 
@@ -2745,6 +2764,40 @@ activate_plugin() {
     run_app_command "$compose_project" \
         "$WORKFLOW_CONSOLE plugin:refresh && $WORKFLOW_CONSOLE plugin:install --activate $plugin_name" \
         || warn "Plugin refresh/activate failed for '$plugin_name'."
+}
+
+# Build the chained bin/console command for plugin prep on plugin-external
+# creates: `plugin:refresh && plugin:install --activate <primary> [&& plugin:install --activate <dep>]*`.
+#
+# Extracted from cmd_create so the exact chain that prevents the "plugin UI
+# silently missing" bug (v0.5.2) is locked down by regression tests.  The
+# primary activation is MANDATORY — without it the cloned DB's active=0
+# carries forward, the plugin's bundle never boots, and InfoController
+# silently omits it from /api/_info/config.
+#
+# Args:
+#   $1 primary plugin name (required)
+#   $2 comma-separated dep plugin names (optional)
+#   $3 bin/console binary path (default: "bin/console")
+_build_plugin_prep_command() {
+    local primary="$1"
+    local deps="${2:-}"
+    local bin="${3:-bin/console}"
+
+    [ -n "$primary" ] || return 1
+
+    local cmd="$bin plugin:refresh && $bin plugin:install --activate $primary"
+    if [ -n "$deps" ]; then
+        local _old_ifs="$IFS"
+        IFS=','
+        local _dep
+        for _dep in $deps; do
+            [ -n "$_dep" ] || continue
+            cmd="$cmd && $bin plugin:install --activate $_dep"
+        done
+        IFS="$_old_ifs"
+    fi
+    printf '%s' "$cmd"
 }
 
 setup_plugin_database() {
@@ -3253,15 +3306,9 @@ cmd_create() {
             # Chain plugin:refresh + primary activate + dep activates under
             # ONE docker exec — each bin/console invocation costs ~3 s of
             # PHP kernel boot; batching saves (2 + N_deps) × ~3 s per create.
-            local _plugin_prep_cmd="$SW_BIN_CONSOLE plugin:refresh && $SW_BIN_CONSOLE plugin:install --activate $PLUGIN_NAME"
-            if [ -n "$dep_plugins" ]; then
-                local _old_ifs="$IFS"
-                IFS=','
-                for _dep in $dep_plugins; do
-                    _plugin_prep_cmd="${_plugin_prep_cmd} && $SW_BIN_CONSOLE plugin:install --activate $_dep"
-                done
-                IFS="$_old_ifs"
-            fi
+            # See _build_plugin_prep_command + tests/plugin_prep_command.bats.
+            local _plugin_prep_cmd
+            _plugin_prep_cmd="$(_build_plugin_prep_command "$PLUGIN_NAME" "$dep_plugins" "$SW_BIN_CONSOLE")"
             run_app_command "$COMPOSE_PROJECT" "$_plugin_prep_cmd" 2>/dev/null \
                 || warn "plugin:refresh / activation failed."
 
@@ -4894,20 +4941,11 @@ cmd_doctor() {
                     # Skip the automatic container-id-shortform alias (12-char hex)
                     case "$_alias" in [0-9a-f]*) [ ${#_alias} -le 12 ] && continue ;; esac
                     # Only warn about aliases that matter to the app boot —
-                    # database/redis/opensearch/etc.  Generic aliases like
-                    # `web` or `app` are naturally shared across multiple
-                    # compose projects joining one network (each worktree
-                    # names its service `web`) and don't cause the
-                    # round-robin "Unknown database" class of bug because
-                    # nothing inside the container looks up `web` via DNS.
-                    case "$_alias" in
-                        database|mysql|mariadb|postgres|postgresql|\
-                        redis|valkey|\
-                        opensearch|elasticsearch|es|\
-                        mailer|mailhog|mailpit|\
-                        rabbitmq|messagebus) ;;
-                        *) continue ;;
-                    esac
+                    # _is_critical_alias filters out generic shared aliases
+                    # like `web`/`app` that many compose projects joining
+                    # one network will always collide on (harmless —
+                    # nothing inside the container looks those up via DNS).
+                    _is_critical_alias "$_alias" || continue
                     local _owners
                     _owners="$(docker network inspect "$_net" --format '{{range .Containers}}{{.Name}}|{{end}}' 2>/dev/null \
                         | tr '|' '\n' | while read -r n; do
