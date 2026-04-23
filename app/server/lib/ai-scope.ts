@@ -1,0 +1,311 @@
+/**
+ * AI-assisted plugin scope + branch prefix detection.
+ *
+ * Drop-in replacement for the brittle regex-only `detectPluginScopeFromLabels`
+ * that used to be the only signal when a user triggers a resolve without
+ * passing `--project`.  Flow:
+ *
+ *   1. Fast-path — if the existing pure heuristics agree on an unambiguous
+ *      plugin + a non-default branch prefix, return them with
+ *      `method: 'heuristic'`, confidence 1.0.  No spawn, no latency.
+ *
+ *   2. Otherwise spawn the user's resolve backend (Claude or Codex CLI)
+ *      with a single-shot prompt that asks for a strict-JSON decision.
+ *      Hard timeout 12 s; stdout parsed, validated against the registered
+ *      plugin list, returned with `method: 'ai'`.
+ *
+ *   3. Any failure (ENOENT, non-zero exit, timeout, bad JSON, unknown
+ *      plugin name) collapses to the raw heuristic with `method: 'fallback'`,
+ *      confidence 0, reasoning that names the failure.  NEVER throws —
+ *      the caller (`startResolveStream`) treats the result as best-effort
+ *      and always proceeds to `swctl create`.
+ *
+ * Gated on `features.resolveEnabled` at the call site; this module itself
+ * is pure and doesn't read the config flag (easier to test, easier to reuse
+ * later if we add a CLI parity path).
+ *
+ * Safety: the prompt contains the issue body (PII).  It is NEVER logged
+ * — we only log the final decision.  See fallback() below.
+ */
+
+import { spawn } from 'child_process'
+import {
+  backendBinary,
+  branchPrefixFromLabels,
+  detectPluginScopeFromLabels,
+  type ResolveBackend,
+} from './resolve.js'
+
+export interface AiScopeInput {
+  issueTitle: string
+  /** Caller must already have sliced to ~2000 chars. */
+  issueBody: string
+  labels: string[]
+  backend: ResolveBackend
+  /** Registered plugin names — passed in (not re-read here) for testability. */
+  pluginNames: string[]
+}
+
+export interface AiScopeDecision {
+  /** Plugin name from `pluginNames`, or null = shopware platform / trunk. */
+  project: string | null
+  branchPrefix: 'fix' | 'feat' | 'chore'
+  /** 0..1. 1.0 = heuristic certain; 0.0 = fell all the way back. */
+  confidence: number
+  /** One-line human explanation, ≤140 chars.  Logged to SSE. */
+  reasoning: string
+  method: 'heuristic' | 'ai' | 'fallback'
+}
+
+const AI_TIMEOUT_MS = 12_000
+const MAX_STDOUT_BYTES = 16 * 1024 // AI is asked for a ~200 B JSON object
+const STDOUT_LOG_CAP = 120
+
+export async function detectScopeWithAI(input: AiScopeInput): Promise<AiScopeDecision> {
+  const heuristicProject = detectPluginScopeFromLabels(input.labels)
+  const heuristicPrefix = branchPrefixFromLabels(input.labels)
+  const heuristicConfident =
+    heuristicProject !== null &&
+    // branchPrefixFromLabels defaults to 'fix' — only treat non-default as a
+    // positive signal.  'fix' may still be correct but it's also the zero-
+    // information value, so we run the AI to double-check.
+    heuristicPrefix !== 'fix'
+
+  // ── Fast-path ──────────────────────────────────────────────────────────
+  if (heuristicConfident) {
+    return {
+      project: heuristicProject,
+      branchPrefix: heuristicPrefix,
+      confidence: 1.0,
+      reasoning: 'heuristic: unambiguous label match',
+      method: 'heuristic',
+    }
+  }
+
+  // ── AI path ────────────────────────────────────────────────────────────
+  const bin = backendBinary(input.backend)
+  const prompt = buildPrompt(input)
+  const args = buildArgs(input.backend, prompt)
+
+  try {
+    const stdout = await runOnce(bin, args, AI_TIMEOUT_MS)
+    const parsed = parseDecision(stdout, input.pluginNames)
+    if (!parsed) {
+      return fallback(input, heuristicProject, heuristicPrefix, bin,
+        `parse/schema failure: ${truncate(stdout, STDOUT_LOG_CAP)}`)
+    }
+    return { ...parsed, method: 'ai' }
+  } catch (err: any) {
+    const reason = err?.code === 'ENOENT'
+      ? `binary not found (${bin})`
+      : err?.code === 'ETIMEDOUT'
+        ? `timeout after ${AI_TIMEOUT_MS} ms`
+        : err?.message || String(err)
+    return fallback(input, heuristicProject, heuristicPrefix, bin, reason)
+  }
+}
+
+// ── Internals ───────────────────────────────────────────────────────────────
+
+function buildPrompt(input: AiScopeInput): string {
+  const pluginList = input.pluginNames.length > 0
+    ? input.pluginNames.join(', ')
+    : '(none registered)'
+  const labels = input.labels.length > 0 ? input.labels.join(', ') : '(none)'
+
+  // Kept terse and instruction-first.  `-p` / `exec --message` CLIs have no
+  // system role, so the rules and schema both sit inline before the data.
+  return [
+    'You are swctl\'s scope router. Reply with ONE JSON object and nothing else.',
+    'No markdown, no prose, no code fences.',
+    '',
+    'Schema:',
+    '{"project": string|null, "branchPrefix": "fix"|"feat"|"chore",',
+    ' "confidence": number, "reasoning": string}',
+    '',
+    'Rules:',
+    '- "project" MUST be exactly one name from the plugins list below, or null',
+    '  (null = shopware platform / trunk).',
+    '- "branchPrefix": "feat" for new capabilities, "chore" for refactors/docs/CI,',
+    '  "fix" for bugs/regressions.',
+    '- "confidence" 0..1.',
+    '- "reasoning" ONE short sentence, ≤140 chars, no newlines.',
+    '',
+    `Plugins: ${pluginList}`,
+    `Title: ${input.issueTitle}`,
+    `Labels: ${labels}`,
+    'Body:',
+    input.issueBody,
+  ].join('\n')
+}
+
+function buildArgs(backend: ResolveBackend, prompt: string): string[] {
+  if (backend === 'codex') {
+    // Codex's `exec --message` is the one-shot equivalent of Claude's -p.
+    // MVP flag surface — matches what _ai_spawn_args uses on the bash side.
+    return ['exec', '--message', prompt]
+  }
+  // Claude default.  `plan` permission mode blocks any tool usage (pure
+  // classification — we don't want it editing files), and an empty
+  // `--allowedTools` belts-and-braces that guarantee.
+  return [
+    '-p', prompt,
+    '--output-format', 'text',
+    '--permission-mode', 'plan',
+    '--allowedTools', '',
+  ]
+}
+
+/**
+ * Spawn once, collect stdout up to MAX_STDOUT_BYTES, enforce a hard timeout.
+ * Rejects with `{ code: 'ENOENT' | 'ETIMEDOUT' | <exit-code-string>, message }`
+ * so the caller can distinguish failure kinds.
+ */
+function runOnce(bin: string, args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const child = spawn(bin, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    })
+
+    const chunks: Buffer[] = []
+    let byteCount = 0
+    let truncated = false
+    child.stdout?.on('data', (b: Buffer) => {
+      if (truncated) return
+      if (byteCount + b.length > MAX_STDOUT_BYTES) {
+        chunks.push(b.slice(0, MAX_STDOUT_BYTES - byteCount))
+        byteCount = MAX_STDOUT_BYTES
+        truncated = true
+        try { child.kill('SIGTERM') } catch {}
+      } else {
+        chunks.push(b)
+        byteCount += b.length
+      }
+    })
+
+    // Drain stderr but discard — AI noise ("Loading model...") is not useful
+    // and would only make log lines harder to interpret.
+    child.stderr?.on('data', () => {})
+
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { child.kill('SIGKILL') } catch {}
+      const err: NodeJS.ErrnoException = new Error(`ai-scope: timeout after ${timeoutMs}ms`)
+      err.code = 'ETIMEDOUT'
+      reject(err)
+    }, timeoutMs)
+
+    child.on('error', (err: NodeJS.ErrnoException) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(err)
+    })
+
+    child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (code !== 0 && !truncated) {
+        const err: NodeJS.ErrnoException = new Error(`ai-scope: exit ${code}`)
+        err.code = `EXIT_${code}`
+        reject(err)
+        return
+      }
+      resolve(Buffer.concat(chunks).toString('utf-8'))
+    })
+  })
+}
+
+/**
+ * Extract the first balanced `{...}` block from stdout and validate against
+ * the schema.  Returns null on any parse / validation failure — caller treats
+ * as fallback.
+ */
+function parseDecision(stdout: string, pluginNames: string[]): Omit<AiScopeDecision, 'method'> | null {
+  const block = extractFirstJsonObject(stdout)
+  if (!block) return null
+
+  let obj: unknown
+  try { obj = JSON.parse(block) } catch { return null }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null
+
+  const o = obj as Record<string, unknown>
+  const project = o.project === null
+    ? null
+    : typeof o.project === 'string' && o.project.trim() !== ''
+      ? o.project.trim()
+      : undefined
+  if (project === undefined) return null
+  if (project !== null && !pluginNames.includes(project)) return null
+
+  const branchPrefix = o.branchPrefix
+  if (branchPrefix !== 'fix' && branchPrefix !== 'feat' && branchPrefix !== 'chore') return null
+
+  const confidence = typeof o.confidence === 'number' && Number.isFinite(o.confidence)
+    ? Math.max(0, Math.min(1, o.confidence))
+    : null
+  if (confidence === null) return null
+
+  const reasoning = typeof o.reasoning === 'string'
+    ? o.reasoning.replace(/\s+/g, ' ').trim().slice(0, 140)
+    : ''
+  if (!reasoning) return null
+
+  return { project, branchPrefix, confidence, reasoning }
+}
+
+/**
+ * Walk the string tracking brace depth; return the first balanced object.
+ * Tolerates leading prose (some CLIs wrap output in "Assistant: {...}"),
+ * trailing prose, and strings that contain braces.
+ */
+function extractFirstJsonObject(s: string): string | null {
+  let start = -1
+  let depth = 0
+  let inString = false
+  let escape = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (inString) {
+      if (escape) { escape = false; continue }
+      if (c === '\\') { escape = true; continue }
+      if (c === '"') inString = false
+      continue
+    }
+    if (c === '"') { inString = true; continue }
+    if (c === '{') {
+      if (depth === 0) start = i
+      depth++
+    } else if (c === '}') {
+      depth--
+      if (depth === 0 && start !== -1) return s.slice(start, i + 1)
+    }
+  }
+  return null
+}
+
+function fallback(
+  input: AiScopeInput,
+  heuristicProject: string | null,
+  heuristicPrefix: 'fix' | 'feat' | 'chore',
+  bin: string,
+  reason: string,
+): AiScopeDecision {
+  // eslint-disable-next-line no-console
+  console.warn(`[ai-scope] backend=${input.backend} bin=${bin} — ${reason}; falling back to heuristic`)
+  return {
+    project: heuristicProject,
+    branchPrefix: heuristicPrefix,
+    confidence: 0,
+    reasoning: `ai fallback: ${reason.slice(0, 120)}`,
+    method: 'fallback',
+  }
+}
+
+function truncate(s: string, n: number): string {
+  return s.length <= n ? s : s.slice(0, n) + '…'
+}

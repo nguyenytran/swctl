@@ -24,9 +24,18 @@ export async function fetchResolveRuns(): Promise<ResolveRun[]> {
   return res.json()
 }
 
-export function buildResolveStreamUrl(issue: string, project?: string): string {
+export type ResolveBackend = 'claude' | 'codex'
+
+export function buildResolveStreamUrl(
+  issue: string,
+  project?: string,
+  backend?: ResolveBackend,
+): string {
   const params = new URLSearchParams({ issue })
   if (project) params.set('project', project)
+  // Omit the param for the default to keep the URL clean; the server
+  // treats an absent/unknown backend as 'claude'.
+  if (backend && backend !== 'claude') params.set('backend', backend)
   return `${BASE}/stream?${params}`
 }
 

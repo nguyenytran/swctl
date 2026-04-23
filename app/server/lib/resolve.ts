@@ -9,6 +9,8 @@ import { streamSpawn, spawnSwctl } from './stream.js'
 import { readAllInstances } from './metadata.js'
 import { readProjects } from './projects.js'
 import { emit } from './events.js'
+import { isResolveEnabled } from './config.js'
+import { detectScopeWithAI, type AiScopeDecision } from './ai-scope.js'
 
 const STATE_DIR = process.env.SWCTL_STATE_DIR || ''
 const RUNS_FILE = STATE_DIR ? path.join(STATE_DIR, 'resolve-runs.json') : ''
@@ -210,7 +212,7 @@ async function fetchIssueLabels(issueRef: string): Promise<string[]> {
  * the source repo in instance metadata.  Returns null on any failure.
  */
 export async function fetchIssueInfo(issueRef: string): Promise<{
-  owner: string; repo: string; number: string; title: string; labels: string[]; htmlUrl: string
+  owner: string; repo: string; number: string; title: string; body: string; labels: string[]; htmlUrl: string
 } | null> {
   let owner = 'shopware', repo = 'shopware', num = ''
   const urlMatch = issueRef.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/)
@@ -233,10 +235,13 @@ export async function fetchIssueInfo(issueRef: string): Promise<{
       },
     })
     if (!res.ok) return null
-    const data = await res.json() as { title?: string; labels?: Array<{ name?: string }>; html_url?: string }
+    const data = await res.json() as { title?: string; body?: string; labels?: Array<{ name?: string }>; html_url?: string }
     return {
       owner, repo, number: num,
       title: data.title || '',
+      // Additive: AI scope detection reads this.  Existing callers just
+      // ignore the new field.
+      body: data.body || '',
       labels: (data.labels || []).map((l) => l?.name || '').filter(Boolean),
       htmlUrl: data.html_url || `https://github.com/${owner}/${repo}/issues/${num}`,
     }
@@ -309,6 +314,53 @@ export function detectPluginScopeFromLabels(labels: string[]): string | null {
 }
 
 /**
+ * Resolve-feature backends we know how to spawn.  New backends (e.g. a future
+ * openai-api HTTP flow) plug in here + the switch in `spawnArgsFor*` helpers
+ * below.  Keep in sync with the `_ai_*` helpers in the swctl bash script —
+ * the contract (binary + flag surface per mode) must match so a fix
+ * started via the UI can be resumed via the CLI and vice versa.
+ */
+export type ResolveBackend = 'claude' | 'codex'
+
+/** Normalise a user-supplied / query-string backend value to a known tag. */
+export function coerceBackend(input: string | undefined | null): ResolveBackend {
+  const v = (input || '').toLowerCase()
+  return v === 'codex' ? 'codex' : 'claude'
+}
+
+/**
+ * Resolve the CLI binary for a backend.  `SWCTL_CLAUDE_BIN` /
+ * `SWCTL_CODEX_BIN` let users point at a non-PATH binary (dev, CI, tests).
+ * Mirrors `_ai_backend_binary` in swctl.
+ */
+export function backendBinary(backend: ResolveBackend): string {
+  switch (backend) {
+    case 'codex': return process.env.SWCTL_CODEX_BIN || 'codex'
+    case 'claude':
+    default:      return process.env.SWCTL_CLAUDE_BIN || 'claude'
+  }
+}
+
+/**
+ * Read RESOLVE_BACKEND from the instance env file.  Missing/empty → claude
+ * (back-compat with pre-0.5.7 instances that only have CLAUDE_SESSION_ID).
+ */
+function readInstanceBackend(issueId: string): ResolveBackend {
+  const f = findInstanceEnvFile(issueId)
+  if (!f) return 'claude'
+  try {
+    const content = fs.readFileSync(f, 'utf-8')
+    const m = content.match(/^RESOLVE_BACKEND=(.*)$/m)
+    if (!m) return 'claude'
+    // Strip surrounding single quotes
+    const raw = m[1].replace(/^'([\s\S]*)'$/, '$1')
+    return coerceBackend(raw)
+  } catch {
+    return 'claude'
+  }
+}
+
+/**
  * Generate a RFC4122 v4 UUID for Claude Code's `--session-id`.  Claude
  * Code validates the format (UUID with dashes) and rejects anything else.
  */
@@ -350,6 +402,13 @@ function patchResolveMetadata(
     CLAUDE_RESOLVE_STEP: string
     CLAUDE_RESOLVE_STARTED: string
     CLAUDE_RESOLVE_COST: string
+    RESOLVE_BACKEND: string
+    // Audit trail for AI-assisted scope + branch-prefix detection (0.5.7+).
+    // Three discrete keys (not JSON) so `swctl doctor` / a shell one-liner
+    // can grep them without jq.
+    SCOPE_DETECTION_METHOD: string     // 'ai' | 'heuristic' | 'fallback' | 'user'
+    SCOPE_DETECTION_CONFIDENCE: string // '0.00'..'1.00'
+    SCOPE_DETECTION_REASONING: string  // ≤140 chars
   }>,
 ): void {
   const f = findInstanceEnvFile(issueId)
@@ -438,9 +497,10 @@ function observeStreamLine(state: ResolveStreamState, raw: string): void {
  */
 export function startResolveStream(
   c: Context,
-  params: { issue: string; project?: string; mode?: 'qa' | 'dev' },
+  params: { issue: string; project?: string; mode?: 'qa' | 'dev'; backend?: string },
 ) {
   const { issue, project, mode } = params
+  const backend: ResolveBackend = coerceBackend(params.backend)
   const home = process.env.HOME || '/root'
 
   // Extract issue number from URL or raw number
@@ -489,6 +549,10 @@ export function startResolveStream(
       }
     }
 
+    // Hoisted so the downstream patchResolveMetadata call can persist the
+    // audit fields regardless of which branch below populated them.
+    let aiDecision: AiScopeDecision | null = null
+
     if (!existing) {
       await sendEvent('log', { line: `[swctl] Creating worktree for #${issueId}...`, ts: Date.now() })
 
@@ -500,9 +564,54 @@ export function startResolveStream(
         await sendEvent('log', { line: `[scope] couldn't fetch issue labels → defaulting to platform scope + fix/ branch prefix`, ts: Date.now() })
       }
 
-      // --- Scope detection ---
+      // --- Scope + branch-prefix detection ---
+      //
+      // Precedence (first match wins):
+      //   1. `params.project` explicitly passed by the caller (UI "project"
+      //      dropdown or API query-string override).  AI is NEVER invoked.
+      //   2. `features.resolveEnabled=true` → run detectScopeWithAI.  It
+      //      fast-paths to the heuristic when labels are unambiguous, or
+      //      spawns the configured backend with a single-shot classifier
+      //      prompt when they're not.  Always returns a best-effort
+      //      decision; never throws.
+      //   3. Resolve feature disabled → fall back to the pre-0.5.7
+      //      heuristic-only behaviour verbatim (regression-safe).
+      //
+      // All paths eventually set `effectiveProject` + `prefix` and emit
+      // one `[scope] …` SSE log line carrying the decision, method, and
+      // confidence so the user can audit the routing at a glance.
       let effectiveProject = project
-      if (!effectiveProject) {
+      let prefix: 'fix' | 'feat' | 'chore'
+
+      if (project) {
+        await sendEvent('log', { line: `[scope] user → project=${project} (explicit override)`, ts: Date.now() })
+        prefix = branchPrefixFromLabels(labels)
+        aiDecision = {
+          project,
+          branchPrefix: prefix,
+          confidence: 1,
+          reasoning: 'user-provided project',
+          method: 'heuristic',
+        }
+      } else if (isResolveEnabled()) {
+        const info = await fetchIssueInfo(issue)
+        aiDecision = await detectScopeWithAI({
+          issueTitle: info?.title ?? '',
+          issueBody:  (info?.body ?? '').slice(0, 2000),
+          labels,
+          backend,
+          pluginNames: readProjects()
+            .filter((p: any) => p.type === 'plugin-external')
+            .map((p: any) => p.name),
+        })
+        effectiveProject = aiDecision.project ?? undefined
+        prefix = aiDecision.branchPrefix
+        await sendEvent('log', {
+          line: `[scope] ${aiDecision.method} → project=${effectiveProject ?? 'platform'} prefix=${prefix}/ conf=${aiDecision.confidence.toFixed(2)} — ${aiDecision.reasoning}`,
+          ts: Date.now(),
+        })
+      } else {
+        // Resolve feature disabled — preserve pre-0.5.7 legacy behaviour.
         const detected = labels.length > 0 ? detectPluginScopeFromLabels(labels) : null
         if (detected) {
           effectiveProject = detected
@@ -510,13 +619,9 @@ export function startResolveStream(
         } else if (labels.length > 0) {
           await sendEvent('log', { line: `[scope] no extension/* label matched a registered plugin → platform scope`, ts: Date.now() })
         }
-      } else {
-        await sendEvent('log', { line: `[scope] using user-provided project: ${effectiveProject}`, ts: Date.now() })
+        prefix = branchPrefixFromLabels(labels)
       }
-
-      // --- Branch prefix from issue type ---
-      const prefix = branchPrefixFromLabels(labels)
-      await sendEvent('log', { line: `[branch] prefix from labels → ${prefix}/`, ts: Date.now() })
+      await sendEvent('log', { line: `[branch] prefix → ${prefix}/`, ts: Date.now() })
 
       const branchName = `${prefix}/${issueId}`
       const createArgs: string[] = ['create']
@@ -607,16 +712,43 @@ export function startResolveStream(
     ]
 
     // Persist the session id + running status up-front so a crash/abort
-    // still leaves something the UI can resume from.
+    // still leaves something the UI can resume from.  Also pin the
+    // backend so resume/ask flows route to the correct binary.
     patchResolveMetadata(issueId, {
       CLAUDE_SESSION_ID: sessionId,
       CLAUDE_RESOLVE_STATUS: 'running',
       CLAUDE_RESOLVE_STEP: '0',
       CLAUDE_RESOLVE_STARTED: new Date().toISOString(),
+      RESOLVE_BACKEND: backend,
+      // One-line audit record of how scope+prefix got picked for this
+      // instance.  Always written — even when AI was skipped — so the
+      // fields are grep-stable across instances created before and after
+      // the feature flag toggles.
+      ...(aiDecision ? {
+        SCOPE_DETECTION_METHOD:     aiDecision.method,
+        SCOPE_DETECTION_CONFIDENCE: aiDecision.confidence.toFixed(2),
+        SCOPE_DETECTION_REASONING:  aiDecision.reasoning,
+      } : {
+        SCOPE_DETECTION_METHOD:     'heuristic',
+        SCOPE_DETECTION_CONFIDENCE: '0.00',
+        SCOPE_DETECTION_REASONING:  'legacy (resolve feature disabled)',
+      }),
     })
 
     const startTime = Date.now()
-    const child = spawn('claude', claudeArgs, {
+    // Codex flag surface differs from Claude's; for MVP we only wire the
+    // claude path end-to-end.  A codex-backed resolve via the UI falls
+    // back to the claude CLI here and logs a warning — users wanting
+    // codex today should use `swctl resolve --backend=codex` from the
+    // CLI.  A follow-up will read `codex --help` and wire up the real
+    // stream-json equivalent.
+    if (backend !== 'claude') {
+      await sendEvent('log', {
+        line: `[resolve] backend=${backend} is not yet supported from the UI; falling back to claude for this run. Use 'swctl resolve --backend=${backend}' from the CLI for now.`,
+        ts: Date.now(),
+      })
+    }
+    const child = spawn(backendBinary('claude'), claudeArgs, {
       cwd: worktreePath,
       env: { ...process.env, HOME: home, TERM: 'dumb' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -743,8 +875,16 @@ export function startResolveResumeStream(
       CLAUDE_RESOLVE_STATUS: 'running',
     })
 
+    const resumeBackend = readInstanceBackend(issueId)
+    if (resumeBackend !== 'claude') {
+      await sendEvent('log', {
+        line: `[resolve] backend=${resumeBackend} resume is not yet supported from the UI; falling back to claude. Use 'swctl resolve resume ${issueId}' from the CLI.`,
+        ts: Date.now(),
+      })
+    }
+
     const startTime = Date.now()
-    const child = spawn('claude', claudeArgs, {
+    const child = spawn(backendBinary('claude'), claudeArgs, {
       cwd: worktreePath,
       env: { ...process.env, HOME: home, TERM: 'dumb' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -872,8 +1012,16 @@ export function askResolveStream(
       try { await stream.writeSSE({ event, data: JSON.stringify(data) }) } catch {}
     }
 
+    const askBackend = readInstanceBackend(issueId)
+    if (askBackend !== 'claude') {
+      await sendEvent('log', {
+        line: `[resolve] backend=${askBackend} ask is not yet supported from the UI; falling back to claude. Use 'swctl resolve ask ${issueId} "..."' from the CLI.`,
+        ts: Date.now(),
+      })
+    }
+
     const startTime = Date.now()
-    const child = spawn('claude', args, {
+    const child = spawn(backendBinary('claude'), args, {
       cwd: instance.worktreePath || home,
       env: { ...process.env, HOME: home, TERM: 'dumb' },
       stdio: ['ignore', 'pipe', 'pipe'],

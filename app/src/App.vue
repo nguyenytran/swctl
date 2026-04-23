@@ -46,6 +46,13 @@ function routePath(p: string): string {
               ? 'bg-surface text-white'
               : 'text-gray-500 hover:text-gray-300'"
           >Worktrees</router-link>
+          <router-link
+            to="/config"
+            class="px-3 py-1 text-sm rounded transition-colors"
+            :class="route.path.startsWith('/config')
+              ? 'bg-surface text-white'
+              : 'text-gray-500 hover:text-gray-300'"
+          >Config</router-link>
           <!-- Plugin routes -->
           <router-link
             v-for="r in plugins.routes.value"

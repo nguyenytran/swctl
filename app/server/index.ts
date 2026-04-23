@@ -28,6 +28,7 @@ import {
 } from './lib/github.js'
 import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
 import { startResolveStream, startResolveResumeStream, listResolveRuns, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
+import { readUserConfig, writeUserConfig, configFilePath, isResolveEnabled } from './lib/config.js'
 
 const app = new Hono()
 
@@ -396,12 +397,78 @@ app.get('/api/config', (c) => {
 })
 
 // Feature flags exposed to the UI so nav + routes can conditionally render.
-// Read at server boot from env; see the /api/skill/resolve/* middleware
-// above for the server-side gate.
+// Dynamic: reads env var OR ~/.swctl/config.json so flipping the flag
+// from /#/config takes effect immediately without a server restart.
 app.get('/api/features', (c) => {
   return c.json({
-    resolveEnabled: process.env.SWCTL_RESOLVE_ENABLED === '1',
+    resolveEnabled: isResolveEnabled(),
   })
+})
+
+// ── User config (~/.swctl/config.json) ────────────────────────────────────
+//
+// Read + mutate the JSON config file the CLI (`swctl config …`) also uses.
+// NOTE: the path is `/api/user-config` and NOT `/api/config` — the latter
+// was already claimed by the Shopware project config reader above
+// (returns `.swctl.conf` values like SW_PROJECT).  A path collision
+// means the second handler is never called, so this split is required.
+//
+// Intentionally NOT behind the resolve gate — /#/config is how the user
+// turns the resolve feature ON in the first place, so gating it would be
+// a footgun.  The server-side read is authoritative: the shell's `_ai_*`
+// helpers do the same precedence (env > config > default) so a fix
+// started from the CLI sees the same binary + config dir as one started
+// from the UI.
+app.get('/api/user-config', (c) => {
+  return c.json({
+    path: configFilePath(),
+    config: readUserConfig(),
+  })
+})
+
+app.put('/api/user-config', async (c) => {
+  try {
+    const body = await c.req.json<{ config?: unknown }>()
+    if (!body.config || typeof body.config !== 'object') {
+      return c.json({ error: 'Missing or invalid config object' }, 400)
+    }
+    // Type-validate the shape before writing — reject junk.
+    const incoming = body.config as {
+      features?: { resolveEnabled?: unknown }
+      ai?: {
+        defaultBackend?: unknown
+        claude?: { bin?: unknown; configDir?: unknown }
+        codex?:  { bin?: unknown; configDir?: unknown }
+      }
+    }
+    const toStr = (v: unknown): string | undefined =>
+      typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined
+    const clean = {
+      features: {
+        resolveEnabled: typeof incoming.features?.resolveEnabled === 'boolean'
+          ? incoming.features.resolveEnabled
+          : undefined,
+      },
+      ai: {
+        defaultBackend:
+          incoming.ai?.defaultBackend === 'claude' || incoming.ai?.defaultBackend === 'codex'
+            ? incoming.ai.defaultBackend
+            : undefined,
+        claude: {
+          bin:       toStr(incoming.ai?.claude?.bin),
+          configDir: toStr(incoming.ai?.claude?.configDir),
+        },
+        codex: {
+          bin:       toStr(incoming.ai?.codex?.bin),
+          configDir: toStr(incoming.ai?.codex?.configDir),
+        },
+      },
+    }
+    const saved = writeUserConfig(clean as Parameters<typeof writeUserConfig>[0])
+    return c.json({ ok: true, path: configFilePath(), config: saved })
+  } catch (err: any) {
+    return c.json({ error: err?.message || 'Failed to save config' }, 500)
+  }
 })
 
 app.get('/api/projects', (c) => {
@@ -1224,14 +1291,15 @@ app.get('/api/stream/refresh-external', async (c) => {
 
 // --- shopware-resolve skill: spawn Claude Code and stream output ---
 
-// Feature flag: the resolve workflow is hidden by default.  Set
-// SWCTL_RESOLVE_ENABLED=1 in the server environment (e.g. the swctl-ui
-// compose file) to expose the /api/skill/resolve/* routes.  With the
-// flag off, every resolve endpoint returns 404 so nothing in the UI
-// (or an external client) can invoke it.
-const resolveEnabled = process.env.SWCTL_RESOLVE_ENABLED === '1'
+// Feature flag: the resolve workflow is hidden by default.  Enable via
+// either of:
+//   - SWCTL_RESOLVE_ENABLED=1 (env var, legacy)
+//   - `{ "features": { "resolveEnabled": true } }` in ~/.swctl/config.json
+//     (set via /#/config in the UI or `swctl config set features.resolveEnabled true`)
+// The check is dynamic so flipping it via the UI takes effect on the
+// next request without a server restart.
 app.use('/api/skill/resolve/*', async (c, next) => {
-  if (!resolveEnabled) {
+  if (!isResolveEnabled()) {
     return c.json({ error: 'resolve feature is disabled' }, 404)
   }
   await next()
@@ -1241,8 +1309,12 @@ app.get('/api/skill/resolve/stream', (c) => {
   const issue = c.req.query('issue') || ''
   const project = c.req.query('project') || ''
   const mode = (c.req.query('mode') as 'qa' | 'dev') || 'dev'
+  // Optional backend override.  Defaults to 'claude' when absent / unknown.
+  // Persisted to the instance's RESOLVE_BACKEND so resume/ask pick it up
+  // without the UI having to re-send it.
+  const backend = c.req.query('backend') || ''
   if (!issue) return c.json({ error: 'Missing issue parameter' }, 400)
-  return startResolveStream(c, { issue, project: project || undefined, mode })
+  return startResolveStream(c, { issue, project: project || undefined, mode, backend })
 })
 
 app.get('/api/skill/resolve/runs', (c) => {

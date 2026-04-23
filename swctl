@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.5.6"
+SWCTL_VERSION="0.5.7"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -539,6 +539,11 @@ load_instance_metadata() {
     local file="$1"
     # shellcheck disable=SC1090
     . "$file"
+    # Backfill: pre-v0.5.7 instances don't have RESOLVE_BACKEND set.
+    # They were all driven by Claude (the only backend at the time),
+    # so default to claude.  Live value overrides if metadata was
+    # written by a newer swctl.
+    RESOLVE_BACKEND="${RESOLVE_BACKEND:-claude}"
 }
 
 write_metadata() {
@@ -594,6 +599,10 @@ write_metadata() {
         printf 'CLAUDE_RESOLVE_STEP=%q\n' "${CLAUDE_RESOLVE_STEP:-}"
         printf 'CLAUDE_RESOLVE_STARTED=%q\n' "${CLAUDE_RESOLVE_STARTED:-}"
         printf 'CLAUDE_RESOLVE_COST=%q\n' "${CLAUDE_RESOLVE_COST:-0}"
+        # Which AI CLI backend (claude|codex) drove this resolve session.
+        # Defaults to claude for backwards compat with pre-v0.5.7 metadata —
+        # any instance without RESOLVE_BACKEND is assumed claude at load time.
+        printf 'RESOLVE_BACKEND=%q\n' "${RESOLVE_BACKEND:-claude}"
     } >"$meta_file"
 }
 
@@ -2813,6 +2822,202 @@ _build_plugin_prep_command() {
     printf '%s' "$cmd"
 }
 
+# ---------------------------------------------------------------------------
+# User config ($HOME/.swctl/config.json)
+#
+# A single JSON file that the UI and the CLI both read + write.  Lives at
+# a bind-mounted path so edits made in the /config page show up in the
+# next `swctl resolve ...` run without a restart.
+#
+# Only reads keys under `.ai.*` today — schema can grow later without
+# touching call sites (_user_config_read returns empty + non-zero when
+# the key is missing, callers use a fallback).
+#
+# Env-var overrides always win over config values (see _ai_backend_binary
+# etc.) so CI / tests / power users don't need a config file to poke
+# around.
+# ---------------------------------------------------------------------------
+
+_user_config_file() {
+    printf '%s' "${SWCTL_CONFIG_FILE:-$HOME/.swctl/config.json}"
+}
+
+# _user_config_read <jq-path>
+#
+# Prints the string value at <jq-path> (e.g. '.ai.claude.bin') or returns
+# non-zero if the file, jq, or the key is missing.  Never raises — callers
+# always wrap with `|| default`.
+_user_config_read() {
+    local path="$1" file v
+    file="$(_user_config_file)"
+    [ -f "$file" ] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    v="$(jq -r "${path} // empty" "$file" 2>/dev/null || true)"
+    [ -n "$v" ] || return 1
+    printf '%s' "$v"
+}
+
+# _user_config_write <jq-path> <value>
+#
+# Sets the string at <jq-path> to <value>, creating the file + parent
+# objects as needed.  Atomic — writes a temp file + renames.  Fails hard
+# if jq is missing (this is a user-facing command; no silent fallbacks).
+_user_config_write() {
+    local path="$1" value="$2" file tmp
+    file="$(_user_config_file)"
+    command -v jq >/dev/null 2>&1 || die "'jq' is required to edit config. brew install jq."
+    mkdir -p "$(dirname "$file")"
+    [ -s "$file" ] || printf '{}\n' > "$file"
+    tmp="$(mktemp)"
+    # Use --arg so values are JSON-escaped correctly (quotes, backslashes).
+    # `setpath` isn't quite right because the path is a jq expression
+    # string — just interpolate directly, the path is trusted input.
+    if ! jq --arg v "$value" "$path = \$v" "$file" > "$tmp"; then
+        rm -f "$tmp"
+        die "Failed to update config at $path"
+    fi
+    mv "$tmp" "$file"
+}
+
+# _user_config_delete <jq-path>
+_user_config_delete() {
+    local path="$1" file tmp
+    file="$(_user_config_file)"
+    [ -f "$file" ] || return 0
+    command -v jq >/dev/null 2>&1 || die "'jq' is required."
+    tmp="$(mktemp)"
+    if ! jq "del($path)" "$file" > "$tmp"; then
+        rm -f "$tmp"
+        die "Failed to delete config at $path"
+    fi
+    mv "$tmp" "$file"
+}
+
+# ---------------------------------------------------------------------------
+# AI-backend abstraction for the resolve workflow.
+#
+# Resolve runs are driven by a local AI assistant CLI (Claude Code by
+# default, Codex CLI opt-in).  The three helpers below keep the backend
+# choice out of cmd_resolve / resolve.ts so adding a new backend is a
+# case-statement edit, not a spawn-site rewrite.
+#
+#   _ai_backend_binary    — which executable to spawn
+#   _ai_backend_config_dir — where the backend stores its config + skills
+#   _ai_spawn_args        — flag mapping for new/resume/ask modes
+#   _ai_resolve_backend   — pick a backend with CLI-flag / env / default precedence
+#
+# Resolution order (first hit wins):
+#   1. Env-var override:   SWCTL_CLAUDE_BIN / CLAUDE_CONFIG_DIR / SWCTL_RESOLVE_BACKEND
+#   2. User config file:   ~/.swctl/config.json → .ai.<backend>.bin / .configDir / .defaultBackend
+#   3. Built-in default:   "claude" / "codex" / "$HOME/.claude" / "$HOME/.codex"
+# ---------------------------------------------------------------------------
+
+_ai_backend_binary() {
+    case "$1" in
+        claude)
+            if [ -n "${SWCTL_CLAUDE_BIN:-}" ]; then
+                printf '%s' "$SWCTL_CLAUDE_BIN"
+            else
+                printf '%s' "$(_user_config_read '.ai.claude.bin' 2>/dev/null || echo claude)"
+            fi
+            ;;
+        codex)
+            if [ -n "${SWCTL_CODEX_BIN:-}" ]; then
+                printf '%s' "$SWCTL_CODEX_BIN"
+            else
+                printf '%s' "$(_user_config_read '.ai.codex.bin' 2>/dev/null || echo codex)"
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+_ai_backend_config_dir() {
+    case "$1" in
+        claude)
+            if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+                printf '%s' "$CLAUDE_CONFIG_DIR"
+            else
+                printf '%s' "$(_user_config_read '.ai.claude.configDir' 2>/dev/null || echo "$HOME/.claude")"
+            fi
+            ;;
+        codex)
+            if [ -n "${CODEX_CONFIG_DIR:-}" ]; then
+                printf '%s' "$CODEX_CONFIG_DIR"
+            else
+                printf '%s' "$(_user_config_read '.ai.codex.configDir' 2>/dev/null || echo "$HOME/.codex")"
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Apply the precedence:  --backend <arg> > env > config file > claude
+# $1 = explicit backend passed on the CLI (may be empty).  Prints the
+# resolved backend (lowercased, validated) or returns non-zero.
+_ai_resolve_backend() {
+    local explicit="${1:-}"
+    local backend
+    if [ -n "$explicit" ]; then
+        backend="$explicit"
+    elif [ -n "${SWCTL_RESOLVE_BACKEND:-}" ]; then
+        backend="$SWCTL_RESOLVE_BACKEND"
+    else
+        backend="$(_user_config_read '.ai.defaultBackend' 2>/dev/null || echo claude)"
+    fi
+    backend="$(printf '%s' "$backend" | tr '[:upper:]' '[:lower:]')"
+    case "$backend" in
+        claude|codex) printf '%s' "$backend" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Print the flag list for the given backend + mode, newline-separated.
+# Callers `readarray -t` the output into an argv array — whitespace in
+# prompt values stays intact because the consumer array-expands.
+#
+#   mode ∈ { new, resume, ask }
+#   $3   — session id (required for resume/ask; generated by caller for new)
+#
+# Codex's real flag surface is behind a `~/.codex/config.toml` rather
+# than long CLI flags.  For the MVP we emit a minimal `exec --session`
+# shape; a follow-up maps the exact flags after `codex --help` is
+# pinned.  The abstraction shape (mode × backend) is the stable part.
+_ai_spawn_args() {
+    local backend="$1" mode="$2" session_id="${3:-}"
+    case "$backend" in
+        claude)
+            case "$mode" in
+                new)
+                    printf -- '--output-format\nstream-json\n--verbose\n--session-id\n%s\n--effort\nmax\n' "$session_id"
+                    ;;
+                resume)
+                    printf -- '--resume\n%s\n--output-format\nstream-json\n--verbose\n' "$session_id"
+                    ;;
+                ask)
+                    printf -- '--resume\n%s\n-p\n' "$session_id"
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        codex)
+            case "$mode" in
+                new)
+                    printf -- 'exec\n--session\n%s\n' "$session_id"
+                    ;;
+                resume)
+                    printf -- 'exec\n--session\n%s\n--resume\n' "$session_id"
+                    ;;
+                ask)
+                    printf -- 'exec\n--session\n%s\n--message\n' "$session_id"
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 setup_plugin_database() {
     # Clone a separate DB for a plugin issue (no full provision — just the DB).
     local source_db
@@ -4795,28 +5000,45 @@ cmd_doctor() {
     fi
 
     # 5. Tracked instances + their container health.
+    # Also break down by resolve backend so users can see at a glance which
+    # instances are Claude-backed vs Codex-backed (v0.5.7+).
     local total=0 managed_ok=0 managed_missing=0
+    local backend_claude=0 backend_codex=0 backend_unknown=0
     if [ -d "${SWCTL_REGISTRY_DIR:-${HOME}/.local/state/swctl/instances}" ]; then
         total="$(find "${SWCTL_REGISTRY_DIR:-${HOME}/.local/state/swctl/instances}" -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ')"
-        if [ "$rc" -eq 0 ] && [ "$total" -gt 0 ]; then
-            local f issue
-            while IFS= read -r f; do
-                issue="$(basename "$f" .env)"
-                # shellcheck disable=SC1090
-                local proj="" cont_status
-                proj="$(awk -F= '/^COMPOSE_PROJECT=/ {gsub(/[\047"]/, "", $2); print $2; exit}' "$f" 2>/dev/null)"
-                [ -n "$proj" ] || continue
+        local f issue
+        while IFS= read -r f; do
+            issue="$(basename "$f" .env)"
+            # shellcheck disable=SC1090
+            local proj="" cont_status
+            proj="$(awk -F= '/^COMPOSE_PROJECT=/ {gsub(/[\047"]/, "", $2); print $2; exit}' "$f" 2>/dev/null)"
+            # Count backend irrespective of container health — that stat is
+            # about what's tracked, not what's running right now.
+            local this_backend
+            this_backend="$(awk -F= '/^RESOLVE_BACKEND=/ {gsub(/[\047"]/, "", $2); print $2; exit}' "$f" 2>/dev/null)"
+            case "$this_backend" in
+                claude|"") backend_claude=$((backend_claude + 1)) ;;
+                codex)     backend_codex=$((backend_codex + 1)) ;;
+                *)         backend_unknown=$((backend_unknown + 1)) ;;
+            esac
+            [ -n "$proj" ] || continue
+            if [ "$rc" -eq 0 ]; then
                 cont_status="$(docker ps -a --filter "label=com.docker.compose.project=${proj}" --format '{{.Status}}' 2>/dev/null | head -1)"
                 if [ -n "$cont_status" ]; then
                     managed_ok=$((managed_ok + 1))
                 else
                     managed_missing=$((managed_missing + 1))
                 fi
-            done < <(find "${SWCTL_REGISTRY_DIR:-${HOME}/.local/state/swctl/instances}" -type f -name '*.env' 2>/dev/null)
-        fi
+            fi
+        done < <(find "${SWCTL_REGISTRY_DIR:-${HOME}/.local/state/swctl/instances}" -type f -name '*.env' 2>/dev/null)
     fi
     printf '[INFO] tracked instances   : %s (running: %s, missing container: %s)\n' \
         "$total" "$managed_ok" "$managed_missing"
+    if [ "$total" -gt 0 ]; then
+        local backend_summary="claude: $backend_claude, codex: $backend_codex"
+        [ "$backend_unknown" -gt 0 ] && backend_summary="$backend_summary, unknown: $backend_unknown"
+        printf '[INFO] resolve backends    : %s\n' "$backend_summary"
+    fi
 
     # 6. Plugin-external instances: every linked plugin with an admin
     # source tree MUST have a built Vite entrypoints.json, otherwise the
@@ -6134,6 +6356,8 @@ Commands:
               swctl skill install [--user|--repo]    swctl skill uninstall    swctl skill status
   mcp         Install/remove swctl's MCP server in your host Claude Code settings.
               swctl mcp install   [--user|--project]  swctl mcp uninstall    swctl mcp status
+  config      Read/write ~/.swctl/config.json (AI backend, feature flags).
+              swctl config [show|path|get|set|unset|edit]
   project     Manage registered projects: swctl project [add|list|remove|init]
   build-base  Pre-populate shared vendor and node_modules base volumes from the project root.
   clean-base  Remove shared base volumes for the current project.
@@ -6262,70 +6486,168 @@ mcp_bundle_path() {
     printf '%s/app/mcp/index.ts' "$dir"
 }
 
-cmd_skill_install() {
-    local scope="user"
-    case "${1:-}" in
-        --user) scope="user"; shift ;;
-        --repo|--project) scope="repo"; shift ;;
+# _ai_targets_for_install <requested> [scope]
+#
+# Expands a --target value ("claude", "codex", "all") into a newline-separated
+# list of backends to install into.
+#
+#   requested="all"    → every detected backend (config dir exists) for user
+#                        scope; defaults to ["claude"] for repo scope (repo
+#                        scope doesn't need on-disk detection).
+#   requested=""       → same default behaviour.
+#   requested="claude" → just claude
+#   requested="codex"  → just codex
+#
+# Callers must fail if the result is empty and the user asked for "all".
+_ai_targets_for_install() {
+    local requested="${1:-}"
+    local scope="${2:-user}"
+
+    case "$requested" in
+        claude|codex)
+            printf '%s\n' "$requested"
+            return 0
+            ;;
+        ""|all)
+            ;;
+        *)
+            return 1
+            ;;
     esac
 
-    local src dst
+    # Repo scope: we're writing into $(pwd)/.claude or $(pwd)/.codex — no
+    # host-level "detect config dir" makes sense.  Default to claude when
+    # unspecified; user must opt in to codex explicitly.
+    if [ "$scope" = "repo" ]; then
+        printf 'claude\n'
+        return 0
+    fi
+
+    # User scope, requested=all|"" → enumerate every backend whose host config
+    # dir exists.  No silent fallbacks: if nothing is detected, caller fails.
+    local found=0 backend
+    for backend in claude codex; do
+        local cfg
+        cfg="$(_ai_backend_config_dir "$backend")"
+        if [ -d "$cfg" ]; then
+            printf '%s\n' "$backend"
+            found=1
+        fi
+    done
+    [ "$found" -eq 1 ] || return 2
+}
+
+# _ai_skill_dst <backend> <scope>
+_ai_skill_dst() {
+    local backend="$1" scope="$2"
+    case "$scope" in
+        user)
+            local cfg
+            cfg="$(_ai_backend_config_dir "$backend")" || return 1
+            printf '%s/skills/shopware-resolve' "$cfg"
+            ;;
+        repo)
+            # Repo-scoped: drop into .<backend>/skills/ next to .swctl.conf.
+            printf '%s/.%s/skills/shopware-resolve' "$(pwd)" "$backend"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+cmd_skill_install() {
+    local scope="user" target=""
+    while [ $# -gt 0 ]; do
+        case "${1:-}" in
+            --user)    scope="user"; shift ;;
+            --repo|--project) scope="repo"; shift ;;
+            --target)  shift; target="${1:?Missing --target value}"; shift ;;
+            --target=*) target="${1#--target=}"; shift ;;
+            *) die "Unknown argument: $1" ;;
+        esac
+    done
+
+    local src
     src="$(skill_bundle_path)"
     [ -d "$src" ] || die "Bundled skill not found at $src. Reinstall swctl."
 
-    if [ "$scope" = "user" ]; then
-        dst="$HOME/.claude/skills/shopware-resolve"
-    else
-        dst="$(pwd)/.claude/skills/shopware-resolve"
-    fi
+    local targets rc=0
+    targets="$(_ai_targets_for_install "$target" "$scope")" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) die "Unknown --target value '$target'. Use claude, codex, or all." ;;
+        2) die "No AI backend config dirs detected (checked ~/.claude, ~/.codex). Use --target claude or install the backend first." ;;
+    esac
 
-    mkdir -p "$(dirname "$dst")"
+    local backend
+    while IFS= read -r backend; do
+        [ -n "$backend" ] || continue
+        local dst
+        dst="$(_ai_skill_dst "$backend" "$scope")" || die "Cannot compute dest for backend '$backend'."
+        mkdir -p "$(dirname "$dst")"
 
-    if [ -L "$dst" ]; then
-        local current
-        current="$(readlink "$dst" 2>/dev/null || true)"
-        if [ "$current" = "$src" ]; then
-            ok "shopware-resolve skill already linked at $dst"
-            return 0
+        if [ -L "$dst" ]; then
+            local current
+            current="$(readlink "$dst" 2>/dev/null || true)"
+            if [ "$current" = "$src" ]; then
+                ok "[$backend] shopware-resolve skill already linked at $dst"
+                continue
+            fi
+            warn "[$backend] Replacing existing symlink ($current → $src)"
+            ln -sfn "$src" "$dst"
+        elif [ -e "$dst" ]; then
+            die "[$backend] $dst already exists as a file/dir (not a symlink). Move it aside or run 'swctl skill uninstall' first."
+        else
+            ln -sfn "$src" "$dst"
         fi
-        warn "Replacing existing symlink ($current → $src)"
-        ln -sfn "$src" "$dst"
-    elif [ -e "$dst" ]; then
-        die "$dst already exists as a file/dir (not a symlink). Move it aside or run 'swctl skill uninstall' first."
-    else
-        ln -sfn "$src" "$dst"
-    fi
-    ok "Linked shopware-resolve skill → $dst"
-    info "Run 'claude /shopware-resolve' from a terminal to use it on the host."
+        ok "[$backend] Linked shopware-resolve skill → $dst"
+    done <<< "$targets"
+
+    info "Run 'claude /shopware-resolve' (or 'codex /shopware-resolve') from a terminal to use it on the host."
 }
 
 cmd_skill_uninstall() {
-    local scope="user"
-    case "${1:-}" in
-        --user) scope="user"; shift ;;
-        --repo|--project) scope="repo"; shift ;;
-    esac
+    local scope="user" target=""
+    while [ $# -gt 0 ]; do
+        case "${1:-}" in
+            --user)    scope="user"; shift ;;
+            --repo|--project) scope="repo"; shift ;;
+            --target)  shift; target="${1:?Missing --target value}"; shift ;;
+            --target=*) target="${1#--target=}"; shift ;;
+            *) die "Unknown argument: $1" ;;
+        esac
+    done
 
-    local dst
-    if [ "$scope" = "user" ]; then
-        dst="$HOME/.claude/skills/shopware-resolve"
+    local targets rc=0
+    # For uninstall, empty target defaults to claude (back-compat).  "all" is
+    # supported via explicit --target all.
+    if [ -z "$target" ]; then
+        targets="claude"
     else
-        dst="$(pwd)/.claude/skills/shopware-resolve"
+        targets="$(_ai_targets_for_install "$target" "$scope")" || rc=$?
+        case "$rc" in
+            0) ;;
+            1) die "Unknown --target value '$target'. Use claude, codex, or all." ;;
+            2) warn "No AI backend config dirs detected; nothing to uninstall."; return 0 ;;
+        esac
     fi
 
-    if [ -L "$dst" ]; then
-        rm -f "$dst"
-        ok "Removed shopware-resolve skill symlink: $dst"
-    elif [ -e "$dst" ]; then
-        die "$dst is not a symlink — refusing to delete (user-owned content)."
-    else
-        info "No shopware-resolve skill linked at $dst"
-    fi
+    local backend
+    while IFS= read -r backend; do
+        [ -n "$backend" ] || continue
+        local dst
+        dst="$(_ai_skill_dst "$backend" "$scope")" || die "Cannot compute dest for backend '$backend'."
+        if [ -L "$dst" ]; then
+            rm -f "$dst"
+            ok "[$backend] Removed shopware-resolve skill symlink: $dst"
+        elif [ -e "$dst" ]; then
+            warn "[$backend] $dst is not a symlink — refusing to delete (user-owned content)."
+        else
+            info "[$backend] No shopware-resolve skill linked at $dst"
+        fi
+    done <<< "$targets"
 }
 
 cmd_skill_status() {
-    local user_dst="$HOME/.claude/skills/shopware-resolve"
-    local repo_dst; repo_dst="$(pwd)/.claude/skills/shopware-resolve"
     local src
     src="$(skill_bundle_path)"
 
@@ -6336,23 +6658,30 @@ cmd_skill_status() {
         warn "  MISSING — reinstall swctl"
     fi
 
-    printf '\n%bUser-level link (%s):%b\n' "${COLOR_BOLD:-}" "$user_dst" "${COLOR_RESET:-}"
-    if [ -L "$user_dst" ]; then
-        ok "  → $(readlink "$user_dst")"
-    elif [ -e "$user_dst" ]; then
-        warn "  present but not a symlink (user-installed content)"
-    else
-        info "  not linked (run 'swctl skill install --user')"
-    fi
+    local backend
+    for backend in claude codex; do
+        local user_dst repo_dst
+        user_dst="$(_ai_skill_dst "$backend" "user")"
+        repo_dst="$(_ai_skill_dst "$backend" "repo")"
 
-    printf '\n%bRepo-level link (%s):%b\n' "${COLOR_BOLD:-}" "$repo_dst" "${COLOR_RESET:-}"
-    if [ -L "$repo_dst" ]; then
-        ok "  → $(readlink "$repo_dst")"
-    elif [ -e "$repo_dst" ]; then
-        warn "  present but not a symlink"
-    else
-        info "  not linked"
-    fi
+        printf '\n%b[%s] user-level link (%s):%b\n' "${COLOR_BOLD:-}" "$backend" "$user_dst" "${COLOR_RESET:-}"
+        if [ -L "$user_dst" ]; then
+            ok "  → $(readlink "$user_dst")"
+        elif [ -e "$user_dst" ]; then
+            warn "  present but not a symlink (user-installed content)"
+        else
+            info "  not linked (run 'swctl skill install --user --target $backend')"
+        fi
+
+        printf '%b[%s] repo-level link (%s):%b\n' "${COLOR_BOLD:-}" "$backend" "$repo_dst" "${COLOR_RESET:-}"
+        if [ -L "$repo_dst" ]; then
+            ok "  → $(readlink "$repo_dst")"
+        elif [ -e "$repo_dst" ]; then
+            warn "  present but not a symlink"
+        else
+            info "  not linked"
+        fi
+    done
 }
 
 cmd_skill() {
@@ -6367,71 +6696,127 @@ cmd_skill() {
     esac
 }
 
-cmd_mcp_install() {
-    local scope="user"
-    case "${1:-}" in
-        --user) scope="user"; shift ;;
-        --repo|--project) scope="repo"; shift ;;
+# _ai_mcp_settings <backend> <scope>
+#
+# Prints the path to the settings JSON file for the given backend/scope
+# pair.  Repo scope uses a single flat `.mcp.json` regardless of backend
+# (Claude Code's convention; Codex respects the same project-local file).
+_ai_mcp_settings() {
+    local backend="$1" scope="$2"
+    case "$scope" in
+        user)
+            local cfg
+            cfg="$(_ai_backend_config_dir "$backend")" || return 1
+            printf '%s/settings.json' "$cfg"
+            ;;
+        repo)
+            printf '%s/.mcp.json' "$(pwd)"
+            ;;
+        *) return 1 ;;
     esac
+}
+
+cmd_mcp_install() {
+    local scope="user" target=""
+    while [ $# -gt 0 ]; do
+        case "${1:-}" in
+            --user)    scope="user"; shift ;;
+            --repo|--project) scope="repo"; shift ;;
+            --target)  shift; target="${1:?Missing --target value}"; shift ;;
+            --target=*) target="${1#--target=}"; shift ;;
+            *) die "Unknown argument: $1" ;;
+        esac
+    done
 
     command -v jq >/dev/null 2>&1 || die "'jq' is required for MCP install. brew install jq."
 
-    local src target
+    local src
     src="$(mcp_bundle_path)"
     [ -f "$src" ] || die "Bundled MCP server not found at $src. Reinstall swctl."
 
-    if [ "$scope" = "user" ]; then
-        target="$HOME/.claude/settings.json"
+    # Repo scope writes a single .mcp.json regardless of backend; collapse to
+    # claude so we only write it once.
+    local targets rc=0
+    if [ "$scope" = "repo" ]; then
+        targets="claude"
     else
-        target="$(pwd)/.mcp.json"
+        targets="$(_ai_targets_for_install "$target" "$scope")" || rc=$?
+        case "$rc" in
+            0) ;;
+            1) die "Unknown --target value '$target'. Use claude, codex, or all." ;;
+            2) die "No AI backend config dirs detected (checked ~/.claude, ~/.codex). Use --target claude or install the backend first." ;;
+        esac
     fi
-
-    mkdir -p "$(dirname "$target")"
-    [ -s "$target" ] || printf '{}\n' > "$target"
 
     local desired
     desired="$(jq -n --arg cmd "npx" --arg tsx "tsx" --arg p "$src" \
         '{command: $cmd, args: [$tsx, $p]}')"
 
-    local tmp; tmp="$(mktemp)"
-    jq --argjson swctl "$desired" \
-        '.mcpServers = (.mcpServers // {}) | .mcpServers.swctl = $swctl' \
-        "$target" > "$tmp" && mv "$tmp" "$target"
+    local backend
+    while IFS= read -r backend; do
+        [ -n "$backend" ] || continue
+        local target_file
+        target_file="$(_ai_mcp_settings "$backend" "$scope")" || die "Cannot compute settings path for '$backend'."
+        mkdir -p "$(dirname "$target_file")"
+        [ -s "$target_file" ] || printf '{}\n' > "$target_file"
 
-    ok "Wired swctl MCP entry into $target"
+        local tmp; tmp="$(mktemp)"
+        jq --argjson swctl "$desired" \
+            '.mcpServers = (.mcpServers // {}) | .mcpServers.swctl = $swctl' \
+            "$target_file" > "$tmp" && mv "$tmp" "$target_file"
+
+        ok "[$backend] Wired swctl MCP entry into $target_file"
+    done <<< "$targets"
+
     info "Command: npx tsx $src"
 }
 
 cmd_mcp_uninstall() {
-    local scope="user"
-    case "${1:-}" in
-        --user) scope="user"; shift ;;
-        --repo|--project) scope="repo"; shift ;;
-    esac
+    local scope="user" target=""
+    while [ $# -gt 0 ]; do
+        case "${1:-}" in
+            --user)    scope="user"; shift ;;
+            --repo|--project) scope="repo"; shift ;;
+            --target)  shift; target="${1:?Missing --target value}"; shift ;;
+            --target=*) target="${1#--target=}"; shift ;;
+            *) die "Unknown argument: $1" ;;
+        esac
+    done
 
     command -v jq >/dev/null 2>&1 || die "'jq' is required."
 
-    local target
-    if [ "$scope" = "user" ]; then
-        target="$HOME/.claude/settings.json"
+    local targets rc=0
+    if [ "$scope" = "repo" ]; then
+        targets="claude"
+    elif [ -z "$target" ]; then
+        targets="claude"
     else
-        target="$(pwd)/.mcp.json"
+        targets="$(_ai_targets_for_install "$target" "$scope")" || rc=$?
+        case "$rc" in
+            0) ;;
+            1) die "Unknown --target value '$target'. Use claude, codex, or all." ;;
+            2) warn "No AI backend config dirs detected; nothing to uninstall."; return 0 ;;
+        esac
     fi
 
-    if [ ! -s "$target" ]; then
-        info "No $target to edit."
-        return 0
-    fi
+    local backend
+    while IFS= read -r backend; do
+        [ -n "$backend" ] || continue
+        local target_file
+        target_file="$(_ai_mcp_settings "$backend" "$scope")" || continue
+        if [ ! -s "$target_file" ]; then
+            info "[$backend] No $target_file to edit."
+            continue
+        fi
 
-    local tmp; tmp="$(mktemp)"
-    jq 'if .mcpServers.swctl then .mcpServers |= del(.swctl) else . end' \
-        "$target" > "$tmp" && mv "$tmp" "$target"
-    ok "Removed swctl MCP entry from $target"
+        local tmp; tmp="$(mktemp)"
+        jq 'if .mcpServers.swctl then .mcpServers |= del(.swctl) else . end' \
+            "$target_file" > "$tmp" && mv "$tmp" "$target_file"
+        ok "[$backend] Removed swctl MCP entry from $target_file"
+    done <<< "$targets"
 }
 
 cmd_mcp_status() {
-    local user_target="$HOME/.claude/settings.json"
-    local repo_target; repo_target="$(pwd)/.mcp.json"
     local src
     src="$(mcp_bundle_path)"
 
@@ -6442,11 +6827,14 @@ cmd_mcp_status() {
         warn "  MISSING — reinstall swctl"
     fi
 
-    for target in "$user_target" "$repo_target"; do
-        printf '\n%b%s:%b\n' "${COLOR_BOLD:-}" "$target" "${COLOR_RESET:-}"
-        if [ -s "$target" ] && command -v jq >/dev/null 2>&1; then
+    local backend
+    for backend in claude codex; do
+        local user_target
+        user_target="$(_ai_mcp_settings "$backend" "user")"
+        printf '\n%b[%s] %s:%b\n' "${COLOR_BOLD:-}" "$backend" "$user_target" "${COLOR_RESET:-}"
+        if [ -s "$user_target" ] && command -v jq >/dev/null 2>&1; then
             local entry
-            entry="$(jq -c '.mcpServers.swctl // null' "$target" 2>/dev/null || echo null)"
+            entry="$(jq -c '.mcpServers.swctl // null' "$user_target" 2>/dev/null || echo null)"
             if [ "$entry" != "null" ]; then
                 ok "  $entry"
             else
@@ -6456,6 +6844,20 @@ cmd_mcp_status() {
             info "  (not present)"
         fi
     done
+
+    local repo_target; repo_target="$(pwd)/.mcp.json"
+    printf '\n%b[repo] %s:%b\n' "${COLOR_BOLD:-}" "$repo_target" "${COLOR_RESET:-}"
+    if [ -s "$repo_target" ] && command -v jq >/dev/null 2>&1; then
+        local entry
+        entry="$(jq -c '.mcpServers.swctl // null' "$repo_target" 2>/dev/null || echo null)"
+        if [ "$entry" != "null" ]; then
+            ok "  $entry"
+        else
+            info "  no swctl MCP entry"
+        fi
+    else
+        info "  (not present)"
+    fi
 }
 
 cmd_mcp() {
@@ -6467,6 +6869,102 @@ cmd_mcp() {
         uninstall) cmd_mcp_uninstall "$@" ;;
         status)    cmd_mcp_status "$@" ;;
         *) die "Unknown mcp subcommand: $sub" ;;
+    esac
+}
+
+# ── User config (~/.swctl/config.json) ──────────────────────────────────────
+#
+# Shared by the CLI and the UI /config page.  Schema is deliberately loose
+# (a free-form JSON object); today we only document + expose AI-related
+# keys, but a future feature can squat on any subtree without migrating.
+#
+# Documented keys:
+#   .ai.defaultBackend         "claude" | "codex"       → _ai_resolve_backend
+#   .ai.claude.bin             "/path/to/claude"        → _ai_backend_binary claude
+#   .ai.claude.configDir       "/path/to/.claude"       → _ai_backend_config_dir claude
+#   .ai.codex.bin              "/path/to/codex"         → _ai_backend_binary codex
+#   .ai.codex.configDir        "/path/to/.codex"        → _ai_backend_config_dir codex
+# --------------------------------------------------------------------------
+
+cmd_config_path() {
+    printf '%s\n' "$(_user_config_file)"
+}
+
+cmd_config_get() {
+    local path="${1:-}"
+    [ -n "$path" ] || die "Usage: swctl config get <jq-path>   e.g. '.ai.defaultBackend'"
+    # Prefix with '.' if caller gave a bare key (ai.defaultBackend → .ai.defaultBackend)
+    case "$path" in
+        .*) ;;
+        *)  path=".$path" ;;
+    esac
+    local file
+    file="$(_user_config_file)"
+    if [ ! -f "$file" ]; then
+        warn "Config file does not exist: $file"
+        return 1
+    fi
+    command -v jq >/dev/null 2>&1 || die "'jq' is required. brew install jq."
+    jq -r "$path // empty" "$file"
+}
+
+cmd_config_set() {
+    local path="${1:-}" value="${2:-}"
+    [ -n "$path" ]  || die "Usage: swctl config set <jq-path> <value>"
+    [ -n "$value" ] || die "Usage: swctl config set <jq-path> <value>"
+    case "$path" in
+        .*) ;;
+        *)  path=".$path" ;;
+    esac
+    _user_config_write "$path" "$value"
+    ok "Set $path = $value in $(_user_config_file)"
+}
+
+cmd_config_unset() {
+    local path="${1:-}"
+    [ -n "$path" ] || die "Usage: swctl config unset <jq-path>"
+    case "$path" in
+        .*) ;;
+        *)  path=".$path" ;;
+    esac
+    _user_config_delete "$path"
+    ok "Removed $path from $(_user_config_file)"
+}
+
+cmd_config_show() {
+    local file
+    file="$(_user_config_file)"
+    if [ ! -f "$file" ]; then
+        info "Config file does not exist: $file"
+        info "Run 'swctl config set <key> <value>' to create it, or visit /#/config in the UI."
+        return 0
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        jq . "$file"
+    else
+        cat "$file"
+    fi
+}
+
+cmd_config_edit() {
+    local file
+    file="$(_user_config_file)"
+    mkdir -p "$(dirname "$file")"
+    [ -f "$file" ] || printf '{}\n' > "$file"
+    "${EDITOR:-vi}" "$file"
+}
+
+cmd_config() {
+    local sub="${1:-show}"
+    shift || true
+    case "$sub" in
+        path)  cmd_config_path  "$@" ;;
+        get)   cmd_config_get   "$@" ;;
+        set)   cmd_config_set   "$@" ;;
+        unset) cmd_config_unset "$@" ;;
+        show|list) cmd_config_show "$@" ;;
+        edit)  cmd_config_edit  "$@" ;;
+        *) die "Usage: swctl config [show|path|get|set|unset|edit] [...]" ;;
     esac
 }
 
@@ -6701,26 +7199,54 @@ resolve_dispatch_issue() {
     mkdir -p "$run_dir"
     printf 'running\n' > "$run_dir/status"
 
-    # Matches the UI (app/server/lib/resolve.ts):
-    # - explicit allowlist so non-interactive mode doesn't hit approval prompts
-    # - --effort max for a wider per-turn thinking budget
-    # - --session-id makes `claude --resume <id>` work later
-    claude -p "$prompt" \
-        --output-format stream-json \
-        --verbose \
-        --permission-mode "$permission_mode" \
-        --allowedTools "Bash Edit Write Read Grep Glob Task WebFetch WebSearch TodoWrite" \
-        --effort max \
-        --session-id "$session_id" \
-        --name "resolve-$issue_id" \
-        --add-dir "$worktree_path" \
-        --max-budget-usd 5.00 \
-        2>"$run_dir/stderr.log" \
-    | resolve_stream_monitor "$issue_id"
+    # Backend dispatch.  `RESOLVE_BACKEND` is resolved once at the top
+    # of cmd_resolve and exported; resolve_one passes it through.
+    local backend="${RESOLVE_BACKEND:-claude}"
+    local ai_bin
+    ai_bin="$(_ai_backend_binary "$backend")"
 
-    local exit_code=$?
+    local exit_code
+    case "$backend" in
+        claude)
+            # - explicit allowlist so non-interactive mode doesn't hit approval prompts
+            # - --effort max for a wider per-turn thinking budget
+            # - --session-id makes `<bin> --resume <id>` work later
+            "$ai_bin" -p "$prompt" \
+                --output-format stream-json \
+                --verbose \
+                --permission-mode "$permission_mode" \
+                --allowedTools "Bash Edit Write Read Grep Glob Task WebFetch WebSearch TodoWrite" \
+                --effort max \
+                --session-id "$session_id" \
+                --name "resolve-$issue_id" \
+                --add-dir "$worktree_path" \
+                --max-budget-usd 5.00 \
+                2>"$run_dir/stderr.log" \
+            | resolve_stream_monitor "$issue_id"
+            exit_code=${PIPESTATUS[0]}
+            ;;
+        codex)
+            # MVP: Codex CLI support is experimental.  The flag surface
+            # below is a best-effort starting point — verify against the
+            # installed `codex` binary and PR updates as needed.
+            # resolve_stream_monitor parses Claude's stream-json format;
+            # for Codex we fall back to raw stderr teeing until the
+            # format parity is wired up.
+            warn "[resolve] Codex backend is experimental. Output parsing is minimal."
+            "$ai_bin" exec \
+                --session "$session_id" \
+                --cd "$worktree_path" \
+                "$prompt" \
+                2>"$run_dir/stderr.log"
+            exit_code=$?
+            ;;
+        *)
+            err "[resolve] Unknown backend '$backend'."
+            return 2
+            ;;
+    esac
     printf '%s\n' "$exit_code" > "$run_dir/exit_code"
-    return $exit_code
+    return "$exit_code"
 }
 
 resolve_one() {
@@ -6888,6 +7414,7 @@ cmd_resolve() {
     local permission_mode="acceptEdits"
     local issues=""
     local labels=""
+    local backend_arg=""
 
     SWCTL_GITHUB_TOKEN_FILE="${SWCTL_STATE_DIR:-$HOME/.local/state/swctl}/github.token"
 
@@ -6897,6 +7424,8 @@ cmd_resolve() {
             --jobs|-j) shift; max_jobs="${1:?Missing --jobs arg}"; shift ;;
             --supervised) permission_mode="default"; shift ;;
             --labels)  shift; labels="${1:?Missing --labels arg}"; shift ;;
+            --backend) shift; backend_arg="${1:?Missing --backend arg}"; shift ;;
+            --backend=*) backend_arg="${1#--backend=}"; shift ;;
             --select)
                 shift
                 local fetched
@@ -6918,14 +7447,25 @@ cmd_resolve() {
         esac
     done
 
-    [ -n "$issues" ] || die "No issues specified.\nUsage: swctl resolve [--github <owner/repo>] [--select] [--labels <labels>] [--jobs N] [--supervised] <issue...>"
+    [ -n "$issues" ] || die "No issues specified.\nUsage: swctl resolve [--github <owner/repo>] [--select] [--labels <labels>] [--jobs N] [--supervised] [--backend=<claude|codex>] <issue...>"
 
-    command -v claude >/dev/null 2>&1 || die "Claude Code CLI not found. Install: https://docs.anthropic.com/en/docs/claude-code"
+    # Resolve the backend now so the rest of the run (and every child
+    # invocation spawned in parallel) inherits a single decision.  Exports
+    # RESOLVE_BACKEND so resolve_one / resolve_dispatch_issue / resolve.ts
+    # all read the same value without re-parsing the flag.
+    RESOLVE_BACKEND="$(_ai_resolve_backend "$backend_arg")" \
+        || die "Invalid backend '${backend_arg:-$SWCTL_RESOLVE_BACKEND}'. Use claude or codex."
+    export RESOLVE_BACKEND
+
+    local ai_bin
+    ai_bin="$(_ai_backend_binary "$RESOLVE_BACKEND")"
+    command -v "$ai_bin" >/dev/null 2>&1 \
+        || die "Backend '$RESOLVE_BACKEND' needs '$ai_bin' on PATH. Claude: https://docs.anthropic.com/en/docs/claude-code ; Codex: https://github.com/openai/codex"
     command -v jq >/dev/null 2>&1 || die "jq required for stream parsing."
 
     local total
     total="$(printf '%s\n' "$issues" | grep -c '.' || echo 0)"
-    info "[resolve] Resolving $total issue(s) with Claude Code (max $max_jobs concurrent)."
+    info "[resolve] Resolving $total issue(s) with ${RESOLVE_BACKEND} (max $max_jobs concurrent)."
 
     if [ "$total" -eq 1 ]; then
         resolve_one "$(printf '%s' "$issues" | tr -d '[:space:]')" "$repo" "$permission_mode"
@@ -6965,18 +7505,42 @@ cmd_resolve_resume() {
     local resume_prompt
     resume_prompt="Continue the previous /shopware-resolve run. You stopped after Step ${last_step}. Pick up at Step ${next_step} now, following the same ground rules from the skill."
 
-    claude -p "$resume_prompt" \
-        --resume "$CLAUDE_SESSION_ID" \
-        --output-format stream-json \
-        --verbose \
-        --permission-mode acceptEdits \
-        --allowedTools "Bash Edit Write Read Grep Glob Task WebFetch WebSearch TodoWrite" \
-        --effort max \
-        --add-dir "$WORKTREE_PATH" \
-        2>"$run_dir/stderr.log" \
-    | resolve_stream_monitor "$ISSUE_ID"
-
-    local rc=$?
+    # Dispatch on the backend recorded in metadata.  load_instance_metadata
+    # back-fills RESOLVE_BACKEND=claude for pre-v0.5.7 instances so this
+    # works even for sessions created before the Codex backend shipped.
+    local backend="${RESOLVE_BACKEND:-claude}"
+    local ai_bin
+    ai_bin="$(_ai_backend_binary "$backend")"
+    local rc
+    case "$backend" in
+        claude)
+            "$ai_bin" -p "$resume_prompt" \
+                --resume "$CLAUDE_SESSION_ID" \
+                --output-format stream-json \
+                --verbose \
+                --permission-mode acceptEdits \
+                --allowedTools "Bash Edit Write Read Grep Glob Task WebFetch WebSearch TodoWrite" \
+                --effort max \
+                --add-dir "$WORKTREE_PATH" \
+                2>"$run_dir/stderr.log" \
+            | resolve_stream_monitor "$ISSUE_ID"
+            rc=${PIPESTATUS[0]}
+            ;;
+        codex)
+            warn "[resolve] Codex resume is experimental."
+            "$ai_bin" exec \
+                --session "$CLAUDE_SESSION_ID" \
+                --resume \
+                --cd "$WORKTREE_PATH" \
+                "$resume_prompt" \
+                2>"$run_dir/stderr.log"
+            rc=$?
+            ;;
+        *)
+            err "[resolve] Unknown backend '$backend'."
+            return 2
+            ;;
+    esac
     local final_status="done"
     [ "$rc" -ne 0 ] && final_status="failed"
 
@@ -6989,7 +7553,7 @@ cmd_resolve_resume() {
     fi
     write_metadata "$meta_file"
 
-    return $rc
+    return "$rc"
 }
 
 render_resolve_status() {
@@ -7127,20 +7691,49 @@ cmd_resolve_ask() {
     meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
     load_instance_metadata "$meta_file"
 
-    if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
-        info "[resolve] Asking Claude (resuming session ${CLAUDE_SESSION_ID:0:8}...):"
-        claude -p "$message" \
-            --resume "$CLAUDE_SESSION_ID" \
-            --permission-mode acceptEdits \
-            --add-dir "$WORKTREE_PATH" \
-            2>/dev/null
-    else
-        info "[resolve] Asking Claude (new session in worktree):"
-        claude -p "$message" \
-            --permission-mode acceptEdits \
-            --add-dir "$WORKTREE_PATH" \
-            2>/dev/null
-    fi
+    local backend="${RESOLVE_BACKEND:-claude}"
+    local ai_bin
+    ai_bin="$(_ai_backend_binary "$backend")" || die "Unknown resolve backend '$backend'."
+
+    case "$backend" in
+        claude)
+            if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+                info "[resolve] Asking Claude (resuming session ${CLAUDE_SESSION_ID:0:8}...):"
+                "$ai_bin" -p "$message" \
+                    --resume "$CLAUDE_SESSION_ID" \
+                    --permission-mode acceptEdits \
+                    --add-dir "$WORKTREE_PATH" \
+                    2>/dev/null
+            else
+                info "[resolve] Asking Claude (new session in worktree):"
+                "$ai_bin" -p "$message" \
+                    --permission-mode acceptEdits \
+                    --add-dir "$WORKTREE_PATH" \
+                    2>/dev/null
+            fi
+            ;;
+        codex)
+            warn "[resolve] Codex backend is experimental; flag mapping may change in a future release."
+            if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+                info "[resolve] Asking Codex (resuming session ${CLAUDE_SESSION_ID:0:8}...):"
+                "$ai_bin" exec \
+                    --session "$CLAUDE_SESSION_ID" \
+                    --resume \
+                    --cd "$WORKTREE_PATH" \
+                    --message "$message" \
+                    2>/dev/null
+            else
+                info "[resolve] Asking Codex (new session in worktree):"
+                "$ai_bin" exec \
+                    --cd "$WORKTREE_PATH" \
+                    --message "$message" \
+                    2>/dev/null
+            fi
+            ;;
+        *)
+            die "Unsupported resolve backend '$backend'."
+            ;;
+    esac
 }
 
 cmd_resolve_chat() {
@@ -7152,19 +7745,44 @@ cmd_resolve_chat() {
     meta_file="$(resolve_instance_file_by_issue "$issue_input")" || die "No instance for '$issue_input'."
     load_instance_metadata "$meta_file"
 
-    info "[resolve] Opening interactive Claude session for #$ISSUE_ID"
+    local backend="${RESOLVE_BACKEND:-claude}"
+    local ai_bin
+    ai_bin="$(_ai_backend_binary "$backend")" || die "Unknown resolve backend '$backend'."
+
+    local backend_label
+    case "$backend" in
+        claude) backend_label="Claude" ;;
+        codex)  backend_label="Codex" ;;
+        *)      die "Unsupported resolve backend '$backend'." ;;
+    esac
+
+    info "[resolve] Opening interactive $backend_label session for #$ISSUE_ID"
     info "Worktree: $WORKTREE_PATH"
     info "Branch: $BRANCH"
 
     cd "$WORKTREE_PATH" || die "Cannot cd to $WORKTREE_PATH"
 
-    if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
-        info "Resuming session ${CLAUDE_SESSION_ID:0:8}..."
-        exec claude --resume "$CLAUDE_SESSION_ID"
-    else
-        info "Starting new session..."
-        exec claude
-    fi
+    case "$backend" in
+        claude)
+            if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+                info "Resuming session ${CLAUDE_SESSION_ID:0:8}..."
+                exec "$ai_bin" --resume "$CLAUDE_SESSION_ID"
+            else
+                info "Starting new session..."
+                exec "$ai_bin"
+            fi
+            ;;
+        codex)
+            warn "[resolve] Codex backend is experimental; interactive flag surface may change."
+            if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+                info "Resuming session ${CLAUDE_SESSION_ID:0:8}..."
+                exec "$ai_bin" --session "$CLAUDE_SESSION_ID" --resume
+            else
+                info "Starting new session..."
+                exec "$ai_bin"
+            fi
+            ;;
+    esac
 }
 
 cmd_resolve_pr() {
@@ -7619,12 +8237,14 @@ main() {
             cmd_code "$@"
             ;;
         resolve)
-            # Gated feature — hidden by default.  Set SWCTL_RESOLVE_ENABLED=1
-            # (env var, shell profile, or compose environment) to enable the
-            # GitHub-issue-to-PR Claude workflow.  The rest of swctl stays
-            # fully functional when this is off.
-            if [ "${SWCTL_RESOLVE_ENABLED:-0}" != "1" ]; then
-                die "'resolve' is not enabled in this build. Set SWCTL_RESOLVE_ENABLED=1 to enable."
+            # Gated feature — hidden by default.  Enable either of:
+            #   - SWCTL_RESOLVE_ENABLED=1 env var
+            #   - `features.resolveEnabled = true` in ~/.swctl/config.json
+            #     (flip it via the UI /#/config page or `swctl config set
+            #     features.resolveEnabled true`)
+            if [ "${SWCTL_RESOLVE_ENABLED:-0}" != "1" ] \
+               && [ "$(_user_config_read '.features.resolveEnabled' 2>/dev/null)" != "true" ]; then
+                die "'resolve' is not enabled. Enable it via: swctl config set features.resolveEnabled true  (or SWCTL_RESOLVE_ENABLED=1)"
             fi
             ensure_state_dirs
             shift
@@ -7669,6 +8289,10 @@ main() {
         mcp)
             shift
             cmd_mcp "$@"
+            ;;
+        config)
+            shift
+            cmd_config "$@"
             ;;
         build-base)
             ensure_state_dirs

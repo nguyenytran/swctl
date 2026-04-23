@@ -5,7 +5,7 @@ import { useStream } from '@/composables/useStream'
 import { useResolve } from '@/composables/useResolve'
 import { fetchDiff, fetchGitHubIssues, fetchDefaultIssueLabels } from '@/api'
 import { buildResolveStreamUrl, buildAskStreamUrl, finishResolve } from '@/api/resolve'
-import type { PrInfo } from '@/api/resolve'
+import type { PrInfo, ResolveBackend } from '@/api/resolve'
 import type { GitHubItem } from '@/types'
 import LogPanel from './LogPanel.vue'
 
@@ -25,6 +25,22 @@ const diffStat = ref('')
 const diffContent = ref('')
 const diffLoading = ref(false)
 const newIssueUrl = ref('')
+
+// Backend picker — persisted to localStorage so the user's last choice
+// sticks across page loads.  Defaults to 'claude' (matches the server
+// default and the pre-0.5.7 behaviour).
+const BACKEND_STORAGE_KEY = 'swctl.resolve.backend'
+const selectedBackend = ref<ResolveBackend>(
+  ((): ResolveBackend => {
+    try {
+      const v = localStorage.getItem(BACKEND_STORAGE_KEY)
+      return v === 'codex' ? 'codex' : 'claude'
+    } catch { return 'claude' }
+  })(),
+)
+watch(selectedBackend, (v) => {
+  try { localStorage.setItem(BACKEND_STORAGE_KEY, v) } catch {}
+})
 
 // GitHub browse picker — same label-chip filter flow as BatchCreateModal but
 // inline in the Resolve sidebar so users don't have to juggle URLs.
@@ -136,7 +152,7 @@ function selectIssue(issueId: string) {
 
 function startResolve() {
   if (!newIssueUrl.value) return
-  const url = buildResolveStreamUrl(newIssueUrl.value)
+  const url = buildResolveStreamUrl(newIssueUrl.value, undefined, selectedBackend.value)
   resolveStream.start(url)
   newIssueUrl.value = ''
 }
@@ -349,6 +365,35 @@ onMounted(async () => {
             :disabled="!newIssueUrl || resolveStream.running.value"
             @click="startResolve"
           >+</button>
+        </div>
+        <!-- Backend picker — pinned into the new issue's metadata at create
+             time so resume / ask / chat route to the same binary.  Defaults
+             to Claude to match the server default and pre-0.5.7 behaviour. -->
+        <div class="flex items-center gap-2 mt-1.5 text-[11px] text-gray-500">
+          <span>AI:</span>
+          <label class="flex items-center gap-1 cursor-pointer select-none">
+            <input
+              v-model="selectedBackend"
+              type="radio"
+              value="claude"
+              class="accent-blue-500"
+            />
+            <span :class="selectedBackend === 'claude' ? 'text-gray-200' : ''">Claude</span>
+          </label>
+          <label class="flex items-center gap-1 cursor-pointer select-none">
+            <input
+              v-model="selectedBackend"
+              type="radio"
+              value="codex"
+              class="accent-blue-500"
+            />
+            <span :class="selectedBackend === 'codex' ? 'text-gray-200' : ''">Codex</span>
+          </label>
+          <span
+            v-if="selectedBackend === 'codex'"
+            class="ml-auto text-amber-500/80"
+            title="Codex support is MVP; the UI currently falls back to Claude for streaming. CLI works end-to-end."
+          >experimental</span>
         </div>
       </div>
     </div>
