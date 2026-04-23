@@ -62,7 +62,12 @@ const MAX_STDOUT_BYTES = 16 * 1024 // AI is asked for a ~200 B JSON object
 const STDOUT_LOG_CAP = 120
 
 export async function detectScopeWithAI(input: AiScopeInput): Promise<AiScopeDecision> {
-  const heuristicProject = detectPluginScopeFromLabels(input.labels)
+  // Always pass `input.pluginNames` explicitly — `detectPluginScopeFromLabels`
+  // otherwise reads the on-disk projects registry, which may be empty in
+  // contexts where this function is called (CI, probe harness, callers
+  // that pre-load the plugin list from a non-disk source).  The caller
+  // is the source of truth for which plugins exist for THIS decision.
+  const heuristicProject = detectPluginScopeFromLabels(input.labels, input.pluginNames)
   const heuristicPrefix = branchPrefixFromLabels(input.labels)
   const heuristicConfident =
     heuristicProject !== null &&

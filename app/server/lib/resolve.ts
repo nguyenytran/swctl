@@ -286,8 +286,19 @@ export function branchPrefixFromLabels(labels: string[]): 'fix' | 'feat' | 'chor
  * the plugin name (case-insensitive). This handles "Custom-Products" →
  * "SwagCustomizedProducts" (both "custom" and "products" are present).
  */
-export function detectPluginScopeFromLabels(labels: string[]): string | null {
-  const plugins = readProjects().filter((p) => p.type === 'plugin-external').map((p) => p.name)
+export function detectPluginScopeFromLabels(
+  labels: string[],
+  /**
+   * Caller-supplied plugin list.  When omitted, the function falls back
+   * to reading the on-disk projects registry (default).  Passing it
+   * explicitly is required in contexts where the registry isn't
+   * populated — e.g. `detectScopeWithAI` on CI runners where no user
+   * ever ran `swctl project add`.
+   */
+  pluginNamesOverride?: string[],
+): string | null {
+  const plugins = pluginNamesOverride
+    ?? readProjects().filter((p) => p.type === 'plugin-external').map((p) => p.name)
   if (plugins.length === 0) return null
 
   // Rank candidates by word count so multi-word labels beat single-word ones,
