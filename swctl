@@ -4722,7 +4722,9 @@ cmd_nuke() {
     rm -f "${SWCTL_TMP_DIR:-/tmp}/${compose_project}.compose.env" \
           "${SWCTL_TMP_DIR:-/tmp}/${compose_project}.volumes.override.yml" \
           2>/dev/null || true
-    [ -n "${meta_file:-}" ] && rm -f "$meta_file" 2>/dev/null || true
+    if [ -n "${meta_file:-}" ]; then
+        rm -f "$meta_file" 2>/dev/null || true
+    fi
 
     ok "Nuked issue '${ISSUE_ID}'."
     info "You can now re-create it: swctl create --qa ${ISSUE_ID} <branch>"
@@ -6837,10 +6839,12 @@ resolve_parallel() {
         done
 
         (
-            resolve_one "$issue_number" "$repo" "$permission_mode" \
-                >"$job_dir/${issue_number}.log" 2>&1 \
-                && touch "$job_dir/${issue_number}.ok" \
-                || touch "$job_dir/${issue_number}.fail"
+            if resolve_one "$issue_number" "$repo" "$permission_mode" \
+                >"$job_dir/${issue_number}.log" 2>&1; then
+                touch "$job_dir/${issue_number}.ok"
+            else
+                touch "$job_dir/${issue_number}.fail"
+            fi
         ) &
 
         running=$((running + 1))
@@ -7065,6 +7069,8 @@ tui_resolve_flow() {
     local total
     total="$(printf '%s\n' "$issues" | grep -c '.' || echo 0)"
     info "Will resolve $total issue(s) with Claude Code."
+    # Split newline-separated issues into positional args for cmd_resolve.
+    # shellcheck disable=SC2046  # intentional word-split: each issue → one arg
     cmd_resolve $(printf '%s\n' "$issues" | tr '\n' ' ')
 }
 
@@ -7183,6 +7189,7 @@ cmd_resolve_pr_list() {
     for meta_file in "$registry_dir"/*/*.env; do
         [ -f "$meta_file" ] || continue
         (
+            # shellcheck source=/dev/null  # dynamic path: per-instance metadata
             source "$meta_file" 2>/dev/null || exit 0
             [ -n "${CLAUDE_SESSION_ID:-}" ] || exit 0  # Only resolve sessions
 
