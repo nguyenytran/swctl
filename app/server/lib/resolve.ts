@@ -259,6 +259,51 @@ function labelWords(label: string): string[] {
 }
 
 /**
+ * Input for buildCreateArgs — everything startResolveStream needs to
+ * decide in order to spawn `swctl create`.  Extracted as a pure
+ * function so the argv contract is regression-tested in
+ * tests/integration/resolve_create_args.bats without having to run the
+ * full SSE pipeline.
+ */
+export interface CreateArgsInput {
+  issueId: string
+  branchPrefix: 'fix' | 'feat' | 'chore'
+  /** Resolved project name (e.g. "SwagCommercial") or null = platform/trunk. */
+  project: string | null
+  /** 'dev' → no --qa; 'qa' → --qa (swctl default differs — we're explicit). */
+  mode: 'dev' | 'qa'
+}
+
+/**
+ * Assemble the argv for `swctl create`.  The exact shape of this array
+ * is the CONTRACT between the resolve server and the bash CLI — getting
+ * it wrong silently (e.g. re-adding `--no-provision`, forgetting
+ * `--qa`, passing `--project trunk`) produces broken instances that
+ * only show symptoms at runtime.  The tests in
+ * resolve_create_args.bats lock the shape down.
+ *
+ * Rules (each asserted by a dedicated test):
+ *   - `create` is always first (positional verb).
+ *   - `--qa` iff mode === 'qa'.
+ *   - **No `--no-provision`** — regression guard for the v0.5.7→0.5.8 bug
+ *     that shipped broken admin + storefront to resolve-created worktrees.
+ *   - `--project <name>` iff project is truthy AND !== 'trunk'.
+ *   - Positional tail: `<issueId> <branchPrefix>/<issueId>`.
+ */
+export function buildCreateArgs(input: CreateArgsInput): string[] {
+  const args: string[] = ['create']
+  if (input.mode === 'qa') args.push('--qa')
+  // No --no-provision.  See the long-form comment in startResolveStream
+  // for why; if you're about to re-add this, please read it first.
+  if (input.project && input.project !== 'trunk') {
+    args.push('--project', input.project)
+  }
+  const branchName = `${input.branchPrefix}/${input.issueId}`
+  args.push(input.issueId, branchName)
+  return args
+}
+
+/**
  * Pick a conventional-commit branch prefix (fix / feat / chore) from an
  * issue's labels. Defaults to "fix" because Shopware issues skew toward
  * bug reports.
@@ -367,7 +412,7 @@ export function backendBinary(backend: ResolveBackend): string {
  * Read RESOLVE_BACKEND from the instance env file.  Missing/empty → claude
  * (back-compat with pre-0.5.7 instances that only have CLAUDE_SESSION_ID).
  */
-function readInstanceBackend(issueId: string): ResolveBackend {
+export function readInstanceBackend(issueId: string): ResolveBackend {
   const f = findInstanceEnvFile(issueId)
   if (!f) return 'claude'
   try {
@@ -645,42 +690,20 @@ export function startResolveStream(
       }
       await sendEvent('log', { line: `[branch] prefix → ${prefix}/`, ts: Date.now() })
 
-      const branchName = `${prefix}/${issueId}`
-      const createArgs: string[] = ['create']
-      // qa mode is the default for resolve (read-only skim); user can override with "dev"
-      if (mode !== 'dev') createArgs.push('--qa')
-      //
-      // --no-provision REMOVED (v0.5.8).
-      //
-      // The original intent was to defer the heavy provisioning phase
-      // (DB clone, container start, sync_build_artifacts, assets:install,
-      // theme:compile) until Claude's Step 5 called `swctl_setup`.  That
-      // saved ~5 min on resolve starts where Claude never actually
-      // reached Step 5 (e.g. verification-only runs).
-      //
-      // But it also left every resolve-created instance in a broken
-      // in-between state for users who clicked into the UI before Step 5:
-      //   - cloned DB references theme hashes that don't exist on disk
-      //     (storefront serves 410s for /theme/<hash>/* → broken styles)
-      //   - no public/bundles/administration → admin loads but has no
-      //     bundle to mount → "admin not opening"
-      //   - shared node_modules volume is mounted READ-ONLY because
-      //     resolve_admin_nm_volume() picks the shared base when the
-      //     branch has no admin diff, so a recovery `theme:compile` inside
-      //     the container fails with EROFS on node_modules/.vite-temp/
-      //
-      // Running `swctl create` without --no-provision takes the same
-      // path batch-create uses — which the user reports works reliably.
-      // The cost is ~3-5 min more wall-clock on the first resolve of an
-      // issue; that's worth eating for a usable instance every time.
-      // Pass --project for plugin-external / non-default projects.  swctl
-      // already knows the plugin name from the registered project metadata,
-      // so we only pass --project.  (Passing --plugin too is rejected by
-      // swctl as "--plugin can only be used with a platform project".)
-      if (effectiveProject && effectiveProject !== 'trunk') {
-        createArgs.push('--project', effectiveProject)
-      }
-      createArgs.push(issueId, branchName)
+      // Build the `swctl create` argv through the pure helper — single
+      // source of truth for the contract (regression-tested in
+      // tests/integration/resolve_create_args.bats).  History: the prior
+      // inline assembly used to emit `--no-provision`, which shipped
+      // broken admin + storefront to every resolve-created worktree
+      // (see the commit that introduced buildCreateArgs for the full
+      // postmortem).  Don't re-add any flags here — add them to the
+      // helper (and add a test).
+      const createArgs = buildCreateArgs({
+        issueId,
+        branchPrefix: prefix,
+        project: effectiveProject ?? null,
+        mode: mode === 'dev' ? 'dev' : 'qa',
+      })
       await sendEvent('log', { line: `[swctl] swctl ${createArgs.join(' ')}`, ts: Date.now() })
 
       // Serialise the actual spawn through the CreateQueue — see class
