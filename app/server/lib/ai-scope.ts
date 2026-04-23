@@ -169,9 +169,39 @@ function buildArgs(backend: ResolveBackend, prompt: string): string[] {
 function runOnce(bin: string, args: string[], timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let settled = false
-    const child = spawn(bin, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
+    const settleReject = (err: NodeJS.ErrnoException): void => {
+      if (settled) return
+      settled = true
+      reject(err)
+    }
+    const settleResolve = (s: string): void => {
+      if (settled) return
+      settled = true
+      resolve(s)
+    }
+
+    // spawn() itself can throw synchronously on some platforms when the
+    // bin path contains null bytes or similarly malformed input.  Wrap
+    // so those turn into rejects, not uncaught exceptions inside the
+    // Promise executor.
+    let child: import('child_process').ChildProcess
+    try {
+      child = spawn(bin, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+      })
+    } catch (err) {
+      settleReject(err as NodeJS.ErrnoException)
+      return
+    }
+
+    // Attach error listener FIRST — before any other listeners or timers
+    // — so an async 'error' event (Linux node emits ENOENT this way
+    // when the binary path doesn't exist) can't slip through as an
+    // "unhandled 'error' event" and terminate the process.
+    child.once('error', (err: NodeJS.ErrnoException) => {
+      clearTimeout(timer)
+      settleReject(err)
     })
 
     const chunks: Buffer[] = []
@@ -195,32 +225,21 @@ function runOnce(bin: string, args: string[], timeoutMs: number): Promise<string
     child.stderr?.on('data', () => {})
 
     const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
       try { child.kill('SIGKILL') } catch {}
       const err: NodeJS.ErrnoException = new Error(`ai-scope: timeout after ${timeoutMs}ms`)
       err.code = 'ETIMEDOUT'
-      reject(err)
+      settleReject(err)
     }, timeoutMs)
 
-    child.on('error', (err: NodeJS.ErrnoException) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      reject(err)
-    })
-
-    child.on('close', (code) => {
-      if (settled) return
-      settled = true
+    child.once('close', (code) => {
       clearTimeout(timer)
       if (code !== 0 && !truncated) {
         const err: NodeJS.ErrnoException = new Error(`ai-scope: exit ${code}`)
         err.code = `EXIT_${code}`
-        reject(err)
+        settleReject(err)
         return
       }
-      resolve(Buffer.concat(chunks).toString('utf-8'))
+      settleResolve(Buffer.concat(chunks).toString('utf-8'))
     })
   })
 }

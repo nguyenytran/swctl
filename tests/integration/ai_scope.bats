@@ -145,6 +145,15 @@ SH
     }'
     SWCTL_CLAUDE_BIN=/nonexistent/definitely-not-a-binary \
         run bash -c "cd '$_repo' && printf '%s' '$input' | '$_tsx' '$_probe'"
+    # Dump the actual output when the assertions fail so CI logs show us
+    # what the probe returned (this test flaked on Linux and macOS +
+    # Linux node have different ENOENT-on-spawn timing).
+    if [ "$status" -ne 0 ] \
+       || [[ "$output" != *'"method":"fallback"'* ]] \
+       || [[ "$output" != *'"project":"SwagCommercial"'* ]]; then
+        echo "status: $status" >&2
+        echo "output: $output" >&2
+    fi
     [ "$status" -eq 0 ]
     [[ "$output" == *'"method":"fallback"'* ]]
     # Heuristic should still populate plugin — extension/swag-commercial → SwagCommercial.
