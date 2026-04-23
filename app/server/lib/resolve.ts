@@ -649,10 +649,30 @@ export function startResolveStream(
       const createArgs: string[] = ['create']
       // qa mode is the default for resolve (read-only skim); user can override with "dev"
       if (mode !== 'dev') createArgs.push('--qa')
-      // --no-provision defers the heavy work (Docker container, DB clone,
-      // Shopware install) until Claude's Step 5 calls `swctl_setup`.  The
-      // lightweight git worktree is ready for code edits in ~5s.
-      createArgs.push('--no-provision')
+      //
+      // --no-provision REMOVED (v0.5.8).
+      //
+      // The original intent was to defer the heavy provisioning phase
+      // (DB clone, container start, sync_build_artifacts, assets:install,
+      // theme:compile) until Claude's Step 5 called `swctl_setup`.  That
+      // saved ~5 min on resolve starts where Claude never actually
+      // reached Step 5 (e.g. verification-only runs).
+      //
+      // But it also left every resolve-created instance in a broken
+      // in-between state for users who clicked into the UI before Step 5:
+      //   - cloned DB references theme hashes that don't exist on disk
+      //     (storefront serves 410s for /theme/<hash>/* → broken styles)
+      //   - no public/bundles/administration → admin loads but has no
+      //     bundle to mount → "admin not opening"
+      //   - shared node_modules volume is mounted READ-ONLY because
+      //     resolve_admin_nm_volume() picks the shared base when the
+      //     branch has no admin diff, so a recovery `theme:compile` inside
+      //     the container fails with EROFS on node_modules/.vite-temp/
+      //
+      // Running `swctl create` without --no-provision takes the same
+      // path batch-create uses — which the user reports works reliably.
+      // The cost is ~3-5 min more wall-clock on the first resolve of an
+      // issue; that's worth eating for a usable instance every time.
       // Pass --project for plugin-external / non-default projects.  swctl
       // already knows the plugin name from the registered project metadata,
       // so we only pass --project.  (Passing --plugin too is rejected by

@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.5.7"
+SWCTL_VERSION="0.5.8"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
