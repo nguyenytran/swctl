@@ -17,6 +17,12 @@ jobs:
       - name: ShellCheck
         run: shellcheck swctl
 
+      - name: Validate workflow hooks
+        run: |
+          for hook in workflows/shopware6/hooks/*.sh; do
+            bash -n "$hook"
+          done
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -27,5 +33,43 @@ jobs:
           git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats
           sudo /tmp/bats/install.sh /usr/local
 
-      - name: Run tests
+      - name: Run unit tests
         run: bats tests/*.bats
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install BATS
+        run: |
+          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats
+          sudo /tmp/bats/install.sh /usr/local
+
+      # ubuntu-latest runners ship Docker — verify it's actually up before
+      # running the suite so a flaky daemon produces a clear failure
+      # instead of the tests silently `skip`'ing.
+      - name: Verify docker is available
+        run: |
+          docker version
+          docker info >/dev/null
+
+      - name: Pre-pull alpine image
+        # Every integration test spawns throwaway alpine containers; pulling
+        # once up-front keeps per-test timing stable and surfaces network
+        # issues early.
+        run: docker pull alpine:latest
+
+      - name: Run integration tests
+        run: bats tests/integration/*.bats
+
+      - name: Cleanup leftover test resources
+        if: always()
+        # Defensive — every test has a teardown, but if bats crashes mid-test
+        # the leftovers would accumulate across runs on self-hosted runners.
+        # No-op on GitHub-hosted runners (ephemeral VMs).
+        run: |
+          LEFT=$(docker ps -aq --filter 'name=swctl-it-' 2>/dev/null | tr '\n' ' ')
+          [ -n "$LEFT" ] && docker rm -f $LEFT || true
+          docker network ls --format '{{.Name}}' | grep '^swctl-it-' | xargs -r -I{} docker network rm {} || true
+          docker volume ls --format '{{.Name}}' | grep '^swctl-it-' | xargs -r -I{} docker volume rm {} || true
