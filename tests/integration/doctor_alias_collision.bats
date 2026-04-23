@@ -54,6 +54,20 @@ teardown() {
         --network "$_it_net" alpine sh -c 'tail -f /dev/null' >/dev/null
 
     SWCTL_REGISTRY_DIR="$_it_registry" run cmd_doctor
+
+    # Diagnostics if the test fails (bats only prints $output on failure;
+    # emit the network + container-alias state so CI logs have full context)
+    if [ "$status" -eq 0 ] || [[ "$output" != *"alias 'database' is claimed by multiple"* ]]; then
+        echo "--- docker network inspect $_it_net ---" >&2
+        docker network inspect "$_it_net" --format '{{range .Containers}}{{.Name}} {{end}}' >&2 || true
+        for c in "$_it_app" "$_it_db1" "$_it_db2"; do
+            echo "--- aliases for $c on $_it_net ---" >&2
+            docker inspect "$c" --format '{{with (index .NetworkSettings.Networks "'"$_it_net"'")}}{{range .Aliases}}{{.}} {{end}}{{end}}' >&2 || true
+        done
+        echo "--- cmd_doctor output ---" >&2
+        printf '%s\n' "$output" >&2
+    fi
+
     # cmd_doctor returns non-zero whenever any step emitted a warning
     [ "$status" -ne 0 ]
     [[ "$output" == *"alias 'database' is claimed by multiple containers"* ]]
