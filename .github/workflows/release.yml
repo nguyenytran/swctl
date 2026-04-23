@@ -78,10 +78,12 @@ jobs:
 
       - name: Sanity-check version alignment
         # swctl, Makefile, and the tag must all agree.  Prevents a tag
-        # from shipping a tarball with a stale SWCTL_VERSION.
+        # from shipping a tarball with a stale SWCTL_VERSION.  Extraction
+        # uses grep + whitespace-split awk to avoid portability issues
+        # with `?` in awk field separators (BSD awk errors, GNU awk tolerates).
         run: |
           script_v=$(awk -F'"' '/^SWCTL_VERSION=/ {print $2; exit}' swctl)
-          make_v=$(awk -F'?= ' '/^VERSION \?=/ {print $2; exit}' Makefile)
+          make_v=$(grep -E '^VERSION[[:space:]]*\?=' Makefile | awk '{print $NF; exit}')
           echo "tag=${{ steps.version.outputs.version }}  script=$script_v  make=$make_v"
           if [ "$script_v" != "${{ steps.version.outputs.version }}" ] \
              || [ "$make_v" != "${{ steps.version.outputs.version }}" ]; then
