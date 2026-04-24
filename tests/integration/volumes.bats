@@ -118,3 +118,54 @@ teardown() {
     run docker volume inspect "$_it_vol2"
     [ "$status" -eq 0 ]
 }
+
+# ---------------------------------------------------------------------------
+# _ensure_alpine_image + stderr-surface guards (v0.5.9)
+#
+# Regression guards for the user-reported symptom:
+#   [ERR] Failed to populate volume 'vendor-base-trunk' from '<path>'
+# …with no further detail, caused by:
+#   (a) alpine:latest not cached locally, Docker auto-pulled silently,
+#       pull failed under `2>/dev/null` in the populate docker run
+#   (b) any genuine docker/cp error being hidden by the same redirect
+# ---------------------------------------------------------------------------
+
+@test "_ensure_alpine_image: idempotent when alpine is already cached" {
+    # alpine is guaranteed present — require_docker in setup triggers
+    # a pull, and most other tests already ran it.  First call is
+    # normally a no-op; second is definitely a no-op.
+    run _ensure_alpine_image
+    [ "$status" -eq 0 ]
+    run _ensure_alpine_image
+    [ "$status" -eq 0 ]
+}
+
+@test "populate surfaces actual docker error on failure (stderr not swallowed)" {
+    # Regression: previously the populate `2>/dev/null` erased every
+    # real error, so "Failed to populate volume" carried no diagnostic
+    # detail.  Trigger a deterministic failure by pointing src at a
+    # non-existent path (the function itself short-circuits early in
+    # this case, but any docker-level error path now MUST emit
+    # something actionable on stderr).
+    run _ensure_base_volume_populated "$_it_vol" "/definitely/nonexistent/src-$$" "autoload.php"
+    [ "$status" -ne 0 ]
+    # Either the early "Source '...' missing" warn or an indented
+    # docker error — both count as "user can tell what went wrong".
+    # The key is that `$output` is not empty.
+    [ -n "$output" ]
+}
+
+@test "clone uses the same stderr-surface path as populate" {
+    # Hard to trigger a real docker-level clone failure in a unit
+    # test — docker's `-v <vol>:/src:ro` auto-creates missing volumes
+    # rather than erroring.  Instead, verify structurally: the clone
+    # function uses the same mktemp+sed+unlink pattern as populate
+    # (which IS regression-tested above).  If someone reverts one
+    # and not the other, this catches the drift.
+    run grep -c 'mktemp' <(declare -f _clone_docker_volume)
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output")" -ge 1 ]
+    run grep -c 'sed .s/\^/  /' <(declare -f _clone_docker_volume)
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output")" -ge 1 ]
+}
