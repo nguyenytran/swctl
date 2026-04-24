@@ -10,6 +10,21 @@ load test_helper
 # (backend × mode × flag list) is the stable contract every caller
 # depends on.  These tests lock it down.
 
+setup() {
+    # Hermetic: point the config reader at an empty tmp file so a
+    # dev's ~/.swctl/config.json (may have `ai.defaultBackend = codex`
+    # from manual experiments) doesn't leak into tests that assert the
+    # built-in "claude" default.
+    _cfg_dir="$(mktemp -d)"
+    export SWCTL_CONFIG_FILE="$_cfg_dir/config.json"
+    unset SWCTL_CLAUDE_BIN SWCTL_CODEX_BIN CLAUDE_CONFIG_DIR CODEX_CONFIG_DIR
+    unset SWCTL_RESOLVE_BACKEND
+}
+
+teardown() {
+    rm -rf "${_cfg_dir:-}"
+}
+
 # ---------------------------------------------------------------------------
 # _ai_backend_binary
 # ---------------------------------------------------------------------------

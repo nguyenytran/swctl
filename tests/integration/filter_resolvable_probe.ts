@@ -27,13 +27,19 @@ async function main(): Promise<void> {
   }
 
   try {
-    const result = filterResolvableIssues(items)
-    // Include only the kept issues' numbers (ordered) to make bats
-    // assertions terse — full GitHubItem shape isn't needed for these
-    // checks and would make jq queries noisy.
+    // `opts` is read from SWCTL_FILTER_OPTS so the bats tests can
+    // override onlyBug without changing the stdin shape.
+    let opts: Parameters<typeof filterResolvableIssues>[1] = {}
+    const rawOpts = process.env.SWCTL_FILTER_OPTS
+    if (rawOpts) {
+      try { opts = JSON.parse(rawOpts) } catch {}
+    }
+    const result = filterResolvableIssues(items, opts)
     process.stdout.write(JSON.stringify({
       keptNumbers: result.kept.map((i) => i.number),
       hidden: result.hidden,
+      hiddenByLinkedPr: result.hiddenByLinkedPr,
+      hiddenByType: result.hiddenByType,
     }) + '\n')
   } catch (e) {
     process.stdout.write(JSON.stringify({ probeError: `filterResolvableIssues threw: ${String(e)}` }) + '\n')

@@ -1173,33 +1173,49 @@ function renderResolvePage(el, ctx) {
       const data = await res.json()
       const nonPrs = (data.items || []).filter(i => !i.isPR)
 
-      // Hide issues already linked to an ACTIVE pull request — resolving
-      // them again would duplicate in-flight or already-shipped work.
-      // Mirrors the policy in app/src/utils/filterResolvable.ts and
-      // tests/integration/filter_resolvable.bats (keep the two in sync).
+      // Two-stage filter, policy mirrored from
+      // app/src/utils/filterResolvable.ts + tests in
+      // tests/integration/filter_resolvable.bats — keep all three in sync.
       //
-      // Active states: open, draft, merged, or anything non-'closed'
-      // (unknown future states treated as active = hide, safe default).
-      // Issues whose linked PRs are ALL closed stay visible — closed =
-      // abandoned attempt, the issue is still fair game.
+      // Stage 1 — onlyBug (default on): Resolve is scoped to fixing
+      //   bugs.  Improvements, Stories, Tasks, or issues with no type
+      //   are hidden here.  Case-insensitive match on issueType.  The
+      //   manual-entry input below is the escape hatch for non-Bug
+      //   issues.
       //
-      // The manual-entry row below ('#sr-manual-row') lets the user
-      // override the filter by pasting any URL / #number.
+      // Stage 2 — no-active-linked-PR: hides issues whose linked PRs
+      //   include an open/draft/merged PR (resolving them would
+      //   duplicate in-flight or already-shipped work).  All-closed or
+      //   no linkedPRs = fair game.
+      //
+      // Unknown future states are treated as active (safe default:
+      // hide and force the user to override via manual entry rather
+      // than risk duplicating work).
+      const isBug = (it) => String(it.issueType || '').toLowerCase() === 'bug'
       const hasActivePr = (it) => {
         const prs = Array.isArray(it.linkedPRs) ? it.linkedPRs : []
         return prs.some(pr => pr && pr.state !== 'closed')
       }
-      const issues = nonPrs.filter(it => !hasActivePr(it))
-      const hiddenCount = nonPrs.length - issues.length
+      let hiddenByType = 0
+      let hiddenByPr = 0
+      const issues = nonPrs.filter((it) => {
+        if (!isBug(it)) { hiddenByType++; return false }
+        if (hasActivePr(it)) { hiddenByPr++; return false }
+        return true
+      })
+      const hiddenCount = hiddenByType + hiddenByPr
 
       if (issues.length === 0) {
+        const reasons = []
+        if (hiddenByType > 0) reasons.push(`${hiddenByType} non-Bug`)
+        if (hiddenByPr > 0)   reasons.push(`${hiddenByPr} already linked to a PR`)
         const hint = hiddenCount > 0
           ? `<div style="padding:12px;color:#6b7280;font-size:12px;">
-               No resolvable issues.
+               No resolvable Bug issues.
                <span style="display:block;margin-top:4px;color:#9ca3af;font-size:11px;">
-                 (${hiddenCount} hidden — already linked to a PR.
+                 (${reasons.join(', ')} hidden.
                  Paste the URL in the manual-entry input above to
-                 resolve one anyway.)
+                 resolve any issue anyway.)
                </span>
              </div>`
           : '<div style="padding:12px;color:#6b7280;font-size:12px;">No issues found.</div>'
@@ -1210,31 +1226,55 @@ function renderResolvePage(el, ctx) {
       }
 
       pickerEl.style.display = ''
-      const hiddenFooter = hiddenCount > 0
-        ? `<div style="padding:8px 12px;color:#6b7280;font-size:11px;font-style:italic;border-top:1px solid #1f2937;">
-             ${hiddenCount} hidden (already linked to a PR).
-             Paste the URL in the manual-entry input to override.
+      let hiddenFooter = ''
+      if (hiddenCount > 0) {
+        const parts = []
+        if (hiddenByType > 0) parts.push(`${hiddenByType} non-Bug`)
+        if (hiddenByPr   > 0) parts.push(`${hiddenByPr} linked to a PR`)
+        hiddenFooter = `<div style="padding:8px 12px;color:#6b7280;font-size:11px;font-style:italic;border-top:1px solid #1f2937;">
+             ${parts.join(' · ')} hidden.
+             Paste the URL in the manual-entry input to resolve any issue anyway.
            </div>`
-        : ''
-      pickerEl.innerHTML = issues.map(i => `
-        <div class="sr-issue-row" data-number="${i.number}" data-url="${escape(i.url || '')}">
+      }
+      // Render issue rows.  The #<number> is an <a> that opens the
+      // issue on GitHub in a new tab (middle-click / cmd-click behaves
+      // like any other link; normal click opens in a new tab and does
+      // NOT toggle the row's checkbox — user request).  Row body still
+      // acts as the checkbox-toggle target so the usual "click the
+      // title to select" ergonomic stays.
+      pickerEl.innerHTML = issues.map(i => {
+        const issueUrl = i.url || (i.repo && i.number
+          ? `https://github.com/${i.repo}/issues/${i.number}`
+          : `https://github.com/shopware/shopware/issues/${i.number}`)
+        return `
+        <div class="sr-issue-row" data-number="${i.number}" data-url="${escape(issueUrl)}">
           <input type="checkbox" />
-          <span class="sr-issue-num">#${i.number}</span>
+          <a class="sr-issue-num" href="${escape(issueUrl)}" target="_blank" rel="noopener noreferrer"
+             title="Open #${i.number} on GitHub"
+             style="color:#60a5fa;text-decoration:none;">#${i.number}</a>
           <span class="sr-issue-title">${escape(i.title)}</span>
           <span class="sr-issue-labels">${(i.labels || []).slice(0, 3).map(l =>
             `<span class="sr-issue-label" style="border-left:2px solid #${l.color || '666'}">${escape(l.name)}</span>`
           ).join('')}</span>
         </div>
-      `).join('') + hiddenFooter
+      `
+      }).join('') + hiddenFooter
 
       // Wire checkboxes
       pickerEl.querySelectorAll('.sr-issue-row').forEach(row => {
         const cb = row.querySelector('input[type=checkbox]')
         const num = row.dataset.number
         const url = row.dataset.url
+        const numLink = row.querySelector('.sr-issue-num')
 
         row.addEventListener('click', (e) => {
-          if (e.target === cb) return // let checkbox handle itself
+          if (e.target === cb) return          // let checkbox handle itself
+          // Clicking the #<number> link opens GitHub — don't also
+          // toggle the row's checkbox.  Without this guard the row's
+          // click handler would flip the selection state, which is
+          // confusing (the user meant "go look at the issue", not
+          // "queue it for resolve").
+          if (numLink && (e.target === numLink || numLink.contains(e.target))) return
           cb.checked = !cb.checked
           cb.dispatchEvent(new Event('change'))
         })

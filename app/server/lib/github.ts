@@ -414,11 +414,19 @@ export async function fetchGitHubIssues(
     })
 
     // Hide assigned issues that are already being handled by swctl:
-    //   (a) have an active resolve session (listResolveRuns, status=running),
-    //   (b) have a completed / failed resolve session,
-    //   (c) have a worktree instance (readAllInstances).
-    // PRs in 'review-requested' / 'my-pr' categories are review tasks, not
-    // resolution candidates, and pass through unfiltered.
+    //   (a) have a live worktree instance (readAllInstances) — the user
+    //       already has a dedicated worktree for it, offering it again
+    //       would create a second one.
+    //   (b) have a resolve run that COMPLETED SUCCESSFULLY
+    //       (status: 'done') — no point re-resolving work we already
+    //       shipped.  Running / failed / crashed runs do NOT qualify:
+    //       a running run without a live instance is almost always
+    //       stale (browser closed mid-stream, process crashed, etc.)
+    //       and the user reasonably expects the issue back in the
+    //       list; a failed run means they want to try again.
+    //
+    // PRs in 'review-requested' / 'my-pr' categories are review tasks,
+    // not resolution candidates, and pass through unfiltered.
     const handled = new Set<number>()
     try {
       for (const inst of readAllInstances()) {
@@ -430,6 +438,13 @@ export async function fetchGitHubIssues(
     }
     try {
       for (const run of listResolveRuns()) {
+        // Only SUCCESSFUL completed runs suppress the issue.  Previous
+        // behaviour added every run unconditionally, which meant an
+        // abandoned (still "running" on disk because nothing updated
+        // the status when the browser tab closed) entry silently
+        // hid the issue from the picker FOREVER — user-reported bug
+        // for #6689 and similar.
+        if (run.status !== 'done') continue
         const m = run.issue.match(/(?:\/issues\/|#)(\d+)$/) || run.issue.match(/^(\d+)$/)
         if (m) handled.add(parseInt(m[1], 10))
       }
