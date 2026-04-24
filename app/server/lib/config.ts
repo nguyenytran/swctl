@@ -69,30 +69,65 @@ function defaultConfig(): UserConfig {
 }
 
 /**
+ * Shallow-copy an object with every `undefined` value dropped.
+ *
+ * This is the crux of writeUserConfig's merge correctness: a spread
+ * `{...current, ...next}` where `next.someKey === undefined` DOES
+ * overwrite `current.someKey` with undefined.  Then `JSON.stringify`
+ * drops the key on write, and the next read treats the field as unset.
+ *
+ * That pattern caused a user-reported regression where saving
+ * "switch default backend to Codex" in the /config UI silently turned
+ * `features.resolveEnabled: true` → missing (because the sanitizer
+ * in the PUT handler produced `features: { resolveEnabled: undefined }`
+ * when the UI payload had no features key).  Stripping undefineds
+ * BEFORE the merge means "unspecified" correctly means "keep current."
+ */
+function stripUndefined<T extends object>(o: T | undefined | null): Partial<T> {
+  if (!o) return {}
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
+    if (v !== undefined) out[k] = v
+  }
+  return out as Partial<T>
+}
+
+/**
  * Atomically write the config file.  Validates that the input is an
  * object and that known fields have the expected types — malformed
  * payloads from a buggy UI shouldn't corrupt the file.
+ *
+ * Merge semantics: the caller sends a Partial<UserConfig>.  Every
+ * key that's PRESENT in the partial wins; every key that's ABSENT
+ * (including those set to `undefined`) preserves the on-disk value.
+ * This lets the UI save just `ai.defaultBackend` without clobbering
+ * `features.resolveEnabled` or `ai.claude.bin`.
  */
 export function writeUserConfig(next: Partial<UserConfig> | null | undefined): UserConfig {
   const current = readUserConfig()
-  // Belt-and-braces: handle any of {null, undefined, partial} input shapes
-  // so a malformed PUT body can't crash the handler — clients get a clean
-  // "nothing changed" response instead of a 500.
   const safeNext: Partial<UserConfig> = next || {}
   const curFeatures = current.features || {}
   const curAi = current.ai || {}
-  const nextFeatures = safeNext.features || {}
-  const nextAi = safeNext.ai || {}
+  const nextFeatures = stripUndefined(safeNext.features)
+  const nextAi = stripUndefined(safeNext.ai)
+  const curAiClaude = curAi.claude || {}
+  const curAiCodex  = curAi.codex  || {}
+  // stripUndefined on the nested objects so a sanitizer that emits
+  // `claude: { bin: undefined, configDir: undefined }` doesn't wipe
+  // the existing values.
+  const nextAiClaude = stripUndefined((safeNext.ai || {}).claude)
+  const nextAiCodex  = stripUndefined((safeNext.ai || {}).codex)
 
-  // Merge two levels deep for `ai` so e.g. saving just `ai.claude.bin`
-  // doesn't clobber `ai.codex.*`.
+  // Merge two levels deep for `ai` so e.g. saving just `ai.defaultBackend`
+  // doesn't clobber `ai.claude.*` or `ai.codex.*`.  `stripUndefined`
+  // at every level keeps "absent key" distinct from "set to undefined."
   const merged: UserConfig = {
     features: { ...curFeatures, ...nextFeatures },
     ai: {
       ...curAi,
       ...nextAi,
-      claude: { ...(curAi.claude || {}), ...(nextAi.claude || {}) },
-      codex:  { ...(curAi.codex  || {}), ...(nextAi.codex  || {}) },
+      claude: { ...curAiClaude, ...nextAiClaude },
+      codex:  { ...curAiCodex,  ...nextAiCodex  },
     },
   }
 
