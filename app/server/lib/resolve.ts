@@ -304,6 +304,98 @@ export function buildCreateArgs(input: CreateArgsInput): string[] {
 }
 
 /**
+ * Input to buildSpawnArgs — everything needed to assemble a backend's
+ * CLI invocation for a "new resolve" run.  Resume/ask use different
+ * shapes and are handled elsewhere.
+ */
+export interface SpawnArgsInput {
+  /** Which backend to invoke. */
+  backend: 'claude' | 'codex'
+  /** The prompt text (Claude: `/shopware-resolve <url>`; Codex: natural-language task description). */
+  prompt: string
+  /** RFC4122 UUID, preassigned so Claude's `--resume` works later.  Ignored by Codex (its session ids are assigned server-side). */
+  sessionId: string
+  /** Absolute path to the worktree the agent should operate in. */
+  worktreePath: string
+  /** Space-joined list of allowed tools for Claude's `--allowedTools`.  Codex has no per-call equivalent (uses `--sandbox` + config.toml). */
+  allowedTools: string
+}
+
+/** Result of buildSpawnArgs — feed directly into `spawn(bin, args, ...)`. */
+export interface SpawnArgsResult {
+  bin: string
+  args: string[]
+}
+
+/**
+ * Assemble the (bin, argv) pair for a fresh resolve spawn.  Extracted as
+ * a pure function so the CORRECT-BINARY contract is regression-guarded
+ * by tests — prior to this, the spawn site hard-coded
+ * `backendBinary('claude')` regardless of the user's selection, so
+ * picking Codex in the UI silently still ran Claude.
+ *
+ * Claude flags (stable, well-documented):
+ *   -p <prompt>
+ *   --output-format stream-json   → one JSON event per line on stdout
+ *   --verbose
+ *   --permission-mode acceptEdits
+ *   --allowedTools <space-joined>
+ *   --session-id <uuid>           → enables later `--resume <uuid>`
+ *   --effort max
+ *   --add-dir <worktree>
+ *
+ * Codex flags (from `codex exec --help`, Codex CLI 0.x):
+ *   --json                        → JSONL output to stdout (closest to Claude's stream-json)
+ *   --full-auto                   → sandbox=workspace-write, skip approvals (what we want for
+ *                                   agent automation; mirrors Claude's `acceptEdits`)
+ *   --cd <worktree>               → working directory (Claude uses --add-dir instead)
+ *   --skip-git-repo-check         → don't refuse to run in a non-git-root worktree (the swctl
+ *                                   sw-<N> directories are worktrees off of trunk; Codex's own
+ *                                   check wrongly refuses in some setups)
+ *   <prompt>                      → positional
+ *
+ * Session semantics differ:
+ *   - Claude accepts a pre-assigned UUID via `--session-id`, which means we
+ *     can `claude --resume <uuid>` later from another endpoint.
+ *   - Codex assigns session ids itself and persists them under
+ *     `~/.codex/sessions/`.  `codex exec resume --last` or
+ *     `codex exec resume <id>` is the resume pathway — incompatible with
+ *     the pre-assigned model.  We ignore `input.sessionId` on the Codex
+ *     path; resume support for Codex is a separate follow-up (requires
+ *     capturing Codex's session id from its first-line output + plumbing
+ *     it into metadata).
+ */
+export function buildSpawnArgs(input: SpawnArgsInput): SpawnArgsResult {
+  if (input.backend === 'codex') {
+    return {
+      bin: backendBinary('codex'),
+      args: [
+        'exec',
+        '--json',
+        '--full-auto',
+        '--skip-git-repo-check',
+        '--cd', input.worktreePath,
+        input.prompt,
+      ],
+    }
+  }
+  // claude (default)
+  return {
+    bin: backendBinary('claude'),
+    args: [
+      '-p', input.prompt,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--permission-mode', 'acceptEdits',
+      '--allowedTools', input.allowedTools,
+      '--session-id', input.sessionId,
+      '--effort', 'max',
+      '--add-dir', input.worktreePath,
+    ],
+  }
+}
+
+/**
  * Pick a conventional-commit branch prefix (fix / feat / chore) from an
  * issue's labels. Defaults to "fix" because Shopware issues skew toward
  * bug reports.
@@ -801,19 +893,35 @@ export function startResolveStream(
     })
 
     const startTime = Date.now()
-    // Codex flag surface differs from Claude's; for MVP we only wire the
-    // claude path end-to-end.  A codex-backed resolve via the UI falls
-    // back to the claude CLI here and logs a warning — users wanting
-    // codex today should use `swctl resolve --backend=codex` from the
-    // CLI.  A follow-up will read `codex --help` and wire up the real
-    // stream-json equivalent.
-    if (backend !== 'claude') {
+    // Resolve the actual (bin, args) pair for the SELECTED backend.  Before
+    // v0.5.10 this block hard-coded `backendBinary('claude')` with a
+    // "falling back to claude" warning log — so picking Codex in the UI
+    // still spawned Claude.  The user hit this: the resolve log showed
+    // `[claude] Starting /shopware-resolve ...` and `session started
+    // model=claude-opus-4-7` even though they'd selected Codex.
+    const spawnPlan = buildSpawnArgs({
+      backend,
+      prompt,
+      sessionId,
+      worktreePath,
+      allowedTools,
+    })
+    await sendEvent('log', {
+      line: `[${backend}] launching: ${spawnPlan.bin} ${spawnPlan.args.slice(0, 4).join(' ')}…`,
+      ts: Date.now(),
+    })
+    if (backend === 'codex') {
+      // Codex's resume is a separate CLI subcommand (`codex exec resume
+      // --last|<id>`) — incompatible with Claude's pre-assigned UUID
+      // model.  The `swctl resolve resume/ask` flows below still
+      // spawn Claude for Codex-backed instances until that plumbing
+      // lands.  First-run works; follow-ups fall back with a warning.
       await sendEvent('log', {
-        line: `[resolve] backend=${backend} is not yet supported from the UI; falling back to claude for this run. Use 'swctl resolve --backend=${backend}' from the CLI for now.`,
+        line: `[codex] note: resume/ask for Codex-backed instances is not yet wired — use the CLI ('swctl resolve ask ${issueId} ...') until then.`,
         ts: Date.now(),
       })
     }
-    const child = spawn(backendBinary('claude'), claudeArgs, {
+    const child = spawn(spawnPlan.bin, spawnPlan.args, {
       cwd: worktreePath,
       env: { ...process.env, HOME: home, TERM: 'dumb' },
       stdio: ['ignore', 'pipe', 'pipe'],
