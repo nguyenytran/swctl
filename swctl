@@ -171,6 +171,12 @@ sanitize_db_identifier() {
 #   $1 = explicit DB name (may be empty)
 #   $2 = prefix (defaults to SW_DB_NAME_PREFIX / "shopware")
 #   $3 = issue id  (defaults to ISSUE_ID)
+#
+# Zero-arg calls are the norm inside cmd_clean (they let the env-var
+# defaults kick in).  The unit tests in tests/cleanup_db_name.bats
+# exercise the arg form.  Shellcheck's SC2119/SC2120 would warn about
+# "unused params" but that's a deliberate API choice here.
+# shellcheck disable=SC2120
 _resolve_cleanup_db_name() {
     local explicit="${1-${DB_NAME:-}}"
     local prefix="${2-${SW_DB_NAME_PREFIX:-shopware}}"
@@ -4868,6 +4874,7 @@ cmd_clean() {
     # tests/cleanup_db_name.bats for the regression guard.
     local source_db target_db
     source_db="$(sanitize_db_identifier "${SW_DB_SHARED_NAME:-shopware}")"
+    # shellcheck disable=SC2119  # zero-arg call is the public API (uses env var defaults)
     target_db="$(_resolve_cleanup_db_name || true)"
     if [ -n "$target_db" ] && [ "$target_db" != "$source_db" ]; then
         if mysql_exec "DROP DATABASE IF EXISTS \`${target_db}\`;" >/dev/null 2>&1; then
