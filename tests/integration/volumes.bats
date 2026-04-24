@@ -118,3 +118,108 @@ teardown() {
     run docker volume inspect "$_it_vol2"
     [ "$status" -eq 0 ]
 }
+
+# ---------------------------------------------------------------------------
+# _ensure_alpine_image + stderr-surface guards (v0.5.9)
+#
+# Regression guards for the user-reported symptom:
+#   [ERR] Failed to populate volume 'vendor-base-trunk' from '<path>'
+# …with no further detail, caused by:
+#   (a) alpine:latest not cached locally, Docker auto-pulled silently,
+#       pull failed under `2>/dev/null` in the populate docker run
+#   (b) any genuine docker/cp error being hidden by the same redirect
+# ---------------------------------------------------------------------------
+
+@test "_ensure_alpine_image: idempotent when alpine is already cached" {
+    # alpine is guaranteed present — require_docker in setup triggers
+    # a pull, and most other tests already ran it.  First call is
+    # normally a no-op; second is definitely a no-op.
+    run _ensure_alpine_image
+    [ "$status" -eq 0 ]
+    run _ensure_alpine_image
+    [ "$status" -eq 0 ]
+}
+
+@test "_ensure_alpine_image: pulls when image missing (user-reported repro)" {
+    # This is the ACTUAL bug the user hit: alpine:latest wasn't cached
+    # on their daemon, the populate's auto-pull under `2>/dev/null`
+    # lost its output, and "Failed to populate volume X from Y" came
+    # back with no clue that the cause was a missing image.
+    #
+    # Force the scenario by removing alpine (best-effort — if another
+    # running container is using it, docker will block the rm; we skip
+    # in that case since there's no way to force-remove safely).
+    if ! docker image rm alpine:latest >/dev/null 2>&1; then
+        skip "alpine:latest is in use by another container — can't force the uncached scenario"
+    fi
+    run _ensure_alpine_image
+    [ "$status" -eq 0 ]
+    # Post-condition: alpine must be cached now.
+    docker image inspect alpine:latest >/dev/null 2>&1
+    # Log must announce the pull (user-visible signal that explains the
+    # delay and differentiates "first create is slow" from "daemon hung").
+    [[ "$output" == *"Pulling alpine"* ]]
+}
+
+@test "populate: early guard (missing src) emits actionable warning" {
+    # Covers the $src pre-check at the top of _ensure_base_volume_populated.
+    # Distinct from the "inside-container failure" test below — this
+    # path never reaches docker run.
+    run _ensure_base_volume_populated "$_it_vol" "/definitely/nonexistent/src-$$" "autoload.php"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Source"*"missing"* ]] || [[ "$output" == *"missing"* ]]
+}
+
+@test "populate: inside-container failure emits docker stderr (regression guard)" {
+    # Shim `docker` so the populate's `docker run` exits with a known
+    # stderr message.  Other docker calls (inspect / create / fast-path
+    # check / image inspect) pass through to the real CLI, so setup
+    # state is correct up to the populate step.
+    #
+    # This is the test that would have caught the v0.5.9 user bug
+    # directly: before the 2>"$run_err" fix, the populate docker run
+    # swallowed this stderr and the user saw only the generic
+    # "Failed to populate volume" message.
+    local magic='SIMULATED_POPULATE_FAILURE_EFB3A1'
+    docker() {
+        # Only intercept the populate's `docker run cp -a`: it's the
+        # only invocation that bind-mounts `:/src:ro`.
+        if [ "$1" = "run" ] && printf '%s\n' "$@" | grep -q ':/src:ro'; then
+            # Emit to stderr so the caller's 2>"$run_err" capture sees
+            # it (swapping the order reveals the bug cleanly).
+            printf '%s\n' "$magic" >&2
+            return 1
+        fi
+        command docker "$@"
+    }
+
+    run _ensure_base_volume_populated "$_it_vol" "$_it_src" "autoload.php"
+    [ "$status" -ne 0 ]
+    # The magic string must appear in $output — that's the whole point
+    # of the stderr-capture fix.
+    [[ "$output" == *"$magic"* ]] || {
+        echo "FAIL: expected docker stderr '$magic' in output, got:" >&2
+        echo "$output" >&2
+        return 1
+    }
+    # The swctl-level "Failed to populate..." error must also appear —
+    # it's what sets up the "here's why" follow-up.
+    [[ "$output" == *"Failed to populate volume"* ]]
+    # Cleanup: remove the function shim so later tests see the real docker.
+    unset -f docker
+}
+
+@test "clone uses the same stderr-surface path as populate" {
+    # Hard to trigger a real docker-level clone failure in a unit
+    # test — docker's `-v <vol>:/src:ro` auto-creates missing volumes
+    # rather than erroring.  Instead, verify structurally: the clone
+    # function uses the same mktemp+sed+unlink pattern as populate
+    # (which IS regression-tested above).  If someone reverts one
+    # and not the other, this catches the drift.
+    run grep -c 'mktemp' <(declare -f _clone_docker_volume)
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output")" -ge 1 ]
+    run grep -c 'sed .s/\^/  /' <(declare -f _clone_docker_volume)
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output")" -ge 1 ]
+}

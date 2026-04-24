@@ -1641,6 +1641,31 @@ resolve_storefront_nm_volume() {
     fi
 }
 
+# Ensure the alpine:latest image is available locally.  Every
+# volume populate / clone spawns a throwaway `alpine` container,
+# and Docker's implicit pull-on-run is silent + eats errors under
+# our 2>/dev/null redirects — a pull failure surfaces as "Failed
+# to populate volume X" with no actionable detail.  Pulling once
+# upfront (idempotent) converts any network-level issue into a
+# clear error BEFORE the populate starts.
+#
+# Idempotent: if the image is already cached, this is a ~50 ms
+# docker daemon round-trip with no network I/O.  Callable anywhere;
+# both _ensure_base_volume_populated and _clone_docker_volume now
+# call it before their docker run.
+_ensure_alpine_image() {
+    if docker image inspect alpine:latest >/dev/null 2>&1; then
+        return 0
+    fi
+    info "Pulling alpine image (one-time, used for volume populate/clone)…"
+    local pull_err
+    pull_err="$(docker pull alpine:latest 2>&1 >/dev/null)" || {
+        err "Failed to pull alpine:latest. Check network / Docker daemon."
+        [ -n "$pull_err" ] && printf '  %s\n' "$pull_err" >&2
+        return 1
+    }
+}
+
 # Populate a docker volume once from a source path on the host.  Idempotent —
 # if the volume already has a sentinel file (which a prior populate leaves),
 # returns immediately.  This is how we avoid rsyncing giant trees (vendor,
@@ -1670,6 +1695,12 @@ _ensure_base_volume_populated() {
 
     [ -d "$src" ] || { warn "Source '$src' missing; volume '$vol' will stay empty."; return 1; }
 
+    # Pull alpine BEFORE the populate run.  A failed implicit pull
+    # inside the populate's `2>/dev/null` used to surface as "Failed
+    # to populate volume X from Y" with no hint that Docker couldn't
+    # reach its registry.
+    _ensure_alpine_image || return 1
+
     info "Populating volume '$vol' from '$src' (one-time, ~1–2 min)…"
     # Use a throwaway container with the source bind-mounted RO and the
     # volume mounted RW.  cp -a preserves symlinks and perms + overwrites
@@ -1689,13 +1720,27 @@ _ensure_base_volume_populated() {
     # the sentinel too — keeping the invariant that every file in the
     # populated volume is owned by uid 1000.  The chown is LAST so any
     # concurrent reader that sees `.ready` finds a fully-chowned tree.
+    #
+    # Capture stderr to a temp file so the "Failed to populate" error
+    # carries the actual docker/cp message instead of leaving the user
+    # guessing.  Previously stderr was redirected to /dev/null and any
+    # real problem (pull failure, bind-mount permission, OOM, corrupt
+    # volume) was invisible.
+    local run_err
+    run_err="$(mktemp)"
     if ! docker run --rm \
         -v "${src}:/src:ro" \
         -v "${vol}:/dst" \
-        alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>/dev/null; then
+        alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>"$run_err" >/dev/null; then
         err "Failed to populate volume '$vol' from '$src'."
+        if [ -s "$run_err" ]; then
+            # Indent so it's obviously the docker output, not swctl's own.
+            sed 's/^/  /' "$run_err" >&2
+        fi
+        rm -f "$run_err"
         return 1
     fi
+    rm -f "$run_err"
     ok "Volume '$vol' populated."
 }
 
@@ -1714,10 +1759,24 @@ _clone_docker_volume() {
     docker volume inspect "$dst" >/dev/null 2>&1 || \
         docker volume create "$dst" >/dev/null
 
-    docker run --rm \
+    # Same alpine + stderr guards as _ensure_base_volume_populated —
+    # a silent pull/clone failure is the hardest flake to diagnose.
+    _ensure_alpine_image || return 1
+
+    local run_err
+    run_err="$(mktemp)"
+    if ! docker run --rm \
         -v "${src}:/src:ro" \
         -v "${dst}:/dst" \
-        alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>/dev/null || return 1
+        alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>"$run_err" >/dev/null; then
+        err "Failed to clone volume '$src' → '$dst'."
+        if [ -s "$run_err" ]; then
+            sed 's/^/  /' "$run_err" >&2
+        fi
+        rm -f "$run_err"
+        return 1
+    fi
+    rm -f "$run_err"
 }
 
 # Plugin build cache — skip `composer build:js:admin` when the same plugin
