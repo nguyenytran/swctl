@@ -150,6 +150,43 @@ sanitize_db_identifier() {
         | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//; s/_{2,}/_/g'
 }
 
+# Resolve the per-instance database name that cmd_clean should drop.
+# Extracted + testable because the inline logic has historically had a
+# subtle orphan-creating bug: when metadata was written with an empty
+# DB_NAME (e.g. pre-v0.5.8 resolve instances that used `swctl create
+# --no-provision` and then provisioned via /api/stream/refresh without
+# re-writing metadata), the drop branch was skipped entirely and the
+# DB survived the clean, accumulating as `shopware_<N>` clutter on the
+# mariadb server.
+#
+# Resolution order (first non-empty wins):
+#   1. explicit (from metadata's DB_NAME= field)
+#   2. fallback: sanitize("${prefix}_${issue}") — the convention used by
+#      provision_database_and_app when it creates the DB (see line ~2607).
+#
+# Returns non-zero when none of those can produce a name — caller must
+# skip the drop in that case (rather than dropping "shopware" by accident).
+#
+# Args:
+#   $1 = explicit DB name (may be empty)
+#   $2 = prefix (defaults to SW_DB_NAME_PREFIX / "shopware")
+#   $3 = issue id  (defaults to ISSUE_ID)
+_resolve_cleanup_db_name() {
+    local explicit="${1-${DB_NAME:-}}"
+    local prefix="${2-${SW_DB_NAME_PREFIX:-shopware}}"
+    local issue="${3-${ISSUE_ID:-}}"
+
+    if [ -n "$explicit" ]; then
+        printf '%s' "$explicit"
+        return 0
+    fi
+    if [ -n "$issue" ] && [ -n "$prefix" ]; then
+        sanitize_db_identifier "${prefix}_${issue}"
+        return 0
+    fi
+    return 1
+}
+
 sanitize_router_id() {
     printf '%s' "$1" \
         | tr '[:upper:]' '[:lower:]' \
@@ -4821,12 +4858,25 @@ cmd_clean() {
         ok "Removed networks for '${COMPOSE_PROJECT}'."
     fi
 
-    # 4. Drop the cloned database (never touches the source)
-    local source_db
+    # 4. Drop the cloned database (never touches the source).
+    #
+    # Uses _resolve_cleanup_db_name so instances with an empty metadata
+    # DB_NAME (pre-v0.5.8 resolve + setup flow) still get their DB
+    # dropped by falling back to the canonical naming convention.
+    # Without this fallback, `swctl clean` silently left `shopware_<N>`
+    # databases behind on the mariadb server.  See
+    # tests/cleanup_db_name.bats for the regression guard.
+    local source_db target_db
     source_db="$(sanitize_db_identifier "${SW_DB_SHARED_NAME:-shopware}")"
-    if [ -n "$DB_NAME" ] && [ "$DB_NAME" != "$source_db" ]; then
-        mysql_exec "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" >/dev/null 2>&1 || warn "Could not drop database '${DB_NAME}'."
-        ok "Dropped database '${DB_NAME}'."
+    target_db="$(_resolve_cleanup_db_name || true)"
+    if [ -n "$target_db" ] && [ "$target_db" != "$source_db" ]; then
+        if mysql_exec "DROP DATABASE IF EXISTS \`${target_db}\`;" >/dev/null 2>&1; then
+            ok "Dropped database '${target_db}'."
+        else
+            warn "Could not drop database '${target_db}' (mariadb unreachable?)."
+        fi
+    elif [ "$target_db" = "$source_db" ]; then
+        warn "Refusing to drop '${target_db}' (matches shared source DB)."
     fi
 
     # 5. Remove the git worktree
