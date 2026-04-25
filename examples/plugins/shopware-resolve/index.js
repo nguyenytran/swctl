@@ -2077,7 +2077,7 @@ async function openTranscriptModal(issueId) {
     style.id = 'sr-tr-styles'
     style.textContent = `
       .sr-tr-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 24px; }
-      .sr-tr-modal { background: #0f172a; border: 1px solid #1f2937; border-radius: 8px; width: min(900px, 100%); max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+      .sr-tr-modal { background: #0f172a; border: 1px solid #1f2937; border-radius: 8px; width: min(1000px, 100%); max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
       .sr-tr-head  { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid #1f2937; }
       .sr-tr-title { font: 600 14px ui-sans-serif, sans-serif; color: #e5e7eb; }
       .sr-tr-close { margin-left: auto; background: transparent; border: none; color: #9ca3af; font-size: 18px; cursor: pointer; padding: 4px 8px; border-radius: 4px; }
@@ -2095,7 +2095,7 @@ async function openTranscriptModal(issueId) {
       .sr-tr-step  { border-bottom: 1px solid #1f2937; }
       .sr-tr-step:last-child { border-bottom: none; }
       .sr-tr-step-head {
-        display: grid; grid-template-columns: 14px 1fr auto auto auto auto;
+        display: grid; grid-template-columns: 14px minmax(0, 1fr) 60px 60px 90px 90px 80px;
         gap: 12px; align-items: center;
         padding: 10px 18px; cursor: pointer; transition: background 0.1s;
         background: transparent; border: none; width: 100%; text-align: left;
@@ -2104,10 +2104,27 @@ async function openTranscriptModal(issueId) {
       .sr-tr-step-head:hover { background: #111827; }
       .sr-tr-step-caret { color: #6b7280; font-size: 11px; }
       .sr-tr-step-name  { color: #e5e7eb; font: 600 13px ui-sans-serif, sans-serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .sr-tr-step-meta  { font: 11px ui-monospace, monospace; color: #6b7280; min-width: 60px; text-align: right; }
-      .sr-tr-step-tok-in  { font: 11px ui-monospace, monospace; color: #60a5fa; min-width: 70px; text-align: right; }
-      .sr-tr-step-tok-out { font: 11px ui-monospace, monospace; color: #34d399; min-width: 70px; text-align: right; }
-      .sr-tr-step-body  { padding: 8px 18px 14px 44px; background: #0a1020; border-top: 1px solid #1f2937; max-height: 360px; overflow: auto; }
+      .sr-tr-step-meta  { font: 11px ui-monospace, monospace; color: #6b7280; text-align: right; }
+      .sr-tr-step-tok-in   { font: 11px ui-monospace, monospace; color: #60a5fa; text-align: right; }
+      .sr-tr-step-tok-out  { font: 11px ui-monospace, monospace; color: #34d399; text-align: right; }
+      .sr-tr-step-tok-total{ font: 600 12px ui-monospace, monospace; color: #fbbf24; text-align: right; }
+      /* Per-step token panel inside the expanded body — most prominent
+         place for "what did this step cost" so it's hard to miss. */
+      .sr-tr-step-tok-panel {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 8px 16px; margin: 0 0 10px 0; padding: 10px 14px;
+        background: #1e2a3d; border: 1px solid #1e293b; border-radius: 6px;
+      }
+      .sr-tr-tok-cell { display: flex; flex-direction: column; gap: 2px; }
+      .sr-tr-tok-cell .lbl { font: 10px ui-sans-serif, sans-serif; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+      .sr-tr-tok-cell .val { font: 600 14px ui-monospace, monospace; }
+      .sr-tr-tok-cell .val.in   { color: #60a5fa; }
+      .sr-tr-tok-cell .val.out  { color: #34d399; }
+      .sr-tr-tok-cell .val.cached { color: #9ca3af; }
+      .sr-tr-tok-cell .val.reason { color: #c084fc; }
+      .sr-tr-tok-cell .val.total  { color: #fbbf24; }
+      .sr-tr-tok-cell .val.dim { color: #6b7280; font-style: italic; font-weight: 400; }
+      .sr-tr-step-body  { padding: 8px 18px 14px 18px; background: #0a1020; border-top: 1px solid #1f2937; max-height: 360px; overflow: auto; }
       .sr-tr-line { font: 11px/1.55 ui-monospace, monospace; color: #cbd5e1; white-space: pre-wrap; word-break: break-word; margin: 0; }
     `
     document.head.appendChild(style)
@@ -2190,6 +2207,10 @@ async function openTranscriptModal(issueId) {
     const stepEl = document.createElement('div')
     stepEl.className = 'sr-tr-step'
     const isOpen = step.step === initialOpen
+    // "Total" tokens for the header summary — sum across input + cached
+    // + output + reasoning so the user gets ONE big number per step
+    // that captures total work, not just the ~uncached subset.
+    const totalTokens = step.tokens.input + step.tokens.cachedInput + step.tokens.output + step.tokens.reasoning
     stepEl.innerHTML = `
       <button class="sr-tr-step-head" type="button">
         <span class="sr-tr-step-caret">${isOpen ? '▾' : '▸'}</span>
@@ -2198,8 +2219,10 @@ async function openTranscriptModal(issueId) {
         <span class="sr-tr-step-meta">${escape(fmtDuration(step.durationMs))}</span>
         <span class="sr-tr-step-tok-in">${escape(fmtTokens(step.tokens.input))} in</span>
         <span class="sr-tr-step-tok-out">${escape(fmtTokens(step.tokens.output))} out</span>
+        <span class="sr-tr-step-tok-total">Σ ${escape(fmtTokens(totalTokens))}</span>
       </button>
       <div class="sr-tr-step-body" style="${isOpen ? '' : 'display:none;'}">
+        ${renderStepTokenPanel(step.tokens)}
         ${step.lines.map((row) => `<pre class="sr-tr-line">${escape(row.line)}</pre>`).join('')}
       </div>
     `
@@ -2213,6 +2236,35 @@ async function openTranscriptModal(issueId) {
     })
     body.appendChild(stepEl)
   }
+}
+
+/**
+ * Render a card with five token cells (input / cached / output /
+ * reasoning / total) shown prominently at the top of a step's
+ * expanded body.  The header columns are a glance-at summary; this
+ * panel is the authoritative per-step breakdown — no scanning the
+ * narrow header columns required.
+ */
+function renderStepTokenPanel(tokens) {
+  const total = tokens.input + tokens.cachedInput + tokens.output + tokens.reasoning
+  const cell = (lbl, value, cls, extra) => `
+    <div class="sr-tr-tok-cell">
+      <span class="lbl">${escape(lbl)}</span>
+      <span class="val ${cls}">${value > 0 ? escape(fmtTokens(value)) : '<span class="dim">—</span>'}${extra ? ` <span class="dim" style="font-size:11px;font-weight:400;">${extra}</span>` : ''}</span>
+    </div>`
+  // Cache-hit ratio — useful diagnostic for "is this step paying for
+  // re-reading context I already paid for".
+  const cacheRatio = (tokens.input + tokens.cachedInput) > 0
+    ? Math.round(100 * tokens.cachedInput / (tokens.input + tokens.cachedInput))
+    : 0
+  return `
+    <div class="sr-tr-step-tok-panel">
+      ${cell('Input',   tokens.input,       'in')}
+      ${cell('Cached',  tokens.cachedInput, 'cached', cacheRatio > 0 ? `(${cacheRatio}% hit)` : '')}
+      ${cell('Output',  tokens.output,      'out')}
+      ${cell('Reasoning', tokens.reasoning, 'reason')}
+      ${cell('Total Σ',  total,             'total')}
+    </div>`
 }
 
 // Expose on window for ad-hoc console invocation:
