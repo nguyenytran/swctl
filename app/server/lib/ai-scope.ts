@@ -57,7 +57,16 @@ export interface AiScopeDecision {
   method: 'heuristic' | 'ai' | 'fallback'
 }
 
-const AI_TIMEOUT_MS = 12_000
+// Per-backend timeouts.  Claude (-p single-shot) usually returns in
+// 3-6s; Codex's first invocation is slower (~15-25s — model warmup,
+// auth/login state checks, sandbox setup) so a single number doesn't
+// fit both.  These match the slowest p99 we've seen in practice with
+// some headroom; tune via env if your model picks a different one.
+const AI_TIMEOUT_CLAUDE_MS = 12_000
+const AI_TIMEOUT_CODEX_MS  = 30_000
+function aiTimeoutFor(backend: ResolveBackend): number {
+  return backend === 'codex' ? AI_TIMEOUT_CODEX_MS : AI_TIMEOUT_CLAUDE_MS
+}
 const MAX_STDOUT_BYTES = 16 * 1024 // AI is asked for a ~200 B JSON object
 const STDOUT_LOG_CAP = 120
 
@@ -91,9 +100,10 @@ export async function detectScopeWithAI(input: AiScopeInput): Promise<AiScopeDec
   const bin = backendBinary(input.backend)
   const prompt = buildPrompt(input)
   const args = buildArgs(input.backend, prompt)
+  const timeoutMs = aiTimeoutFor(input.backend)
 
   try {
-    const stdout = await runOnce(bin, args, AI_TIMEOUT_MS)
+    const stdout = await runOnce(bin, args, timeoutMs)
     const parsed = parseDecision(stdout, input.pluginNames)
     if (!parsed) {
       return fallback(input, heuristicProject, heuristicPrefix, bin,
@@ -104,7 +114,7 @@ export async function detectScopeWithAI(input: AiScopeInput): Promise<AiScopeDec
     const reason = err?.code === 'ENOENT'
       ? `binary not found (${bin})`
       : err?.code === 'ETIMEDOUT'
-        ? `timeout after ${AI_TIMEOUT_MS} ms`
+        ? `timeout after ${timeoutMs} ms`
         : err?.message || String(err)
     return fallback(input, heuristicProject, heuristicPrefix, bin, reason)
   }
