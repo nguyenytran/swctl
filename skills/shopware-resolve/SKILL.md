@@ -234,21 +234,23 @@ See `references/prior-fix-search-guide.md` for advanced git search flags (`-S`, 
 
 **This is the most important part of Step 1.** Code-level analysis is not enough — you must actually observe the bug in a running Shopware instance before proceeding.
 
-**Create a worktree:**
+**Locate the worktree:**
 
-Spin up a worktree using the issue number. Use `--qa` mode for faster provisioning (copies vendor from trunk instead of running composer install). Each worktree needs a unique branch — create a temporary reproduction branch or use the fix branch directly:
-```bash
-swctl create --qa <issue-number> repro/<issue-number>
-```
+Detect whether a worktree already exists for this issue — if so, REUSE IT. The two paths:
 
-**Important:** Only create **2 worktrees at a time**. Creating more simultaneously causes failures. Wait for each batch to complete before starting the next.
+- **Running under `swctl resolve` / the swctl-UI Resolve page (most common):** swctl created the worktree before invoking you. You are already in `/Users/ytran/Shopware/_worktrees/sw-<issue>` (or your CWD is inside it — confirm with `pwd`). DO NOT run `swctl create` — it will fail with "worktree already exists" and waste a turn. Just verify it's there:
+  ```bash
+  swctl status | grep -E "^${issue}\s" || echo "no instance — create one below"
+  ```
+  Confirm the URL is reachable: `curl -sf -o /dev/null http://web.trunk-<issue>.orb.local && echo up`. If the container is "● Stopped", run `swctl restart <issue>`.
 
-Wait for it to be ready:
-```bash
-swctl status
-```
+- **Running standalone (no pre-created worktree):** create one yourself. Use `--qa` mode for faster provisioning:
+  ```bash
+  swctl create --qa <issue-number> fix/<issue-number>-<slug>
+  ```
+  See Step 2 path A for the slug. **Important:** only create **2 worktrees at a time** in batch scenarios — concurrent creates race on git locks.
 
-Result:
+Either way, the result is:
 - Worktree: `/Users/ytran/Shopware/_worktrees/sw-<issue>`
 - URL: `http://web.trunk-<issue>.orb.local`
 - Container with PHP, Caddy, database, Redis, OpenSearch, and demo data
@@ -286,10 +288,13 @@ In these cases, document why live reproduction was skipped and rely on code-leve
 - Decide: `REPRODUCED`, `NOT_REPRODUCED`, or `PARTIALLY_REPRODUCED`.
 - **Prefer live reproduction evidence** over code-level analysis. A `REPRODUCED` verdict backed by live observation (API output, screenshot, DB query) is stronger than one based only on reading code.
 
-**Gate out:**
-- If `REPRODUCED`: present findings and wait for user approval to proceed to Step 2.
-- If `NOT_REPRODUCED`: stop. Return a verification result with likely explanations (`already fixed`, `environment-specific`, `missing repro data`). Collaborate with the user on next steps.
-- If `PARTIALLY_REPRODUCED`: document what works and what does not. Collaborate with user before proceeding.
+**Gate out (per ground rule 3 — interactive vs non-interactive):**
+
+You are running non-interactively if your runtime is `claude -p`, `codex exec`, or any other batch invocation where no human can answer questions. **Detect this from your invocation context — if you cannot ask the user a question and get a real-time answer, you are non-interactive.** When non-interactive, the gates below DO NOT pause the run; they describe what to write into the verification result before emitting `### STEP 1 END` and continuing.
+
+- If `REPRODUCED`: write findings into the Step 1 output template below. Non-interactive: emit `### STEP 1 END` and proceed to Step 2 immediately. Interactive: pause for user confirmation before continuing.
+- If `NOT_REPRODUCED`: write the verification result with a `likely explanation` field (`already fixed`, `environment-specific`, `missing repro data`, `intermittent`). Non-interactive: emit `### STEP 1 END` and jump to Step 8 (write the no-repro summary into the final output) — do not silently stop. Interactive: collaborate with user on next steps.
+- If `PARTIALLY_REPRODUCED`: write what works and what does not. Non-interactive: emit `### STEP 1 END` and proceed to Step 2 with the partial evidence. Interactive: collaborate with user.
 
 **Step 1 output (present to user before gating):**
 
@@ -342,14 +347,20 @@ All must be true before Step 2:
 - local repo/worktree target is known
 - likely duplicates, regressions, or prior fixes were checked
 - reproduction status is explicit
-- Step 1 output template is filled and presented to user
-- user has approved proceeding to Step 2
+- Step 1 output template is filled
+- `### STEP 1 END` emitted on its own line as the LAST thing in this step
+
+The user-approval gate that earlier versions of this skill required is
+LIFTED for non-interactive runs.  Per ground rule 3, do not wait — emit
+the marker, fill the template, and continue.  The marker is mandatory
+regardless of interactive vs non-interactive: a Step 1 without
+`### STEP 1 END` fails the run even if everything else is perfect.
 
 ---
 
 ## Step 2: Find root cause
 
-**Gate in:** Step 1 exit criteria satisfied AND user approved.
+**Gate in:** Step 1 exit criteria satisfied (i.e. `### STEP 1 END` emitted). The earlier "AND user approved" was lifted for non-interactive runs — see Step 1.5/1.6.
 
 **Purpose:** Identify why the bug happens. Do not start fixing yet.
 
@@ -370,18 +381,19 @@ All must be true before Step 2:
 - Correlate issue/PR references with current code paths and release notes.
 - State explicitly which commit likely introduced the regression, if identifiable.
 
-**Gate out - two paths:**
+**Gate out — two paths (interactive runs may pause; non-interactive runs proceed immediately per ground rule 3):**
 
 **Path A: Root cause found with confidence**
-- Present the hypothesis to the user for review.
-- User confirms -> proceed to create a fix branch and then Step 3.
+- Document the hypothesis in the transcript: which code path, what evidence supports it, what's still uncertain. Interactive runs may then pause for user review; non-interactive runs proceed.
 - Determine branch type from the issue:
   - Bug/regression -> `fix/`
   - Feature/enhancement -> `feat/`
   - Cleanup/tooling -> `chore/`
 - **Branch name must include both the issue number AND a descriptive slug** — `<prefix>/<issue-number>-<slug>`. Never create a bare `fix/<issue-number>` or slug-only `fix/<slug>` branch; both forms read poorly in the swctl UI and break the issue link on the dashboard. Good: `fix/10922-reorder-quantity-collision`. Bad: `fix/10922`, `fix/reorder-quantity-collision`. See `references/branch-naming-conventions.md` for the full spec.
 
-- **Reuse the worktree from Step 1.** The worktree at `/Users/ytran/Shopware/_worktrees/sw-<issue>` is already running with trunk and demo data from the reproduction step. Create a fix branch inside it:
+  **swctl resolve already chose a branch name for you** (you can see it from `git branch --show-current` inside the worktree). If you're already on `fix/<id>-<slug>`, REUSE IT — don't create a second one. Only create a new branch if you're not on a fix/feat/chore branch yet.
+
+- **Reuse the worktree from Step 1.** The worktree at `/Users/ytran/Shopware/_worktrees/sw-<issue>` is already running with trunk and demo data from the reproduction step. Create a fix branch inside it (skip if already on the branch):
 
   **For core platform fixes:**
   ```bash
@@ -447,14 +459,24 @@ All must be true before Step 2:
 
 **Path B: Root cause unclear or uncertain**
 - Present what is known and what is uncertain.
-- Collaborate with the user to narrow down: request targeted debugging, more data, or environment access.
-- Stay in Step 2 until confidence is sufficient or the user decides to proceed with best-effort hypothesis.
+- Interactive: collaborate with the user to narrow down — request targeted debugging, more data, or environment access; stay in Step 2 until confidence is sufficient or the user decides to proceed with best-effort hypothesis.
+- Non-interactive (`claude -p`, `codex exec`): the user is not available to clarify. Do NOT loop forever. Pick the most plausible hypothesis you have, label it clearly as "best-effort under non-interactive run — confidence: low", document the alternatives you ruled in/out, and proceed to Step 3 anyway. Step 4's review will catch you if the hypothesis is wrong.
+
+**Required Step 2 artifact (both paths):**
+
+Write a paragraph labeled exactly `Root cause hypothesis:` followed by:
+- the suspected file(s) and line range(s) (`src/.../Foo.php:120-145`)
+- a one-sentence why-this-causes-the-symptom claim
+- the evidence you found (error log signature, git blame commit, behavioural observation)
+- any unknowns you are deferring to Step 3's implementation
+
+Then emit `### STEP 2 END` on its own line. **The marker is mandatory; a missing Step 2 END marker has, in past runs, caused the swctl UI to show "0/8 steps complete" even when the actual code work landed correctly.**
 
 ---
 
 ## Step 3: Implement the fix
 
-**Gate in:** User confirmed root cause from Step 2. Worktree and branch exist.
+**Gate in:** Step 2 emitted `### STEP 2 END` (the earlier "user confirmed" requirement was lifted for non-interactive runs — see Step 2 path B). Worktree and branch exist.
 
 **Purpose:** Write the safest minimal fix.
 
