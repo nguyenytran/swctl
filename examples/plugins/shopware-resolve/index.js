@@ -1759,6 +1759,10 @@ function renderResolvePage(el, ctx) {
             }
 
             const actions = []
+            // Transcript button — always available; modal handles the
+            // empty-state if no transcript file exists for this issue
+            // (e.g. resolve ran before v0.5.9 added persistence).
+            actions.push(`<button class="sr-btn" data-transcript="${escape(item.issueId)}" title="View per-step transcript and token usage">📊</button>`)
             actions.push(`<button class="sr-btn" data-goto="/dashboard/instance/${escape(item.issueId)}" style="text-decoration:none;">Detail</button>`)
             actions.push(`<button class="sr-btn" data-action="push" data-issue="${escape(item.issueId)}">Push</button>`)
             if (!hasPr) {
@@ -1788,6 +1792,17 @@ function renderResolvePage(el, ctx) {
         const clean = target.startsWith('/') ? target : `/${target}`
         location.assign(`${location.pathname}${location.search}#${clean}`)
         requestAnimationFrame(() => window.dispatchEvent(new HashChangeEvent('hashchange')))
+      })
+    })
+
+    // Wire transcript buttons — opens the per-step modal for any issue
+    // in the table, regardless of whether it just finished or shipped
+    // weeks ago.  Result-card buttons are wired separately at the
+    // resolve-stream completion site.
+    tableContainer.querySelectorAll('[data-transcript]').forEach(btn => {
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        openTranscriptModal(btn.getAttribute('data-transcript'))
       })
     })
 
