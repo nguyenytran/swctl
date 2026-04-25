@@ -502,35 +502,65 @@ Document:
 
 **Gate in:** Step 3 implementation complete.
 
-**Purpose:** A sub-agent critically evaluates the patch for regressions, missed edge cases, and safer alternatives.
+**Purpose:** Critically evaluate the patch for regressions, missed edge cases, and safer alternatives. The reviewer must produce a written verdict regardless of how the review is performed — a missing Step 4 END marker silently broken every downstream gate.
 
-### 4.1) Launch review agent
+### 4.1) Run the review
 
-Spawn an independent review agent using the prompt in `agents/review-agent.md`.
+Two execution modes — pick the one your runtime supports. **Both must produce the same artifact format and emit `### STEP 4 END`.**
 
-Provide the agent with:
-1. The `git diff` from the worktree
+**Mode A — Sub-agent review (Claude Code only).**
+Invoke the Task tool with the prompt in `agents/review-agent.md`. Pass:
+1. The `git diff` of Step 3's commits
 2. The root cause summary from Step 2
 3. The fix rationale from Step 3
 
-### 4.2) Review scope
+The sub-agent runs in a clean context, free from the implementation bias. Its output is the verdict.
 
-The review agent evaluates:
-- correctness: does the fix address the root cause?
-- backward compatibility: are extension contracts preserved?
-- regression risk: could this break adjacent code paths?
-- minimality: is the change as narrow as possible?
-- test coverage: are edge cases covered?
-- Shopware-specific concerns: DAL, Flow Builder, state machines, migrations
+**Mode B — Inline self-review (Codex `exec`, or any runtime without a sub-agent tool).**
+Codex doesn't have a Task-tool equivalent; recursively spawning `codex exec` inside a running session is unreliable. Instead, perform the review yourself against the criteria below. The framing matters — read this as an instruction, not a soft request:
 
-### 4.3) Review output
+> "Set aside the implementation. You are now an independent reviewer who has never seen this patch. Evaluate the diff, root cause, and rationale against the checklist below. Do not rubber-stamp — if you can't find concerns, look harder at edge cases, concurrent access, and Shopware-specific contracts. Then write the verdict in the required format."
 
-The agent produces a structured verdict:
-- `PASS`: fix is correct, minimal, well-tested, and safe
-- `CONCERNS`: fix is likely correct but has identifiable risks to address
-- `BLOCK`: fix is incorrect, introduces regression, or breaks compatibility
+### 4.2) Review checklist (both modes)
 
-**Gate out:** Present review verdict to the user. User decides whether to address concerns, iterate, or accept.
+Evaluate against each section. Report specific findings with `file:line` references where applicable.
+
+- **Correctness:** does the fix actually address the root cause? Are null checks, boundaries, and type coercions handled? Are there paths where the symptom could still occur?
+- **Backward compatibility:** does the change break any extension contract (public API, event signatures, entity definitions)? Are decorated services / event subscribers / plugin hooks affected?
+- **Regression risk:** could this break adjacent code paths? Shared services, traits, base classes? Caching / indexing / state machine transitions?
+- **Minimality:** is the change as narrow as possible? Are there unrelated refactors bundled in?
+- **Test coverage:** do tests assert the specific broken behavior, not just the happy path? Edge cases (empty data, null, large datasets)?
+- **Shopware-specific:** DAL definitions, Flow Builder events/actions/rules, state machines, admin/storefront build needs, migration safety for zero-downtime deployment.
+
+### 4.3) Required artifact
+
+Write the verdict in this exact shape (so downstream gates can grep it):
+
+```md
+## Review Verdict: <PASS|CONCERNS|BLOCK>
+
+### Strengths
+- <what the implementation does well>
+
+### Concerns
+- <specific issue with file:line reference>
+
+### Suggestions
+- <improvement or alternative approach>
+
+### Risk Assessment
+- regression risk: <low|medium|high>
+- backward compatibility: <safe|risk identified: detail>
+- test coverage: <adequate|gaps identified: detail>
+- flow builder impact: <none|low|medium|high>
+```
+
+Verdict semantics:
+- **PASS:** correct, minimal, well-tested, safe for extension contracts. Minor style nits don't block.
+- **CONCERNS:** likely correct but has identifiable risks, missing coverage, or questionable assumptions. List specific items.
+- **BLOCK:** incorrect, regresses, breaks compatibility, or misses the root cause. Per ground rule 4, jump to Step 8 and stop.
+
+**Gate out:** Verdict written, `### STEP 4 END` emitted on its own line. Do NOT skip the marker even if the review is brief — a 5-line "PASS, no concerns identified" with the marker is a complete Step 4; a thorough review without the marker fails the run.
 
 ---
 
