@@ -1658,12 +1658,26 @@ _ensure_alpine_image() {
         return 0
     fi
     info "Pulling alpine image (one-time, used for volume populate/clone)…"
-    local pull_err
-    pull_err="$(docker pull alpine:latest 2>&1 >/dev/null)" || {
+    # Sanitised DOCKER_CONFIG: when this swctl runs INSIDE the swctl-ui
+    # container, the bind-mounted host HOME means the docker CLI sees
+    # the host's `~/.docker/config.json`, which on macOS references
+    # `docker-credential-osxkeychain` — a binary that doesn't exist
+    # in the Linux container.  The pull fails with
+    #   "exec: docker-credential-osxkeychain: executable file not found"
+    # even though alpine:latest is a public image needing no auth.
+    #
+    # An empty DOCKER_CONFIG dir bypasses the credsStore lookup
+    # entirely.  Idempotent: only used for this pull invocation.
+    local empty_cfg pull_err
+    empty_cfg="$(mktemp -d)"
+    pull_err="$(DOCKER_CONFIG="$empty_cfg" docker pull alpine:latest 2>&1 >/dev/null)"
+    local rc=$?
+    rm -rf "$empty_cfg"
+    if [ $rc -ne 0 ]; then
         err "Failed to pull alpine:latest. Check network / Docker daemon."
         [ -n "$pull_err" ] && printf '  %s\n' "$pull_err" >&2
         return 1
-    }
+    fi
 }
 
 # Populate a docker volume once from a source path on the host.  Idempotent —

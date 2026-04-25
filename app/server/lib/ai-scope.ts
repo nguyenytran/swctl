@@ -146,9 +146,16 @@ function buildPrompt(input: AiScopeInput): string {
 
 function buildArgs(backend: ResolveBackend, prompt: string): string[] {
   if (backend === 'codex') {
-    // Codex's `exec --message` is the one-shot equivalent of Claude's -p.
-    // MVP flag surface — matches what _ai_spawn_args uses on the bash side.
-    return ['exec', '--message', prompt]
+    // Codex 0.x's exec subcommand takes the prompt POSITIONALLY — there's
+    // no `--message` flag (that was an early MVP guess that exited 2).
+    // `--json` produces JSONL events; our parser walks them for the
+    // first balanced JSON object so prose around it is tolerated.
+    // `--full-auto` skips approval prompts (we run unattended); since
+    // this is a classification call with no FS writes intended,
+    // workspace-write sandbox is fine.
+    // `--skip-git-repo-check` lets us run from any cwd (the swctl-ui
+    // container's cwd isn't a git repo and doesn't need to be).
+    return ['exec', '--json', '--full-auto', '--skip-git-repo-check', prompt]
   }
   // Claude default.  `plan` permission mode blocks any tool usage (pure
   // classification — we don't want it editing files), and an empty
