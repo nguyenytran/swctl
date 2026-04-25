@@ -1,5 +1,4 @@
 import { readAllInstances } from './metadata.js'
-import { listResolveRuns } from './resolve.js'
 
 /**
  * Default allowlist of issue labels surfaced by the Resolve page's fetch-issues
@@ -413,17 +412,28 @@ export async function fetchGitHubIssues(
       return b.number - a.number
     })
 
-    // Hide assigned issues that are already being handled by swctl:
-    //   (a) have a live worktree instance (readAllInstances) — the user
-    //       already has a dedicated worktree for it, offering it again
-    //       would create a second one.
-    //   (b) have a resolve run that COMPLETED SUCCESSFULLY
-    //       (status: 'done') — no point re-resolving work we already
-    //       shipped.  Running / failed / crashed runs do NOT qualify:
-    //       a running run without a live instance is almost always
-    //       stale (browser closed mid-stream, process crashed, etc.)
-    //       and the user reasonably expects the issue back in the
-    //       list; a failed run means they want to try again.
+    // Hide assigned issues that are already being handled by swctl: those
+    // with a live worktree instance (readAllInstances) — the user already
+    // has a dedicated worktree for it, offering it again would create a
+    // second one.
+    //
+    // History: we used to also hide issues that had a `status: 'done'`
+    // entry in resolve-runs.json, on the theory that "we already shipped
+    // it."  But that suppression was both redundant and wrong:
+    //   • Redundant when the work shipped — `filterResolvableIssues` on
+    //     the client already hides issues whose linkedPRs include an
+    //     open/draft/merged PR.
+    //   • Wrong when nothing shipped — a `done` run means Claude reported
+    //     success, but the user may have cleaned the worktree because the
+    //     fix was incomplete, the wrong scope, or simply because they
+    //     wanted to redo it.  A `done` entry from days ago should not
+    //     silently lock the issue out of the picker forever.  (User-
+    //     reported regression for #6689: ran resolve, marked done, then
+    //     cleaned the instance to retry → issue invisible until the
+    //     resolve-runs.json file was hand-edited.)
+    //
+    // Trust the client's PR-link check for "shipped"; the server's job is
+    // only to dedupe against active worktrees.
     //
     // PRs in 'review-requested' / 'my-pr' categories are review tasks,
     // not resolution candidates, and pass through unfiltered.
@@ -435,21 +445,6 @@ export async function fetchGitHubIssues(
       }
     } catch {
       // Non-fatal — if we can't read instances, just don't hide any.
-    }
-    try {
-      for (const run of listResolveRuns()) {
-        // Only SUCCESSFUL completed runs suppress the issue.  Previous
-        // behaviour added every run unconditionally, which meant an
-        // abandoned (still "running" on disk because nothing updated
-        // the status when the browser tab closed) entry silently
-        // hid the issue from the picker FOREVER — user-reported bug
-        // for #6689 and similar.
-        if (run.status !== 'done') continue
-        const m = run.issue.match(/(?:\/issues\/|#)(\d+)$/) || run.issue.match(/^(\d+)$/)
-        if (m) handled.add(parseInt(m[1], 10))
-      }
-    } catch {
-      // Non-fatal — same rationale as above.
     }
     // Optional label allowlist: if the caller passed `labelFilter`, restrict
     // the 'assigned' category to items whose GitHub labels intersect the
