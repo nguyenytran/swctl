@@ -270,6 +270,13 @@ onMounted(async () => {
   await refreshRuns()
   if (resolveInstances.value.length > 0) {
     selectIssue((resolveInstances.value[0] as any).issueId)
+  } else {
+    // Empty Issues sidebar — auto-expand Browse GitHub so the user lands
+    // on a populated list of things they can start a resolve on, instead
+    // of staring at "0 issues" with no obvious next step.  Mirrors the
+    // empty-state hint rendered in the Issues panel below.
+    ghShow.value = true
+    void refreshGh()
   }
 })
 </script>
@@ -284,6 +291,25 @@ onMounted(async () => {
       </div>
 
       <div class="overflow-y-auto flex-1">
+        <!-- Empty state — no in-flight resolves.  Points the user at the
+             two ways to start one (Browse GitHub picker below, or the
+             paste-URL input above the sidebar) so an empty sidebar
+             doesn't look like the page is broken. -->
+        <div
+          v-if="resolveInstances.length === 0"
+          class="px-3 py-4 text-xs text-gray-500 leading-relaxed"
+        >
+          <p class="text-gray-400 mb-2">No active resolves yet.</p>
+          <p>
+            Pick one from
+            <button
+              class="text-blue-400 hover:text-blue-300 underline-offset-2 hover:underline"
+              @click="ghShow ? null : toggleGhPicker()"
+            >Browse GitHub</button>
+            below, or paste an issue URL into the input above.
+          </p>
+        </div>
+
         <button
           v-for="inst in resolveInstances"
           :key="(inst as any).issueId"
