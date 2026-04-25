@@ -441,30 +441,57 @@ app.put('/api/user-config', async (c) => {
         codex?:  { bin?: unknown; configDir?: unknown }
       }
     }
+
+    // Build a Partial<UserConfig> containing ONLY the keys the client
+    // explicitly sent with a valid value.  `writeUserConfig` merges this
+    // over the current on-disk config, so any key not included here is
+    // preserved as-is.
+    //
+    // This avoids a class of bug where the sanitizer would emit
+    // `{ resolveEnabled: undefined }` or `{ bin: undefined }` when the
+    // client sent nothing — that undefined then spread over the real
+    // on-disk value, dropping it.  Symptom: "save backend change" also
+    // silently disabled the resolve feature + wiped claude.bin.  See
+    // config.test regression note.
     const toStr = (v: unknown): string | undefined =>
       typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined
-    const clean = {
-      features: {
-        resolveEnabled: typeof incoming.features?.resolveEnabled === 'boolean'
-          ? incoming.features.resolveEnabled
-          : undefined,
-      },
-      ai: {
-        defaultBackend:
-          incoming.ai?.defaultBackend === 'claude' || incoming.ai?.defaultBackend === 'codex'
-            ? incoming.ai.defaultBackend
-            : undefined,
-        claude: {
-          bin:       toStr(incoming.ai?.claude?.bin),
-          configDir: toStr(incoming.ai?.claude?.configDir),
-        },
-        codex: {
-          bin:       toStr(incoming.ai?.codex?.bin),
-          configDir: toStr(incoming.ai?.codex?.configDir),
-        },
-      },
+
+    type Cleanable = Parameters<typeof writeUserConfig>[0]
+    const clean: NonNullable<Cleanable> = {}
+
+    if (incoming.features && typeof incoming.features === 'object') {
+      if (typeof incoming.features.resolveEnabled === 'boolean') {
+        clean.features = { resolveEnabled: incoming.features.resolveEnabled }
+      }
     }
-    const saved = writeUserConfig(clean as Parameters<typeof writeUserConfig>[0])
+
+    if (incoming.ai && typeof incoming.ai === 'object') {
+      const aiPartial: NonNullable<Cleanable>['ai'] = {}
+      if (incoming.ai.defaultBackend === 'claude' || incoming.ai.defaultBackend === 'codex') {
+        aiPartial.defaultBackend = incoming.ai.defaultBackend
+      }
+      if (incoming.ai.claude && typeof incoming.ai.claude === 'object') {
+        const claudeBin = toStr(incoming.ai.claude.bin)
+        const claudeDir = toStr(incoming.ai.claude.configDir)
+        if (claudeBin !== undefined || claudeDir !== undefined) {
+          aiPartial.claude = {}
+          if (claudeBin !== undefined) aiPartial.claude.bin = claudeBin
+          if (claudeDir !== undefined) aiPartial.claude.configDir = claudeDir
+        }
+      }
+      if (incoming.ai.codex && typeof incoming.ai.codex === 'object') {
+        const codexBin = toStr(incoming.ai.codex.bin)
+        const codexDir = toStr(incoming.ai.codex.configDir)
+        if (codexBin !== undefined || codexDir !== undefined) {
+          aiPartial.codex = {}
+          if (codexBin !== undefined) aiPartial.codex.bin = codexBin
+          if (codexDir !== undefined) aiPartial.codex.configDir = codexDir
+        }
+      }
+      if (Object.keys(aiPartial).length > 0) clean.ai = aiPartial
+    }
+
+    const saved = writeUserConfig(clean)
     return c.json({ ok: true, path: configFilePath(), config: saved })
   } catch (err: any) {
     return c.json({ error: err?.message || 'Failed to save config' }, 500)
