@@ -852,7 +852,7 @@ function handleNewBatch() {
                   <label
                     v-for="item in ghFilteredItems"
                     :key="item.number"
-                    class="grid grid-cols-[auto_1fr] gap-3 items-start px-3 py-2.5 border-b border-border last:border-b-0 hover:bg-surface-hover transition-colors cursor-pointer"
+                    class="grid grid-cols-[auto_1fr] gap-2 items-start pl-2 pr-3 py-2.5 border-b border-border last:border-b-0 hover:bg-surface-hover transition-colors cursor-pointer"
                     :class="{ 'opacity-40 cursor-not-allowed': isGhItemDisabled(item) }"
                   >
                     <input
