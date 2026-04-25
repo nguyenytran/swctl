@@ -272,6 +272,14 @@ export interface CreateArgsInput {
   project: string | null
   /** 'dev' → no --qa; 'qa' → --qa (swctl default differs — we're explicit). */
   mode: 'dev' | 'qa'
+  /**
+   * Optional slug derived from the issue title (e.g. "manufacturer-language-switch").
+   * Empty / undefined → branch is `<prefix>/<issueId>` (legacy shape).
+   * Non-empty → branch is `<prefix>/<issueId>-<slug>`.  The slug is purely
+   * cosmetic — the issueId already makes the branch unique — but it makes
+   * `git log`, `swctl status`, and PR titles readable at a glance.
+   */
+  branchSlug?: string
 }
 
 /**
@@ -288,7 +296,7 @@ export interface CreateArgsInput {
  *   - **No `--no-provision`** — regression guard for the v0.5.7→0.5.8 bug
  *     that shipped broken admin + storefront to resolve-created worktrees.
  *   - `--project <name>` iff project is truthy AND !== 'trunk'.
- *   - Positional tail: `<issueId> <branchPrefix>/<issueId>`.
+ *   - Positional tail: `<issueId> <branchPrefix>/<issueId>[-<slug>]`.
  */
 export function buildCreateArgs(input: CreateArgsInput): string[] {
   const args: string[] = ['create']
@@ -298,9 +306,77 @@ export function buildCreateArgs(input: CreateArgsInput): string[] {
   if (input.project && input.project !== 'trunk') {
     args.push('--project', input.project)
   }
-  const branchName = `${input.branchPrefix}/${input.issueId}`
+  const slug = (input.branchSlug || '').trim()
+  const branchName = slug
+    ? `${input.branchPrefix}/${input.issueId}-${slug}`
+    : `${input.branchPrefix}/${input.issueId}`
   args.push(input.issueId, branchName)
   return args
+}
+
+/**
+ * Derive a short, slug-safe descriptor from an issue title for inclusion
+ * in branch names.  Pure function — no I/O, no AI call.
+ *
+ * Why heuristic and not AI?  We already pay for one AI roundtrip in
+ * detectScopeWithAI; gating branch creation on a second one would
+ * double the create-time latency for marginal gain.  The slug is also
+ * cosmetic (issueId guarantees uniqueness), so a "good enough" first
+ * few keywords from the title is fine.
+ *
+ * Pipeline:
+ *   1. Lowercase, strip non-alphanumerics (collapse to single hyphens).
+ *   2. Split on whitespace, drop short tokens (<2 chars) and stop words
+ *      (English filler + Shopware-specific noise like "fix", "bug").
+ *   3. Take the first ~5 surviving tokens.
+ *   4. Cap total length at 40 chars on a word boundary.
+ *
+ * Returns '' when the title is empty, all-noise, or yields no surviving
+ * tokens — caller falls back to the legacy `<prefix>/<id>` form.
+ */
+export function slugifyIssueTitle(title: string): string {
+  if (!title || typeof title !== 'string') return ''
+
+  // Stop words are intentionally short.  Two categories:
+  //   - English filler: meaningless on its own, no information value.
+  //   - Shopware-issue noise: "fix", "bug", "issue", "error" — implied
+  //     by the branch prefix already, including them in the slug just
+  //     burns characters on every branch name.
+  const stop = new Set([
+    'a', 'all', 'an', 'and', 'any', 'are', 'as', 'at', 'be', 'but',
+    'by', 'can', 'do', 'does', 'for', 'from', 'has', 'have', 'if',
+    'in', 'is', 'it', 'its', 'just', 'no', 'not', 'of', 'off', 'on',
+    'only', 'or', 'out', 'over', 'so', 'some', 'such', 'than',
+    'that', 'the', 'their', 'them', 'then', 'they', 'this', 'those',
+    'to', 'too', 'under', 'up', 'down', 'very', 'was', 'were',
+    'when', 'where', 'which', 'while', 'who', 'why', 'will', 'with',
+    'yet', 'after', 'before', 'during', 'into', 'onto',
+    // Shopware-issue noise
+    'fix', 'fixes', 'fixed', 'bug', 'bugs', 'issue', 'issues',
+    'error', 'errors',
+  ])
+
+  const tokens = title
+    .toLowerCase()
+    // Replace anything not alphanumeric with a space — collapses
+    // punctuation, brackets, slashes, etc.  Keep underscores and dashes
+    // out so we don't double-hyphenate.
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !stop.has(w))
+
+  if (tokens.length === 0) return ''
+
+  // Take first 5; trim later by length budget.
+  const head = tokens.slice(0, 5).join('-')
+
+  // 40 chars is enough to be informative and short enough that
+  // `fix/<id>-<slug>` stays well under git's ~250-char practical limit
+  // and reads on one line in `swctl status`.
+  if (head.length <= 40) return head
+  // Truncate on a word boundary — find the last hyphen ≤ 40.
+  const cut = head.lastIndexOf('-', 40)
+  return cut > 0 ? head.slice(0, cut) : head.slice(0, 40)
 }
 
 /**
@@ -865,6 +941,12 @@ export function startResolveStream(
       // confidence so the user can audit the routing at a glance.
       let effectiveProject = project
       let prefix: 'fix' | 'feat' | 'chore'
+      // Issue title doubles as the source of the branch slug.  We always
+      // try to fetch it once (cheap, single GitHub API call) so every
+      // create path can produce a readable `<prefix>/<id>-<slug>` branch.
+      // Falls back to '' when the API is unreachable / token missing →
+      // buildCreateArgs reverts to the legacy bare `<prefix>/<id>` shape.
+      let issueTitle = ''
 
       if (project) {
         await sendEvent('log', { line: `[scope] user → project=${project} (explicit override)`, ts: Date.now() })
@@ -876,10 +958,13 @@ export function startResolveStream(
           reasoning: 'user-provided project',
           method: 'heuristic',
         }
+        // Title fetch is best-effort — branch slug is cosmetic.
+        try { issueTitle = (await fetchIssueInfo(issue))?.title ?? '' } catch {}
       } else if (isResolveEnabled()) {
         const info = await fetchIssueInfo(issue)
+        issueTitle = info?.title ?? ''
         aiDecision = await detectScopeWithAI({
-          issueTitle: info?.title ?? '',
+          issueTitle,
           issueBody:  (info?.body ?? '').slice(0, 2000),
           labels,
           backend,
@@ -903,8 +988,15 @@ export function startResolveStream(
           await sendEvent('log', { line: `[scope] no extension/* label matched a registered plugin → platform scope`, ts: Date.now() })
         }
         prefix = branchPrefixFromLabels(labels)
+        try { issueTitle = (await fetchIssueInfo(issue))?.title ?? '' } catch {}
       }
-      await sendEvent('log', { line: `[branch] prefix → ${prefix}/`, ts: Date.now() })
+      const branchSlug = slugifyIssueTitle(issueTitle)
+      await sendEvent('log', {
+        line: branchSlug
+          ? `[branch] prefix → ${prefix}/, slug → ${branchSlug}`
+          : `[branch] prefix → ${prefix}/`,
+        ts: Date.now(),
+      })
 
       // Build the `swctl create` argv through the pure helper — single
       // source of truth for the contract (regression-tested in
@@ -919,6 +1011,7 @@ export function startResolveStream(
         branchPrefix: prefix,
         project: effectiveProject ?? null,
         mode: mode === 'dev' ? 'dev' : 'qa',
+        branchSlug,
       })
       await sendEvent('log', { line: `[swctl] swctl ${createArgs.join(' ')}`, ts: Date.now() })
 
