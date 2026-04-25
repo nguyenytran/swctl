@@ -659,8 +659,15 @@ export function startResolveStream(
   params: { issue: string; project?: string; mode?: 'qa' | 'dev'; backend?: string },
 ) {
   const { issue, project, mode } = params
-  const backend: ResolveBackend = coerceBackend(params.backend)
+  const backendRaw = params.backend
+  const backend: ResolveBackend = coerceBackend(backendRaw)
   const home = process.env.HOME || '/root'
+
+  // Server-side log of the received backend.  Without this it's
+  // very easy to be fooled into thinking Codex is running when it
+  // isn't — the spawn-site `[backend] launching: …` log already
+  // names the binary, but a dedicated echo at receipt makes the
+  // "client said X, server resolved to Y" mismatch obvious.
 
   // Extract issue number from URL or raw number
   const issueMatch = issue.match(/\/issues\/(\d+)/) || issue.match(/^(\d+)$/)
@@ -833,11 +840,22 @@ export function startResolveStream(
       await sendEvent('log', { line: `[swctl] Worktree already exists for #${issueId}.`, ts: Date.now() })
     }
 
-    // Step 2: Resolve worktree path for Claude
+    // Step 2: Resolve worktree path for the agent
     const instance = readAllInstances().find((i: any) => i.issueId === issueId)
     const worktreePath = instance?.worktreePath || home
 
-    await sendEvent('log', { line: `[claude] Starting /shopware-resolve ${issue}`, ts: Date.now() })
+    // Echo the resolved backend (and what the client raw-sent) so a
+    // codex-vs-claude mismatch is unmissable in the log.  Used to be
+    // hard-coded `[claude]` here even when the spawn was Codex.
+    const rawShown = backendRaw ? backendRaw : '(none — server defaulted)'
+    await sendEvent('log', {
+      line: `[${backend}] backend resolved (client sent: ${rawShown})`,
+      ts: Date.now(),
+    })
+    await sendEvent('log', {
+      line: `[${backend}] Starting /shopware-resolve ${issue}`,
+      ts: Date.now(),
+    })
 
     // Step 3: Launch Claude Code
     //

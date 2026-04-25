@@ -62,6 +62,10 @@ function startStream(issue, project, mode, out, onDone) {
   if (backend && backend !== 'claude') params.set('backend', backend)
 
   const url = `/api/skill/resolve/stream?${params.toString()}`
+  // Surface the URL we're about to hit, including any backend param,
+  // so a "I picked Codex but Claude ran" mismatch is debuggable
+  // without docker exec'ing into the container.
+  appendLine(out, `[client] opening stream: ${url}`)
   const es = new EventSource(url)
 
   es.addEventListener('log', (e) => {
@@ -109,6 +113,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
   if (backend && backend !== 'claude') params.set('backend', backend)
 
   const url = `/api/skill/resolve/stream?${params.toString()}`
+  appendLine(out, `[client] opening stream: ${url}`)
   const es = new EventSource(url)
   let currentStep = 1
 
