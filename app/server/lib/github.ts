@@ -7,15 +7,18 @@ import { readAllInstances } from './metadata.js'
  * shown" (user has deselected everything) — callers should pass `undefined`
  * to disable label filtering entirely.
  */
+/**
+ * Default label allowlist the Resolve UI initialises its chip filter
+ * with.  Kept narrow on purpose: `domain/inventory` is the only label
+ * shared across the issues this team actually works on.  Wider sets
+ * (priorities, extension scopes, customer-support) flooded the picker
+ * with cross-domain noise that the user immediately had to deselect.
+ *
+ * Users can still ADD any label at runtime via the chip UI — this is
+ * the *initial* state, not a hard cap.
+ */
 export const DEFAULT_ISSUE_LABEL_FILTERS: readonly string[] = [
   'domain/inventory',
-  'priority/low',
-  'priority/high',
-  'priority/critical',
-  'priority/security-related',
-  'extension/Custom-Products',
-  'extension/Commercial',
-  'customer-support',
 ]
 
 export interface LinkedPR {
