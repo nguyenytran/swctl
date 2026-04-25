@@ -841,12 +841,19 @@ function handleNewBatch() {
                 <div v-if="ghSkippedCount > 0" class="mb-2 px-3 py-1.5 bg-yellow-600/10 border border-yellow-600/30 rounded text-xs text-yellow-400">
                   Skipped {{ ghSkippedCount }} issue(s) with no linked PR (QA mode).
                 </div>
+                <!-- Two-column grid layout — checkbox column is fixed-width
+                     so every title aligns at the SAME left edge regardless
+                     of how many badges follow.  Wrapping <label> makes the
+                     entire row click-to-toggle (better than a 16x16-pixel
+                     checkbox target); inner @click.stop blocks the toggle
+                     when the user clicks an interactive child (link,
+                     filter button). -->
                 <div class="overflow-y-auto border border-border rounded bg-surface-dark">
-                  <div
+                  <label
                     v-for="item in ghFilteredItems"
                     :key="item.number"
-                    class="flex items-start gap-2 px-3 py-2 border-b border-border last:border-b-0 hover:bg-surface-hover transition-colors"
-                    :class="{ 'opacity-40': isGhItemDisabled(item) }"
+                    class="grid grid-cols-[auto_1fr] gap-2 items-start pl-2 pr-3 py-2.5 border-b border-border last:border-b-0 hover:bg-surface-hover transition-colors cursor-pointer"
+                    :class="{ 'opacity-40 cursor-not-allowed': isGhItemDisabled(item) }"
                   >
                     <input
                       type="checkbox"
@@ -855,24 +862,34 @@ function handleNewBatch() {
                       :disabled="isGhItemDisabled(item)"
                       @change="toggleGhItem(item.number)"
                     />
-                    <div class="flex-1 min-w-0">
-                      <div class="flex items-center gap-2">
-                        <a
-                          :href="item.url"
-                          target="_blank"
-                          class="text-xs font-mono shrink-0 hover:underline"
+                    <div class="min-w-0">
+                      <!-- Row 1 — title, full width, primary content.
+                           Same left edge on every row; truncation is
+                           predictable because nothing competes for flex
+                           space here. -->
+                      <a
+                        :href="item.url"
+                        target="_blank"
+                        class="block text-sm text-white truncate hover:underline"
+                        :title="item.title"
+                        @click.stop
+                      >{{ item.title }}</a>
+
+                      <!-- Row 2 — identity badges (id, repo, category, type, user).
+                           Uniform 8 px gap, all 10 px text, wraps on narrow
+                           viewports.  Same left edge as the title. -->
+                      <div class="flex items-center gap-2 mt-1 flex-wrap text-[10px]">
+                        <span
+                          class="font-mono shrink-0"
                           :class="{
                             'text-blue-400': item.category === 'assigned',
                             'text-yellow-400': item.category === 'review-requested',
                             'text-purple-400': item.category === 'my-pr',
                           }"
-                          @click.stop
-                        >
-                          {{ item.isPR ? 'PR' : '#' }}{{ item.number }}
-                        </a>
-                        <span v-if="item.repo" class="text-[10px] text-gray-600 shrink-0">{{ item.repo }}</span>
+                        >{{ item.isPR ? 'PR' : '#' }}{{ item.number }}</span>
+                        <span v-if="item.repo" class="text-gray-600 shrink-0">{{ item.repo }}</span>
                         <span
-                          class="text-[10px] px-1 py-0 rounded shrink-0"
+                          class="px-1 rounded shrink-0"
                           :class="{
                             'bg-blue-600/20 text-blue-400 border border-blue-600/30': item.category === 'assigned',
                             'bg-yellow-600/20 text-yellow-400 border border-yellow-600/30': item.category === 'review-requested',
@@ -881,7 +898,7 @@ function handleNewBatch() {
                         >{{ item.category === 'assigned' ? 'assigned' : item.category === 'review-requested' ? 'review' : 'my PR' }}</span>
                         <button
                           v-if="item.issueType"
-                          class="text-[10px] px-1 py-0 rounded shrink-0 hover:ring-1 hover:ring-white/20 transition-all cursor-pointer"
+                          class="px-1 rounded shrink-0 hover:ring-1 hover:ring-white/20 transition-all cursor-pointer"
                           :class="{
                             'bg-red-600/20 text-red-400 border border-red-600/30': item.issueType === 'Bug',
                             'bg-emerald-600/20 text-emerald-400 border border-emerald-600/30': item.issueType === 'Improvement',
@@ -892,47 +909,53 @@ function handleNewBatch() {
                           @click.stop="toggleGhFilterIssueType(item.issueType!)"
                           :title="`Filter by type: ${item.issueType}`"
                         >{{ item.issueType }}</button>
-                        <span class="text-xs text-white truncate">{{ item.title }}</span>
+                        <span v-if="item.user" class="text-gray-600 shrink-0">@{{ item.user }}</span>
+                        <span
+                          v-if="hasExistingWorktree(item)"
+                          class="px-1 rounded bg-gray-600/20 text-gray-400 border border-gray-600/30 shrink-0"
+                          title="A worktree already exists for this issue"
+                        >Worktree exists</span>
                       </div>
-                      <div class="flex items-center gap-2 mt-0.5 flex-wrap">
+
+                      <!-- Row 3 — linked PR / branch / mode-warning.
+                           Only rendered when there's something to show; row
+                           collapses to zero height when empty. -->
+                      <div
+                        v-if="item.linkedPRs?.length || item.branch || mode === 'qa' || item.labels.length > 0"
+                        class="flex items-center gap-2 mt-1 flex-wrap text-[10px]"
+                      >
                         <template v-if="item.linkedPRs?.length">
                           <a
                             :href="`https://github.com/${item.repo || 'shopware/shopware'}/pull/${item.linkedPRs[0].number}`"
                             target="_blank"
-                            class="text-[10px] text-emerald-500 hover:underline font-mono shrink-0"
+                            class="text-emerald-500 hover:underline font-mono shrink-0"
                             @click.stop
                           >&rarr; PR#{{ item.linkedPRs[0].number }}</a>
-                          <span class="text-[10px] text-gray-500 font-mono truncate">{{ item.linkedPRs[0].branch }}</span>
+                          <span class="text-gray-500 font-mono truncate min-w-0">{{ item.linkedPRs[0].branch }}</span>
                           <span
-                            class="text-[10px] px-1 py-0 rounded shrink-0"
+                            class="px-1 rounded shrink-0"
                             :class="{
                               'bg-emerald-600/20 text-emerald-400 border border-emerald-600/30': item.linkedPRs[0].state === 'open',
                               'bg-yellow-600/20 text-yellow-400 border border-yellow-600/30': item.linkedPRs[0].state === 'draft',
                               'bg-gray-600/20 text-gray-400 border border-gray-600/30': item.linkedPRs[0].state === 'closed' || item.linkedPRs[0].state === 'merged',
                             }"
                           >{{ item.linkedPRs[0].state }}</span>
-                          <span v-if="item.linkedPRs.length > 1" class="text-[10px] text-gray-600">+{{ item.linkedPRs.length - 1 }} more</span>
+                          <span v-if="item.linkedPRs.length > 1" class="text-gray-600 shrink-0">+{{ item.linkedPRs.length - 1 }} more</span>
                         </template>
-                        <span v-else-if="item.branch" class="text-[10px] text-gray-500 font-mono truncate">{{ item.branch }}</span>
+                        <span v-else-if="item.branch" class="text-gray-500 font-mono truncate min-w-0">{{ item.branch }}</span>
                         <span
                           v-else-if="mode === 'qa'"
-                          class="text-[10px] px-1 py-0 rounded bg-red-600/20 text-red-400 border border-red-600/30 shrink-0"
+                          class="px-1 rounded bg-red-600/20 text-red-400 border border-red-600/30 shrink-0"
                         >No PR</span>
-                        <span
-                          v-if="hasExistingWorktree(item)"
-                          class="text-[10px] px-1 py-0 rounded bg-gray-600/20 text-gray-400 border border-gray-600/30 shrink-0"
-                          title="A worktree already exists for this issue"
-                        >Worktree exists</span>
-                        <span v-if="item.user" class="text-[10px] text-gray-600">@{{ item.user }}</span>
                         <span
                           v-for="label in item.labels.slice(0, 3)"
                           :key="label.name"
-                          class="text-[10px] px-1 py-0 rounded"
+                          class="px-1 rounded shrink-0"
                           :style="{ backgroundColor: `#${label.color}20`, color: `#${label.color}`, border: `1px solid #${label.color}40` }"
                         >{{ label.name }}</span>
                       </div>
                     </div>
-                  </div>
+                  </label>
                 </div>
               </div>
 

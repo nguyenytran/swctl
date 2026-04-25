@@ -22,6 +22,31 @@ async function fetchRuns() {
   }
 }
 
+// ---------- Backend (Claude / Codex) selection ----------
+//
+// The user's last AI-backend choice persists across reloads via
+// localStorage.  Initial value falls back to `claude` to match the
+// server-side default.  Eventually this should also seed from
+// `/api/user-config` (.ai.defaultBackend) — but localStorage wins
+// once the user has picked something explicitly in this UI.
+//
+// IMPORTANT: the user-facing radio in this plugin's create form is
+// what actually drives spawn.  Without passing `?backend=<value>` in
+// the stream URL, the server falls back to claude regardless of any
+// other config — which is exactly the bug a previous attempt left
+// in place.
+
+const BACKEND_LS_KEY = 'swctl.resolve.backend'
+function getBackend() {
+  try {
+    const v = localStorage.getItem(BACKEND_LS_KEY)
+    return v === 'codex' ? 'codex' : 'claude'
+  } catch { return 'claude' }
+}
+function setBackend(v) {
+  try { localStorage.setItem(BACKEND_LS_KEY, v === 'codex' ? 'codex' : 'claude') } catch {}
+}
+
 // ---------- Stream helper (used by route + action) ----------
 
 function startStream(issue, project, mode, out, onDone) {
@@ -29,8 +54,18 @@ function startStream(issue, project, mode, out, onDone) {
   params.set('issue', issue)
   if (project) params.set('project', project)
   if (mode) params.set('mode', mode)
+  // Forward the user-selected backend.  Server's `coerceBackend`
+  // treats any other value (or absent) as 'claude', so omitting it
+  // when the user picked Codex would silently spawn Claude — the
+  // exact bug PR #6's spawn fix exposed.
+  const backend = getBackend()
+  if (backend && backend !== 'claude') params.set('backend', backend)
 
   const url = `/api/skill/resolve/stream?${params.toString()}`
+  // Surface the URL we're about to hit, including any backend param,
+  // so a "I picked Codex but Claude ran" mismatch is debuggable
+  // without docker exec'ing into the container.
+  appendLine(out, `[client] opening stream: ${url}`)
   const es = new EventSource(url)
 
   es.addEventListener('log', (e) => {
@@ -74,8 +109,11 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
   params.set('issue', issue)
   if (project) params.set('project', project)
   if (mode) params.set('mode', mode)
+  const backend = getBackend()
+  if (backend && backend !== 'claude') params.set('backend', backend)
 
   const url = `/api/skill/resolve/stream?${params.toString()}`
+  appendLine(out, `[client] opening stream: ${url}`)
   const es = new EventSource(url)
   let currentStep = 1
 
@@ -204,6 +242,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
             </div>
           </div>
           <div class="sr-result-actions">
+            <button class="sr-result-btn" data-transcript="${issueId}" title="View per-step transcript and token usage">📊 Transcript</button>
             <button class="sr-result-btn sr-result-btn-primary" data-goto="/dashboard/instance/${issueId}">View Detail</button>
             ${prHtml ? `<a class="sr-result-btn" href="${resultEl.querySelector?.('a')?.href || '#'}" target="_blank">Open PR</a>` : ''}
           </div>
@@ -241,6 +280,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
             </div>
           </div>
           <div class="sr-result-actions">
+            <button class="sr-result-btn" data-transcript="${issueId}" title="View per-step transcript and token usage">📊 Transcript</button>
             ${canResume ? `<button class="sr-result-btn sr-result-btn-primary" data-resume="${issueId}" data-next-step="${nextStep}" title="Re-launch Claude with --resume and pick up from Step ${nextStep}">↻ Resume from Step ${nextStep}</button>` : ''}
             <button class="sr-result-btn" data-goto="/dashboard/instance/${issueId}">View Detail</button>
           </div>
@@ -271,6 +311,14 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
       btn.addEventListener('click', (ev) => {
         ev.preventDefault()
         goTo(btn.getAttribute('data-goto'))
+      })
+    })
+
+    // Wire transcript buttons (success + failure cards both render one).
+    resultEl.querySelectorAll('[data-transcript]').forEach((btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        openTranscriptModal(btn.getAttribute('data-transcript'))
       })
     })
 
@@ -513,8 +561,96 @@ function renderLine(pre, raw) {
     return
   }
 
+  // ---- Codex `--json` JSONL events ----
+  // Codex wraps everything in turn / item envelopes.  We render only on
+  // item.completed (item.started would double-render) and decode the
+  // item-type payload into the same row vocabulary Claude already uses
+  // (text / tool_use / tool_result / banner) so the two backends look
+  // visually consistent.
+  if (type === 'thread.started') {
+    return row('sr-log-banner', `● codex session ${(event.thread_id || '').slice(0, 8) || 'started'}`)
+  }
+  if (type === 'turn.started' || type === 'item.started') {
+    // Suppress — turn.started carries no info; item.started is followed
+    // by item.completed which has the actual content.
+    return
+  }
+  if (type === 'turn.completed') {
+    const u = event.usage || {}
+    const tok = (u.input_tokens || 0) + (u.output_tokens || 0)
+    if (!tok) return
+    return row('sr-log-banner', `● turn complete (${tok.toLocaleString()} tokens)`)
+  }
+  if (type === 'thread.completed') {
+    return row('sr-log-banner-ok', `● codex session done`)
+  }
+  if (type === 'item.completed' && event.item && typeof event.item === 'object') {
+    return renderCodexItem(pre, row, event.item)
+  }
+
   // Unknown event types: show a compact one-liner
   row('sr-log-banner', `● ${type || 'event'}`)
+}
+
+/**
+ * Render one completed Codex item as the same kind of row Claude's
+ * stream-json blocks render to.  Item shape (Codex 0.x):
+ *   - { type: "agent_message", text: "..." }
+ *   - { type: "command_execution", command, aggregated_output, exit_code, status }
+ *   - { type: "file_change", changes: [{ path, kind: "add"|"update"|"delete" }], status }
+ */
+function renderCodexItem(pre, row, item) {
+  if (item.type === 'agent_message' && typeof item.text === 'string') {
+    // Reuse the same line-by-line + STEP marker logic as Claude's text blocks
+    const lines = item.text.split('\n')
+    for (const line of lines) {
+      if (!line.trim()) { row('sr-log-text', ' '); continue }
+      if (/^###\s*STEP\s+\d+\s+END\b/i.test(line)) { row('sr-log-step-end', line); continue }
+      if (/^###\s*STEP\s+\d+\s+START\b/i.test(line)) { row('sr-log-step', line); continue }
+      row('sr-log-text', line)
+    }
+    return
+  }
+
+  if (item.type === 'command_execution') {
+    const cmd = String(item.command || '').replace(/\s+/g, ' ').slice(0, 240)
+    row('sr-log-tool-bash', `▸ Bash: ${cmd}`)
+    const out = String(item.aggregated_output || '').replace(/\r\n/g, '\n')
+    if (out.trim()) {
+      const firstLine = (out.split('\n').find(l => l.trim()) || '').slice(0, 200)
+      const totalLines = out.split('\n').length
+      const code = item.exit_code
+      const err = (typeof code === 'number' && code !== 0) ? ` (exit ${code})` : ''
+      const container = document.createElement('div')
+      container.className = 'sr-log-row sr-log-result'
+      const head = document.createElement('div')
+      head.innerHTML = `<span class="sr-log-caret"></span>⤷ <span>${escape(firstLine)}</span><span style="color:#475569;margin-left:6px;">…(${totalLines} line${totalLines === 1 ? '' : 's'})${err}</span>`
+      const body = document.createElement('div')
+      body.className = 'sr-log-result-body'
+      body.textContent = out
+      body.style.display = 'none'
+      head.style.cursor = 'pointer'
+      head.addEventListener('click', () => {
+        body.style.display = body.style.display === 'none' ? 'block' : 'none'
+      })
+      container.appendChild(head)
+      container.appendChild(body)
+      pre.appendChild(container)
+      pre.scrollTop = pre.scrollHeight
+    }
+    return
+  }
+
+  if (item.type === 'file_change' && Array.isArray(item.changes)) {
+    for (const ch of item.changes) {
+      const verb = ch.kind === 'add' ? '✎ Add' : ch.kind === 'delete' ? '✎ Delete' : '✎ Edit'
+      row('sr-log-tool-edit', `${verb}: ${ch.path || ''}`)
+    }
+    return
+  }
+
+  // Unknown item type — fall back to a compact banner
+  row('sr-log-banner', `● ${item.type || 'item'}`)
 }
 
 function renderBlock(pre, row, block, eventType) {
@@ -821,7 +957,21 @@ function renderResolvePage(el, ctx) {
             <input id="sr-repo" type="text" placeholder="Repository (e.g. shopware/shopware)" value="shopware/shopware" style="width:220px;flex:none;" />
             <button id="sr-fetch" class="sr-fetch-btn">Fetch issues</button>
             <button id="sr-run" disabled>Resolve selected</button>
-            <label class="sr-concurrency-label" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9ca3af;margin-left:auto;">
+            <!--
+              Backend selector — Claude (default) vs Codex.  The
+              chosen value is forwarded as a backend= query param on
+              the SSE stream URL; the server reads it and dispatches
+              to the right CLI in buildSpawnArgs.  Persisted to
+              localStorage so the choice sticks across reloads.
+            -->
+            <label class="sr-backend-label" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9ca3af;margin-left:auto;">
+              AI
+              <select id="sr-backend" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 6px;font-size:12px;">
+                <option value="claude">Claude</option>
+                <option value="codex">Codex</option>
+              </select>
+            </label>
+            <label class="sr-concurrency-label" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9ca3af;">
               Concurrency
               <select id="sr-concurrency" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 6px;font-size:12px;">
                 <option value="1">1</option>
@@ -1364,6 +1514,74 @@ function renderResolvePage(el, ctx) {
     updateManualBtn()
   })
 
+  // ---- Backend dropdown ----------------------------------------------
+  //
+  // Reflects + persists `swctl.resolve.backend` in localStorage (same
+  // key the dead Vue ResolvePage.vue used, kept stable for forward-
+  // compat).  startStream / startStreamWithSteps read via getBackend()
+  // and forward as ?backend= on the SSE URL.
+  //
+  // The available options are filtered by `ai.enabledBackends` from
+  // `/api/user-config` — if the user disabled Codex in /#/config, this
+  // dropdown won't even show it.  Default selection comes from the
+  // server-side `resolved.defaultBackend` (which respects
+  // ai.defaultBackend, falling back to first-enabled).  localStorage
+  // wins iff the localStorage value is in the enabled set; otherwise
+  // we fall back to the resolved default to avoid a stale "Codex" pick
+  // surviving after the user disables it.
+  const backendSel = el.querySelector('#sr-backend')
+  if (backendSel) {
+    ;(async () => {
+      let enabled = ['claude']           // safe back-compat fallback
+      let defaultBackend = 'claude'
+      try {
+        const res = await fetch('/api/user-config')
+        if (res.ok) {
+          const body = await res.json()
+          if (body?.resolved?.enabledBackends?.length) {
+            enabled = body.resolved.enabledBackends
+          }
+          if (body?.resolved?.defaultBackend) {
+            defaultBackend = body.resolved.defaultBackend
+          }
+        }
+      } catch {
+        // /api/user-config unreachable (server still booting, etc.) →
+        // fall through to the static [claude, codex] markup so the
+        // dropdown stays usable.  No ?backend=codex will be sent if
+        // claude is the selected value, so this is safe.
+      }
+
+      // Strip options not in the enabled set.
+      Array.from(backendSel.options).forEach((opt) => {
+        if (!enabled.includes(opt.value)) opt.remove()
+      })
+      // Hide the dropdown entirely when there's exactly one choice — a
+      // 1-option <select> is just visual noise.
+      if (enabled.length <= 1) {
+        const label = backendSel.closest('.sr-backend-label')
+        if (label) label.style.display = 'none'
+      }
+
+      // Reconcile localStorage with the enabled set: if the persisted
+      // value is now disabled (e.g. user just turned off Codex), drop
+      // it back to the resolved default.  Don't re-write LS until the
+      // user explicitly picks something — keeps "their last pick"
+      // sticky if they re-enable later.
+      const persisted = getBackend()
+      const initial = enabled.includes(persisted) ? persisted : defaultBackend
+      if (enabled.includes(initial)) {
+        backendSel.value = initial
+      } else if (backendSel.options.length > 0) {
+        backendSel.value = backendSel.options[0].value
+      }
+
+      backendSel.addEventListener('change', () => {
+        setBackend(backendSel.value)
+      })
+    })()
+  }
+
   // Wire the concurrency dropdown.  Value persists in localStorage
   // under `swctl.resolve.concurrency`.  `auto` resolves at click time
   // to half of navigator.hardwareConcurrency, clamped [1, 4] — a
@@ -1541,6 +1759,10 @@ function renderResolvePage(el, ctx) {
             }
 
             const actions = []
+            // Transcript button — always available; modal handles the
+            // empty-state if no transcript file exists for this issue
+            // (e.g. resolve ran before v0.5.9 added persistence).
+            actions.push(`<button class="sr-btn" data-transcript="${escape(item.issueId)}" title="View per-step transcript and token usage">📊</button>`)
             actions.push(`<button class="sr-btn" data-goto="/dashboard/instance/${escape(item.issueId)}" style="text-decoration:none;">Detail</button>`)
             actions.push(`<button class="sr-btn" data-action="push" data-issue="${escape(item.issueId)}">Push</button>`)
             if (!hasPr) {
@@ -1570,6 +1792,17 @@ function renderResolvePage(el, ctx) {
         const clean = target.startsWith('/') ? target : `/${target}`
         location.assign(`${location.pathname}${location.search}#${clean}`)
         requestAnimationFrame(() => window.dispatchEvent(new HashChangeEvent('hashchange')))
+      })
+    })
+
+    // Wire transcript buttons — opens the per-step modal for any issue
+    // in the table, regardless of whether it just finished or shipped
+    // weeks ago.  Result-card buttons are wired separately at the
+    // resolve-stream completion site.
+    tableContainer.querySelectorAll('[data-transcript]').forEach(btn => {
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        openTranscriptModal(btn.getAttribute('data-transcript'))
       })
     })
 
@@ -1798,6 +2031,248 @@ function escape(s) {
   return String(s).replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
   ))
+}
+
+// ─── Transcript modal ───────────────────────────────────────────────────────
+//
+// Reads /api/skill/resolve/transcript?issueId=N and renders the per-step
+// breakdown in a centered overlay modal.  Header strip shows totals
+// (tokens in/out, cached, reasoning, cost, duration); body is an
+// accordion of steps, each toggle-able.  Esc / background-click /
+// X-button closes; the modal owns its own DOM so multiple instances
+// don't stack.  Idempotent — calling it twice just rebuilds the
+// modal content.
+
+function fmtTokens(n) {
+  return n > 0 ? n.toLocaleString() : '—'
+}
+
+function fmtCost(usd) {
+  if (usd === null || usd === undefined) return '—'
+  return '$' + Number(usd).toFixed(2)
+}
+
+function fmtDuration(ms) {
+  if (!ms || ms < 0) return '—'
+  const s = Math.round(ms / 1000)
+  if (s < 60) return s + 's'
+  const m = Math.floor(s / 60), rs = s % 60
+  if (m < 60) return rs ? `${m}m ${rs}s` : `${m}m`
+  const h = Math.floor(m / 60), rm = m % 60
+  return rm ? `${h}h ${rm}m` : `${h}h`
+}
+
+function stepHeading(s) {
+  if (s.step === 0) return 'Preamble'
+  return s.name ? `Step ${s.step}: ${s.name}` : `Step ${s.step}`
+}
+
+async function openTranscriptModal(issueId) {
+  // Tear down any prior modal so we never stack.
+  document.querySelectorAll('.sr-tr-overlay').forEach((n) => n.remove())
+
+  // Inject styles once.
+  if (!document.getElementById('sr-tr-styles')) {
+    const style = document.createElement('style')
+    style.id = 'sr-tr-styles'
+    style.textContent = `
+      .sr-tr-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 24px; }
+      .sr-tr-modal { background: #0f172a; border: 1px solid #1f2937; border-radius: 8px; width: min(1000px, 100%); max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+      .sr-tr-head  { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid #1f2937; }
+      .sr-tr-title { font: 600 14px ui-sans-serif, sans-serif; color: #e5e7eb; }
+      .sr-tr-close { margin-left: auto; background: transparent; border: none; color: #9ca3af; font-size: 18px; cursor: pointer; padding: 4px 8px; border-radius: 4px; }
+      .sr-tr-close:hover { background: #1f2937; color: #fff; }
+      .sr-tr-totals { padding: 10px 18px; border-bottom: 1px solid #1f2937; background: #111827; font: 11px ui-monospace, monospace; color: #9ca3af; display: flex; flex-wrap: wrap; gap: 4px 16px; }
+      .sr-tr-totals .lbl { color: #6b7280; }
+      .sr-tr-totals .num-in   { color: #60a5fa; }
+      .sr-tr-totals .num-out  { color: #34d399; }
+      .sr-tr-totals .num-cached  { color: #6b7280; }
+      .sr-tr-totals .num-reason  { color: #c084fc; }
+      .sr-tr-totals .num-cost    { color: #fbbf24; }
+      .sr-tr-totals .right    { margin-left: auto; color: #6b7280; }
+      .sr-tr-body  { flex: 1; overflow: auto; }
+      .sr-tr-empty { padding: 32px 18px; color: #9ca3af; font-size: 13px; text-align: center; }
+      .sr-tr-step  { border-bottom: 1px solid #1f2937; }
+      .sr-tr-step:last-child { border-bottom: none; }
+      .sr-tr-step-head {
+        display: grid; grid-template-columns: 14px minmax(0, 1fr) 60px 60px 90px 90px 80px;
+        gap: 12px; align-items: center;
+        padding: 10px 18px; cursor: pointer; transition: background 0.1s;
+        background: transparent; border: none; width: 100%; text-align: left;
+        font: inherit; color: inherit;
+      }
+      .sr-tr-step-head:hover { background: #111827; }
+      .sr-tr-step-caret { color: #6b7280; font-size: 11px; }
+      .sr-tr-step-name  { color: #e5e7eb; font: 600 13px ui-sans-serif, sans-serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .sr-tr-step-meta  { font: 11px ui-monospace, monospace; color: #6b7280; text-align: right; }
+      .sr-tr-step-tok-in   { font: 11px ui-monospace, monospace; color: #60a5fa; text-align: right; }
+      .sr-tr-step-tok-out  { font: 11px ui-monospace, monospace; color: #34d399; text-align: right; }
+      .sr-tr-step-tok-total{ font: 600 12px ui-monospace, monospace; color: #fbbf24; text-align: right; }
+      /* Per-step token panel inside the expanded body — most prominent
+         place for "what did this step cost" so it's hard to miss. */
+      .sr-tr-step-tok-panel {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 8px 16px; margin: 0 0 10px 0; padding: 10px 14px;
+        background: #1e2a3d; border: 1px solid #1e293b; border-radius: 6px;
+      }
+      .sr-tr-tok-cell { display: flex; flex-direction: column; gap: 2px; }
+      .sr-tr-tok-cell .lbl { font: 10px ui-sans-serif, sans-serif; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+      .sr-tr-tok-cell .val { font: 600 14px ui-monospace, monospace; }
+      .sr-tr-tok-cell .val.in   { color: #60a5fa; }
+      .sr-tr-tok-cell .val.out  { color: #34d399; }
+      .sr-tr-tok-cell .val.cached { color: #9ca3af; }
+      .sr-tr-tok-cell .val.reason { color: #c084fc; }
+      .sr-tr-tok-cell .val.total  { color: #fbbf24; }
+      .sr-tr-tok-cell .val.dim { color: #6b7280; font-style: italic; font-weight: 400; }
+      .sr-tr-step-body  { padding: 8px 18px 14px 18px; background: #0a1020; border-top: 1px solid #1f2937; max-height: 360px; overflow: auto; }
+      .sr-tr-line { font: 11px/1.55 ui-monospace, monospace; color: #cbd5e1; white-space: pre-wrap; word-break: break-word; margin: 0; }
+    `
+    document.head.appendChild(style)
+  }
+
+  // Build the modal scaffold up front so we can show "Loading…" while we
+  // fetch.  Avoids a flash of empty modal on slow networks.
+  const overlay = document.createElement('div')
+  overlay.className = 'sr-tr-overlay'
+  overlay.innerHTML = `
+    <div class="sr-tr-modal" role="dialog" aria-label="Resolve transcript for #${escape(issueId)}">
+      <div class="sr-tr-head">
+        <span class="sr-tr-title">Transcript — Issue #${escape(issueId)}</span>
+        <button class="sr-tr-close" aria-label="Close">✕</button>
+      </div>
+      <div class="sr-tr-totals" id="sr-tr-totals">Loading…</div>
+      <div class="sr-tr-body" id="sr-tr-body"></div>
+    </div>
+  `
+  document.body.appendChild(overlay)
+
+  const close = () => overlay.remove()
+  overlay.querySelector('.sr-tr-close').addEventListener('click', close)
+  overlay.addEventListener('click', (ev) => {
+    if (ev.target === overlay) close()
+  })
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') {
+      close()
+      document.removeEventListener('keydown', onKey)
+    }
+  }
+  document.addEventListener('keydown', onKey)
+
+  // Fetch + render.
+  let data
+  try {
+    const res = await fetch(`/api/skill/resolve/transcript?issueId=${encodeURIComponent(issueId)}`)
+    data = await res.json()
+  } catch (err) {
+    overlay.querySelector('#sr-tr-totals').textContent = ''
+    overlay.querySelector('#sr-tr-body').innerHTML =
+      `<div class="sr-tr-empty">Failed to load transcript: ${escape(String(err && err.message || err))}</div>`
+    return
+  }
+
+  if (!data || !Array.isArray(data.steps) || data.steps.length === 0) {
+    overlay.querySelector('#sr-tr-totals').textContent = ''
+    overlay.querySelector('#sr-tr-body').innerHTML = `
+      <div class="sr-tr-empty">
+        No transcript yet.<br>
+        <span style="color:#6b7280;font-size:11px;">
+          Transcripts started recording in v0.5.9. Earlier runs don't have one;
+          the next time you resolve this issue, every line is captured here.
+        </span>
+      </div>`
+    return
+  }
+
+  // Totals strip.
+  const t = data.totals.tokens
+  const totalsEl = overlay.querySelector('#sr-tr-totals')
+  totalsEl.innerHTML = `
+    <span class="lbl">Total:</span>
+    <span><span class="num-in">${escape(fmtTokens(t.input))}</span> in</span>
+    ${t.cachedInput > 0 ? `<span><span class="num-cached">${escape(fmtTokens(t.cachedInput))}</span> cached</span>` : ''}
+    <span><span class="num-out">${escape(fmtTokens(t.output))}</span> out</span>
+    ${t.reasoning > 0 ? `<span><span class="num-reason">${escape(fmtTokens(t.reasoning))}</span> reasoning</span>` : ''}
+    ${data.totals.costUsd !== null ? `<span><span class="num-cost">${escape(fmtCost(data.totals.costUsd))}</span></span>` : ''}
+    <span class="right">${escape(fmtDuration(data.totals.durationMs))} · ${data.totals.lineCount} lines</span>
+  `
+
+  // Per-step accordion.  Auto-expand the highest-numbered step (most
+  // recent activity); rest are collapsed until the user clicks.
+  const body = overlay.querySelector('#sr-tr-body')
+  const lastStep = data.steps[data.steps.length - 1]
+  const initialOpen = lastStep ? lastStep.step : -1
+
+  for (const step of data.steps) {
+    const stepEl = document.createElement('div')
+    stepEl.className = 'sr-tr-step'
+    const isOpen = step.step === initialOpen
+    // "Total" tokens for the header summary — sum across input + cached
+    // + output + reasoning so the user gets ONE big number per step
+    // that captures total work, not just the ~uncached subset.
+    const totalTokens = step.tokens.input + step.tokens.cachedInput + step.tokens.output + step.tokens.reasoning
+    stepEl.innerHTML = `
+      <button class="sr-tr-step-head" type="button">
+        <span class="sr-tr-step-caret">${isOpen ? '▾' : '▸'}</span>
+        <span class="sr-tr-step-name">${escape(stepHeading(step))}</span>
+        <span class="sr-tr-step-meta">${escape(String(step.lines.length))} lines</span>
+        <span class="sr-tr-step-meta">${escape(fmtDuration(step.durationMs))}</span>
+        <span class="sr-tr-step-tok-in">${escape(fmtTokens(step.tokens.input))} in</span>
+        <span class="sr-tr-step-tok-out">${escape(fmtTokens(step.tokens.output))} out</span>
+        <span class="sr-tr-step-tok-total">Σ ${escape(fmtTokens(totalTokens))}</span>
+      </button>
+      <div class="sr-tr-step-body" style="${isOpen ? '' : 'display:none;'}">
+        ${renderStepTokenPanel(step.tokens)}
+        ${step.lines.map((row) => `<pre class="sr-tr-line">${escape(row.line)}</pre>`).join('')}
+      </div>
+    `
+    const head = stepEl.querySelector('.sr-tr-step-head')
+    const bodyEl = stepEl.querySelector('.sr-tr-step-body')
+    const caret = stepEl.querySelector('.sr-tr-step-caret')
+    head.addEventListener('click', () => {
+      const showing = bodyEl.style.display !== 'none'
+      bodyEl.style.display = showing ? 'none' : ''
+      caret.textContent = showing ? '▸' : '▾'
+    })
+    body.appendChild(stepEl)
+  }
+}
+
+/**
+ * Render a card with five token cells (input / cached / output /
+ * reasoning / total) shown prominently at the top of a step's
+ * expanded body.  The header columns are a glance-at summary; this
+ * panel is the authoritative per-step breakdown — no scanning the
+ * narrow header columns required.
+ */
+function renderStepTokenPanel(tokens) {
+  const total = tokens.input + tokens.cachedInput + tokens.output + tokens.reasoning
+  const cell = (lbl, value, cls, extra) => `
+    <div class="sr-tr-tok-cell">
+      <span class="lbl">${escape(lbl)}</span>
+      <span class="val ${cls}">${value > 0 ? escape(fmtTokens(value)) : '<span class="dim">—</span>'}${extra ? ` <span class="dim" style="font-size:11px;font-weight:400;">${extra}</span>` : ''}</span>
+    </div>`
+  // Cache-hit ratio — useful diagnostic for "is this step paying for
+  // re-reading context I already paid for".
+  const cacheRatio = (tokens.input + tokens.cachedInput) > 0
+    ? Math.round(100 * tokens.cachedInput / (tokens.input + tokens.cachedInput))
+    : 0
+  return `
+    <div class="sr-tr-step-tok-panel">
+      ${cell('Input',   tokens.input,       'in')}
+      ${cell('Cached',  tokens.cachedInput, 'cached', cacheRatio > 0 ? `(${cacheRatio}% hit)` : '')}
+      ${cell('Output',  tokens.output,      'out')}
+      ${cell('Reasoning', tokens.reasoning, 'reason')}
+      ${cell('Total Σ',  total,             'total')}
+    </div>`
+}
+
+// Expose on window for ad-hoc console invocation:
+//   openTranscriptModal('6689')
+// Useful when debugging or when the user wants to view the transcript
+// for an issue that doesn't currently have a result-card on screen.
+if (typeof window !== 'undefined') {
+  window.openTranscriptModal = openTranscriptModal
 }
 
 export default plugin

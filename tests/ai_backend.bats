@@ -11,10 +11,12 @@ load test_helper
 # depends on.  These tests lock it down.
 
 setup() {
-    # Hermetic: point the config reader at an empty tmp file so a
-    # dev's ~/.swctl/config.json (may have `ai.defaultBackend = codex`
-    # from manual experiments) doesn't leak into tests that assert the
-    # built-in "claude" default.
+    # Hermetic isolation: point the config reader at an empty tmp file so
+    # a dev's real ~/.swctl/config.json (which might have
+    # `ai.defaultBackend = "codex"` from manual experiments) doesn't
+    # leak into tests that assert the built-in "claude" default.
+    # `_ai_backend_binary` / `_ai_backend_config_dir` / `_ai_resolve_backend`
+    # all route through `_user_config_read`, which reads SWCTL_CONFIG_FILE.
     _cfg_dir="$(mktemp -d)"
     export SWCTL_CONFIG_FILE="$_cfg_dir/config.json"
     unset SWCTL_CLAUDE_BIN SWCTL_CODEX_BIN CLAUDE_CONFIG_DIR CODEX_CONFIG_DIR

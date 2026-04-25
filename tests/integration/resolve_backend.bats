@@ -21,8 +21,8 @@ setup() {
     mkdir -p "$_it_dir"
     _it_stub_out="$_it_dir/stub.out"
     # Hermetic: point at an isolated empty config so the dev's
-    # ~/.swctl/config.json (may have `ai.defaultBackend=codex`) can't
-    # leak in and break assertions about the "claude" default.
+    # ~/.swctl/config.json (which may have `ai.defaultBackend=codex`)
+    # can't leak in and break assertions about the "claude" default.
     export SWCTL_CONFIG_FILE="$_it_dir/config.json"
     unset SWCTL_CLAUDE_BIN SWCTL_CODEX_BIN CLAUDE_CONFIG_DIR CODEX_CONFIG_DIR
     unset SWCTL_RESOLVE_BACKEND

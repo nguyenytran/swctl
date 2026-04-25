@@ -272,6 +272,14 @@ export interface CreateArgsInput {
   project: string | null
   /** 'dev' → no --qa; 'qa' → --qa (swctl default differs — we're explicit). */
   mode: 'dev' | 'qa'
+  /**
+   * Optional slug derived from the issue title (e.g. "manufacturer-language-switch").
+   * Empty / undefined → branch is `<prefix>/<issueId>` (legacy shape).
+   * Non-empty → branch is `<prefix>/<issueId>-<slug>`.  The slug is purely
+   * cosmetic — the issueId already makes the branch unique — but it makes
+   * `git log`, `swctl status`, and PR titles readable at a glance.
+   */
+  branchSlug?: string
 }
 
 /**
@@ -288,7 +296,7 @@ export interface CreateArgsInput {
  *   - **No `--no-provision`** — regression guard for the v0.5.7→0.5.8 bug
  *     that shipped broken admin + storefront to resolve-created worktrees.
  *   - `--project <name>` iff project is truthy AND !== 'trunk'.
- *   - Positional tail: `<issueId> <branchPrefix>/<issueId>`.
+ *   - Positional tail: `<issueId> <branchPrefix>/<issueId>[-<slug>]`.
  */
 export function buildCreateArgs(input: CreateArgsInput): string[] {
   const args: string[] = ['create']
@@ -298,9 +306,274 @@ export function buildCreateArgs(input: CreateArgsInput): string[] {
   if (input.project && input.project !== 'trunk') {
     args.push('--project', input.project)
   }
-  const branchName = `${input.branchPrefix}/${input.issueId}`
+  const slug = (input.branchSlug || '').trim()
+  const branchName = slug
+    ? `${input.branchPrefix}/${input.issueId}-${slug}`
+    : `${input.branchPrefix}/${input.issueId}`
   args.push(input.issueId, branchName)
   return args
+}
+
+/**
+ * Derive a short, slug-safe descriptor from an issue title for inclusion
+ * in branch names.  Pure function — no I/O, no AI call.
+ *
+ * Why heuristic and not AI?  We already pay for one AI roundtrip in
+ * detectScopeWithAI; gating branch creation on a second one would
+ * double the create-time latency for marginal gain.  The slug is also
+ * cosmetic (issueId guarantees uniqueness), so a "good enough" first
+ * few keywords from the title is fine.
+ *
+ * Pipeline:
+ *   1. Lowercase, strip non-alphanumerics (collapse to single hyphens).
+ *   2. Split on whitespace, drop short tokens (<2 chars) and stop words
+ *      (English filler + Shopware-specific noise like "fix", "bug").
+ *   3. Take the first ~5 surviving tokens.
+ *   4. Cap total length at 40 chars on a word boundary.
+ *
+ * Returns '' when the title is empty, all-noise, or yields no surviving
+ * tokens — caller falls back to the legacy `<prefix>/<id>` form.
+ */
+export function slugifyIssueTitle(title: string): string {
+  if (!title || typeof title !== 'string') return ''
+
+  // Stop words are intentionally short.  Two categories:
+  //   - English filler: meaningless on its own, no information value.
+  //   - Shopware-issue noise: "fix", "bug", "issue", "error" — implied
+  //     by the branch prefix already, including them in the slug just
+  //     burns characters on every branch name.
+  const stop = new Set([
+    'a', 'all', 'an', 'and', 'any', 'are', 'as', 'at', 'be', 'but',
+    'by', 'can', 'do', 'does', 'for', 'from', 'has', 'have', 'if',
+    'in', 'is', 'it', 'its', 'just', 'no', 'not', 'of', 'off', 'on',
+    'only', 'or', 'out', 'over', 'so', 'some', 'such', 'than',
+    'that', 'the', 'their', 'them', 'then', 'they', 'this', 'those',
+    'to', 'too', 'under', 'up', 'down', 'very', 'was', 'were',
+    'when', 'where', 'which', 'while', 'who', 'why', 'will', 'with',
+    'yet', 'after', 'before', 'during', 'into', 'onto',
+    // Shopware-issue noise
+    'fix', 'fixes', 'fixed', 'bug', 'bugs', 'issue', 'issues',
+    'error', 'errors',
+  ])
+
+  const tokens = title
+    .toLowerCase()
+    // Replace anything not alphanumeric with a space — collapses
+    // punctuation, brackets, slashes, etc.  Keep underscores and dashes
+    // out so we don't double-hyphenate.
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !stop.has(w))
+
+  if (tokens.length === 0) return ''
+
+  // Take first 5; trim later by length budget.
+  const head = tokens.slice(0, 5).join('-')
+
+  // 40 chars is enough to be informative and short enough that
+  // `fix/<id>-<slug>` stays well under git's ~250-char practical limit
+  // and reads on one line in `swctl status`.
+  if (head.length <= 40) return head
+  // Truncate on a word boundary — find the last hyphen ≤ 40.
+  const cut = head.lastIndexOf('-', 40)
+  return cut > 0 ? head.slice(0, cut) : head.slice(0, 40)
+}
+
+/**
+ * Input to buildSpawnArgs — everything needed to assemble a backend's
+ * CLI invocation for a "new resolve" run.  Resume/ask use different
+ * shapes and are handled elsewhere.
+ */
+export interface SpawnArgsInput {
+  /** Which backend to invoke. */
+  backend: 'claude' | 'codex'
+  /** The prompt text (Claude: `/shopware-resolve <url>`; Codex: natural-language task description). */
+  prompt: string
+  /** RFC4122 UUID, preassigned so Claude's `--resume` works later.  Ignored by Codex (its session ids are assigned server-side). */
+  sessionId: string
+  /** Absolute path to the worktree the agent should operate in. */
+  worktreePath: string
+  /** Space-joined list of allowed tools for Claude's `--allowedTools`.  Codex has no per-call equivalent (uses `--sandbox` + config.toml). */
+  allowedTools: string
+}
+
+/** Result of buildSpawnArgs — feed directly into `spawn(bin, args, ...)`. */
+export interface SpawnArgsResult {
+  bin: string
+  args: string[]
+}
+
+/**
+ * Assemble the (bin, argv) pair for a fresh resolve spawn.  Extracted as
+ * a pure function so the CORRECT-BINARY contract is regression-guarded
+ * by tests — prior to this, the spawn site hard-coded
+ * `backendBinary('claude')` regardless of the user's selection, so
+ * picking Codex in the UI silently still ran Claude.
+ *
+ * Claude flags (stable, well-documented):
+ *   -p <prompt>
+ *   --output-format stream-json   → one JSON event per line on stdout
+ *   --verbose
+ *   --permission-mode acceptEdits
+ *   --allowedTools <space-joined>
+ *   --session-id <uuid>           → enables later `--resume <uuid>`
+ *   --effort max
+ *   --add-dir <worktree>
+ *
+ * Codex flags (from `codex exec --help`, Codex CLI 0.x):
+ *   --json                        → JSONL output to stdout (closest to Claude's stream-json)
+ *   --full-auto                   → sandbox=workspace-write, skip approvals (what we want for
+ *                                   agent automation; mirrors Claude's `acceptEdits`)
+ *   --cd <worktree>               → working directory (Claude uses --add-dir instead)
+ *   --skip-git-repo-check         → don't refuse to run in a non-git-root worktree (the swctl
+ *                                   sw-<N> directories are worktrees off of trunk; Codex's own
+ *                                   check wrongly refuses in some setups)
+ *   <prompt>                      → positional
+ *
+ * Session semantics differ:
+ *   - Claude accepts a pre-assigned UUID via `--session-id`, which means we
+ *     can `claude --resume <uuid>` later from another endpoint.
+ *   - Codex assigns session ids itself and persists them under
+ *     `~/.codex/sessions/`.  `codex exec resume --last` or
+ *     `codex exec resume <id>` is the resume pathway — incompatible with
+ *     the pre-assigned model.  We ignore `input.sessionId` on the Codex
+ *     path; resume support for Codex is a separate follow-up (requires
+ *     capturing Codex's session id from its first-line output + plumbing
+ *     it into metadata).
+ */
+/**
+ * Build the resolve prompt per backend.
+ *
+ * Backends consume prompts very differently:
+ *
+ *   - **Claude Code** invokes the bundled `shopware-resolve` skill via
+ *     its slash-command registry (`~/.claude/skills/shopware-resolve/`
+ *     populated by `swctl skill install --target claude`).  The whole
+ *     8-step workflow content is the skill's SKILL.md; Claude only
+ *     needs the trigger string.
+ *
+ *   - **Codex** has no slash-command registry.  The skill content was
+ *     written into `~/.codex/AGENTS.md` (or the worktree's AGENTS.md)
+ *     by `swctl skill install --target codex` — Codex picks it up as
+ *     ambient context.  But Codex still needs an explicit task
+ *     description: "go run that workflow on this issue, edit files,
+ *     commit."  Without that, `codex exec` will produce a chatty
+ *     "here's what I'd do" response and exit cleanly with zero
+ *     changes — which is exactly what the user hit on issue #6689
+ *     ("No commits on fix/6689 vs trunk").
+ *
+ * The Codex prompt deliberately:
+ *   - states the worktree path so Codex knows where to operate (also
+ *     passed via `--cd` but agents tend to anchor on prompt content)
+ *   - emphasises that this is a NON-INTERACTIVE run (no approvals
+ *     coming) and that `--full-auto` already grants workspace-write,
+ *     so it should make decisions and proceed
+ *   - mentions the swctl step markers (`### STEP N END`) so the UI's
+ *     progress stepper can light up just like it does for Claude
+ *   - tells it to commit before moving on (Codex defaults to NOT
+ *     committing — opposite of `claude --permission-mode acceptEdits`)
+ */
+export interface ResolvePromptInput {
+  backend: ResolveBackend
+  /** Full issue ref (URL or `#N` or `N`).  Surfaced verbatim to the agent. */
+  issue: string
+  /** Numeric id extracted from the issue ref — used as the `swctl_setup` arg in Step 5. */
+  issueId: string
+  /** Absolute path to the git worktree the agent should operate in. */
+  worktreePath: string
+}
+
+export function buildResolvePrompt(input: ResolvePromptInput): string {
+  if (input.backend === 'codex') {
+    // Codex has NO slash-command (`/foo`) or at-mention (`@foo`) skill
+    // registry — neither token resolves to anything special.  AGENTS.md
+    // (installed by `swctl skill install --target codex`) is just
+    // ambient context Codex reads on every run.  The prompt has to be
+    // a concrete task description, not a magic invocation.
+    //
+    // We still need to spell out the run-time invariants — `--full-auto`
+    // grants workspace-write but Codex defaults to NOT committing,
+    // which produced the "No commits on fix/<id> vs trunk" empty
+    // result the user hit on issue #6689.  Telling it to commit per
+    // step is what turns a chatty no-op into a reviewable diff.
+    return [
+      `# Resolve Shopware issue ${input.issue}`,
+      ``,
+      `Apply the 8-step Shopware-issue-resolution workflow described in`,
+      `your AGENTS.md (verify → root cause → implement → review → flow`,
+      `impact → test → PR → triage) to this issue.  The full per-step`,
+      `criteria are in AGENTS.md; this prompt is just the task envelope.`,
+      ``,
+      `Issue:     ${input.issue}`,
+      `Issue id:  ${input.issueId}    ← pass to swctl_setup in Step 5`,
+      `Worktree:  ${input.worktreePath}    ← already on the fix branch; do all edits + commits here`,
+      ``,
+      `Run-time invariants (this is a NON-INTERACTIVE \`codex exec\` run with`,
+      `--dangerously-bypass-approvals-and-sandbox; the swctl-ui container is`,
+      `the actual sandbox):`,
+      `- Full edit access to the worktree above.  No human will approve`,
+      `  anything mid-run; make decisions and proceed.`,
+      `- Run tests as part of Step 6.  Surface failures in the final summary.`,
+      `- COMMIT each step's changes before moving on (use conventional-commit`,
+      `  messages; reference issue ${input.issueId} in the body).  Codex's default`,
+      `  is NOT to commit — without explicit commits, swctl's diff tab will`,
+      `  read "No commits on fix/${input.issueId} vs trunk" and the run produces`,
+      `  nothing reviewable.`,
+      `- Print "### STEP N END" after each completed step so swctl's UI`,
+      `  stepper can track progress.`,
+      ``,
+      `Do not just describe what you'd do — actually edit files, run tests,`,
+      `and commit.  The diff this run produces is what gets reviewed.`,
+      ``,
+      `If AGENTS.md is empty or missing the resolve workflow, run`,
+      `\`swctl skill install --user --target codex\` on the host first, then`,
+      `retry — that command splices the workflow content into ~/.codex/AGENTS.md.`,
+    ].join('\n')
+  }
+
+  // Claude — slash-command form.  The skill's SKILL.md carries every
+  // ground rule + per-step artifact requirement; this is just the trigger.
+  return `/shopware-resolve ${input.issue}\n\n(issue id for Step 5 swctl refresh: ${input.issueId})`
+}
+
+export function buildSpawnArgs(input: SpawnArgsInput): SpawnArgsResult {
+  if (input.backend === 'codex') {
+    return {
+      bin: backendBinary('codex'),
+      args: [
+        'exec',
+        '--json',
+        // Why not `--full-auto`?  `--full-auto` is shorthand for
+        // `--ask-for-approval=never --sandbox=workspace-write`, and the
+        // workspace-write sandbox uses bubblewrap (bwrap) on Linux.
+        // Our swctl-ui base image is Alpine without `kernel.unprivileged_userns_clone=1`,
+        // so bwrap fails with "No permissions to create a new namespace"
+        // on every write attempt — the run "succeeds" with zero edits.
+        // The whole swctl-ui container is already a hardened sandbox
+        // (read-only host bind-mounts, dedicated network, scoped to
+        // SWCTL_BROWSE_ROOT), so a second bwrap layer adds no security
+        // and breaks the agent.  Swap to the explicit bypass flag.
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--skip-git-repo-check',
+        '--cd', input.worktreePath,
+        input.prompt,
+      ],
+    }
+  }
+  // claude (default)
+  return {
+    bin: backendBinary('claude'),
+    args: [
+      '-p', input.prompt,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--permission-mode', 'acceptEdits',
+      '--allowedTools', input.allowedTools,
+      '--session-id', input.sessionId,
+      '--effort', 'max',
+      '--add-dir', input.worktreePath,
+    ],
+  }
 }
 
 /**
@@ -550,6 +823,22 @@ function observeStreamLine(state: ResolveStreamState, raw: string): void {
     }
   }
 
+  // Codex JSONL: { type: "item.completed", item: { type: "agent_message", text } }
+  // Step markers live inside the agent_message text, mirroring Claude's
+  // stream-json shape — same regex, different envelope.
+  if (ev.type === 'item.completed' && ev.item?.type === 'agent_message' && typeof ev.item.text === 'string') {
+    const matches = ev.item.text.matchAll(/###\s*STEP\s+(\d)\s+END\b/gi)
+    for (const m of matches) {
+      state.lastCompletedStep = Math.max(state.lastCompletedStep, parseInt(m[1], 10))
+    }
+  }
+  // Codex thread.started carries the only session-id-like value Codex
+  // surfaces over `--json`.  Capturing it lets `swctl resolve resume`
+  // (when wired) target the right session.
+  if (ev.type === 'thread.started' && typeof ev.thread_id === 'string') {
+    if (!state.sessionId) state.sessionId = ev.thread_id
+  }
+
   if (ev.type === 'result') {
     if (typeof ev.total_cost_usd === 'number') state.cost = ev.total_cost_usd
   }
@@ -567,21 +856,24 @@ export function startResolveStream(
   params: { issue: string; project?: string; mode?: 'qa' | 'dev'; backend?: string },
 ) {
   const { issue, project, mode } = params
-  const backend: ResolveBackend = coerceBackend(params.backend)
+  const backendRaw = params.backend
+  const backend: ResolveBackend = coerceBackend(backendRaw)
   const home = process.env.HOME || '/root'
+
+  // Server-side log of the received backend.  Without this it's
+  // very easy to be fooled into thinking Codex is running when it
+  // isn't — the spawn-site `[backend] launching: …` log already
+  // names the binary, but a dedicated echo at receipt makes the
+  // "client said X, server resolved to Y" mismatch obvious.
 
   // Extract issue number from URL or raw number
   const issueMatch = issue.match(/\/issues\/(\d+)/) || issue.match(/^(\d+)$/)
   const issueId = issueMatch ? issueMatch[1] : issue.replace(/\D/g, '')
 
-  // The skill's own SKILL.md carries the ground rules, per-step artifact
-  // requirements, and stop criterion — see
-  // `skills/shopware-resolve/SKILL.md` "Ground rules" / "Required
-  // artifact per step" sections.  All three entry points (swctl UI,
-  // swctl CLI, direct `claude /shopware-resolve`) use those same rules,
-  // so we keep this prompt minimal: just the slash command + the
-  // explicit issue id for Step 5.
-  const prompt = `/shopware-resolve ${issue}\n\n(issue id for Step 5 swctl refresh: ${issueId})`
+  // Prompt is built per-backend inside the SSE handler below — Codex
+  // needs the resolved worktreePath baked into the prompt, and that's
+  // not known until the worktree create finishes.  See `buildResolvePrompt`
+  // for the per-backend rationale.
 
   recordStart({ issue, project, mode })
 
@@ -649,6 +941,12 @@ export function startResolveStream(
       // confidence so the user can audit the routing at a glance.
       let effectiveProject = project
       let prefix: 'fix' | 'feat' | 'chore'
+      // Issue title doubles as the source of the branch slug.  We always
+      // try to fetch it once (cheap, single GitHub API call) so every
+      // create path can produce a readable `<prefix>/<id>-<slug>` branch.
+      // Falls back to '' when the API is unreachable / token missing →
+      // buildCreateArgs reverts to the legacy bare `<prefix>/<id>` shape.
+      let issueTitle = ''
 
       if (project) {
         await sendEvent('log', { line: `[scope] user → project=${project} (explicit override)`, ts: Date.now() })
@@ -660,10 +958,13 @@ export function startResolveStream(
           reasoning: 'user-provided project',
           method: 'heuristic',
         }
+        // Title fetch is best-effort — branch slug is cosmetic.
+        try { issueTitle = (await fetchIssueInfo(issue))?.title ?? '' } catch {}
       } else if (isResolveEnabled()) {
         const info = await fetchIssueInfo(issue)
+        issueTitle = info?.title ?? ''
         aiDecision = await detectScopeWithAI({
-          issueTitle: info?.title ?? '',
+          issueTitle,
           issueBody:  (info?.body ?? '').slice(0, 2000),
           labels,
           backend,
@@ -687,8 +988,15 @@ export function startResolveStream(
           await sendEvent('log', { line: `[scope] no extension/* label matched a registered plugin → platform scope`, ts: Date.now() })
         }
         prefix = branchPrefixFromLabels(labels)
+        try { issueTitle = (await fetchIssueInfo(issue))?.title ?? '' } catch {}
       }
-      await sendEvent('log', { line: `[branch] prefix → ${prefix}/`, ts: Date.now() })
+      const branchSlug = slugifyIssueTitle(issueTitle)
+      await sendEvent('log', {
+        line: branchSlug
+          ? `[branch] prefix → ${prefix}/, slug → ${branchSlug}`
+          : `[branch] prefix → ${prefix}/`,
+        ts: Date.now(),
+      })
 
       // Build the `swctl create` argv through the pure helper — single
       // source of truth for the contract (regression-tested in
@@ -703,6 +1011,7 @@ export function startResolveStream(
         branchPrefix: prefix,
         project: effectiveProject ?? null,
         mode: mode === 'dev' ? 'dev' : 'qa',
+        branchSlug,
       })
       await sendEvent('log', { line: `[swctl] swctl ${createArgs.join(' ')}`, ts: Date.now() })
 
@@ -741,13 +1050,24 @@ export function startResolveStream(
       await sendEvent('log', { line: `[swctl] Worktree already exists for #${issueId}.`, ts: Date.now() })
     }
 
-    // Step 2: Resolve worktree path for Claude
+    // Step 2: Resolve worktree path for the agent
     const instance = readAllInstances().find((i: any) => i.issueId === issueId)
     const worktreePath = instance?.worktreePath || home
 
-    await sendEvent('log', { line: `[claude] Starting /shopware-resolve ${issue}`, ts: Date.now() })
+    // Echo the resolved backend (and what the client raw-sent) so a
+    // codex-vs-claude mismatch is unmissable in the log.  Used to be
+    // hard-coded `[claude]` here even when the spawn was Codex.
+    const rawShown = backendRaw ? backendRaw : '(none — server defaulted)'
+    await sendEvent('log', {
+      line: `[${backend}] backend resolved (client sent: ${rawShown})`,
+      ts: Date.now(),
+    })
+    await sendEvent('log', {
+      line: `[${backend}] Starting /shopware-resolve ${issue}`,
+      ts: Date.now(),
+    })
 
-    // Step 3: Launch Claude Code
+    // Step 3: Launch the agent (Claude or Codex) via buildSpawnArgs below.
     //
     // Non-interactive runs need every tool Claude will use to be allow-listed
     // up-front — otherwise `Bash(gh …)`, `Bash(git commit …)`, etc. sit
@@ -758,23 +1078,18 @@ export function startResolveStream(
     //
     // `--effort max` gives each turn the widest thinking budget so the skill
     // has room to actually execute every step instead of rushing to a summary.
+    //
+    // The dead `claudeArgs` literal that used to live here was a v0.5.7
+    // remnant; PR #6's `buildSpawnArgs` replaced it.  Removed in this
+    // commit (was triggering TS2454 once the prompt build moved below).
     const allowedTools = [
       'Bash', 'Edit', 'Write', 'Read', 'Grep', 'Glob',
       'Task', 'WebFetch', 'WebSearch', 'TodoWrite',
     ].join(' ')
     // Pre-assign a session id so we can `claude --resume <uuid>` later
-    // from the /api/skill/resolve/resume/stream endpoint.
+    // from the /api/skill/resolve/resume/stream endpoint.  Codex ignores
+    // it (its session model is server-managed under ~/.codex/sessions/).
     const sessionId = newSessionId()
-    const claudeArgs = [
-      '-p', prompt,
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--permission-mode', 'acceptEdits',
-      '--allowedTools', allowedTools,
-      '--session-id', sessionId,
-      '--effort', 'max',
-      '--add-dir', worktreePath,
-    ]
 
     // Persist the session id + running status up-front so a crash/abort
     // still leaves something the UI can resume from.  Also pin the
@@ -801,19 +1116,43 @@ export function startResolveStream(
     })
 
     const startTime = Date.now()
-    // Codex flag surface differs from Claude's; for MVP we only wire the
-    // claude path end-to-end.  A codex-backed resolve via the UI falls
-    // back to the claude CLI here and logs a warning — users wanting
-    // codex today should use `swctl resolve --backend=codex` from the
-    // CLI.  A follow-up will read `codex --help` and wire up the real
-    // stream-json equivalent.
-    if (backend !== 'claude') {
+    // Build the per-backend prompt now that worktreePath is known.  Claude
+    // gets the slash-command form (the bundled SKILL.md does the heavy
+    // lifting); Codex gets a concrete task description that explicitly
+    // tells it to commit per step — without that, `codex exec --full-auto`
+    // chats but doesn't write, and the diff tab shows "No commits on
+    // fix/<id> vs trunk".  See buildResolvePrompt for the full rationale.
+    const prompt = buildResolvePrompt({ backend, issue, issueId, worktreePath })
+
+    // Resolve the actual (bin, args) pair for the SELECTED backend.  Before
+    // v0.5.10 this block hard-coded `backendBinary('claude')` with a
+    // "falling back to claude" warning log — so picking Codex in the UI
+    // still spawned Claude.  The user hit this: the resolve log showed
+    // `[claude] Starting /shopware-resolve ...` and `session started
+    // model=claude-opus-4-7` even though they'd selected Codex.
+    const spawnPlan = buildSpawnArgs({
+      backend,
+      prompt,
+      sessionId,
+      worktreePath,
+      allowedTools,
+    })
+    await sendEvent('log', {
+      line: `[${backend}] launching: ${spawnPlan.bin} ${spawnPlan.args.slice(0, 4).join(' ')}…`,
+      ts: Date.now(),
+    })
+    if (backend === 'codex') {
+      // Codex's resume is a separate CLI subcommand (`codex exec resume
+      // --last|<id>`) — incompatible with Claude's pre-assigned UUID
+      // model.  The `swctl resolve resume/ask` flows below still
+      // spawn Claude for Codex-backed instances until that plumbing
+      // lands.  First-run works; follow-ups fall back with a warning.
       await sendEvent('log', {
-        line: `[resolve] backend=${backend} is not yet supported from the UI; falling back to claude for this run. Use 'swctl resolve --backend=${backend}' from the CLI for now.`,
+        line: `[codex] note: resume/ask for Codex-backed instances is not yet wired — use the CLI ('swctl resolve ask ${issueId} ...') until then.`,
         ts: Date.now(),
       })
     }
-    const child = spawn(backendBinary('claude'), claudeArgs, {
+    const child = spawn(spawnPlan.bin, spawnPlan.args, {
       cwd: worktreePath,
       env: { ...process.env, HOME: home, TERM: 'dumb' },
       stdio: ['ignore', 'pipe', 'pipe'],

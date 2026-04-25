@@ -57,6 +57,44 @@ export async function fetchPrInfo(issueId: string): Promise<PrInfo> {
   return res.json()
 }
 
+// ── Transcript ────────────────────────────────────────────────────────────
+
+export interface TranscriptRow {
+  ts: number
+  line: string
+}
+
+export interface TranscriptStepTokens {
+  input: number
+  cachedInput: number
+  output: number
+  reasoning: number
+}
+
+export interface TranscriptStep {
+  /** 0 = preamble (lines before any STEP marker), 1-8 = workflow steps. */
+  step: number
+  name: string
+  lines: TranscriptRow[]
+  tokens: TranscriptStepTokens
+  durationMs: number
+}
+
+export interface Transcript {
+  steps: TranscriptStep[]
+  totals: {
+    tokens: TranscriptStepTokens
+    costUsd: number | null
+    durationMs: number
+    lineCount: number
+  }
+}
+
+export async function fetchTranscript(issueId: string): Promise<Transcript> {
+  const res = await fetch(`${BASE}/transcript?issueId=${encodeURIComponent(issueId)}`)
+  return res.json()
+}
+
 export interface PrCreatePreview {
   ok: boolean
   error?: string

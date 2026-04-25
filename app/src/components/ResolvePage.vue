@@ -4,8 +4,8 @@ import { useInstances } from '@/composables/useInstances'
 import { useStream } from '@/composables/useStream'
 import { useResolve } from '@/composables/useResolve'
 import { fetchDiff, fetchGitHubIssues, fetchDefaultIssueLabels } from '@/api'
-import { buildResolveStreamUrl, buildAskStreamUrl, finishResolve } from '@/api/resolve'
-import type { PrInfo, ResolveBackend } from '@/api/resolve'
+import { buildResolveStreamUrl, buildAskStreamUrl, finishResolve, fetchTranscript } from '@/api/resolve'
+import type { PrInfo, ResolveBackend, Transcript } from '@/api/resolve'
 import type { GitHubItem } from '@/types'
 import { filterResolvableIssues } from '@/utils/filterResolvable'
 import LogPanel from './LogPanel.vue'
@@ -17,7 +17,7 @@ const askStream = useStream()
 
 // State
 const selectedIssueId = ref<string>('')
-const activeTab = ref<'diff' | 'claude' | 'pr'>('diff')
+const activeTab = ref<'diff' | 'claude' | 'pr' | 'transcript'>('diff')
 const askMessage = ref('')
 const prInfo = ref<PrInfo | null>(null)
 const prLoading = ref(false)
@@ -26,6 +26,11 @@ const diffStat = ref('')
 const diffContent = ref('')
 const diffLoading = ref(false)
 const newIssueUrl = ref('')
+const transcript = ref<Transcript | null>(null)
+const transcriptLoading = ref(false)
+// Step expansion state — by step number.  Default to expanded for the
+// last step (most recent activity) and collapsed for everything else.
+const expandedSteps = ref<Set<number>>(new Set())
 
 // Backend picker — persisted to localStorage so the user's last choice
 // sticks across page loads.  Defaults to 'claude' (matches the server
@@ -156,6 +161,58 @@ watch([selectedIssueId, activeTab], async () => {
   }
 })
 
+// Load transcript when tab switches to transcript.  No polling: the
+// transcript is a snapshot of a finished (or in-progress, but the user
+// is reading retrospectively) run.  If the user wants live updates
+// during a running resolve they'd be on the Claude tab anyway.
+watch([selectedIssueId, activeTab], async () => {
+  if (activeTab.value !== 'transcript' || !selectedIssueId.value) return
+  transcriptLoading.value = true
+  try {
+    transcript.value = await fetchTranscript(selectedIssueId.value)
+    // Auto-expand the highest-numbered step (most recent activity).
+    const last = transcript.value?.steps[transcript.value.steps.length - 1]
+    if (last) expandedSteps.value = new Set([last.step])
+  } catch {
+    transcript.value = null
+  } finally {
+    transcriptLoading.value = false
+  }
+})
+
+function toggleStep(n: number): void {
+  const s = new Set(expandedSteps.value)
+  if (s.has(n)) s.delete(n)
+  else s.add(n)
+  expandedSteps.value = s
+}
+
+/** Format token counts with thousand-separators; "—" for zero so the eye skips empty cells. */
+function fmtTokens(n: number): string {
+  return n > 0 ? n.toLocaleString() : '—'
+}
+
+/** Format ms as "1.2s" / "3m 4s" / "1h 2m" — short, scannable. */
+function fmtDuration(ms: number): string {
+  if (!ms || ms < 0) return '—'
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60), rs = s % 60
+  if (m < 60) return rs ? `${m}m ${rs}s` : `${m}m`
+  const h = Math.floor(m / 60), rm = m % 60
+  return rm ? `${h}h ${rm}m` : `${h}h`
+}
+
+function fmtCost(usd: number | null): string {
+  if (usd === null || usd === undefined) return '—'
+  return `$${usd.toFixed(2)}`
+}
+
+function stepHeading(s: { step: number; name: string }): string {
+  if (s.step === 0) return 'Preamble'
+  return s.name ? `Step ${s.step}: ${s.name}` : `Step ${s.step}`
+}
+
 function selectIssue(issueId: string) {
   selectedIssueId.value = issueId
   activeTab.value = 'diff'
@@ -270,6 +327,13 @@ onMounted(async () => {
   await refreshRuns()
   if (resolveInstances.value.length > 0) {
     selectIssue((resolveInstances.value[0] as any).issueId)
+  } else {
+    // Empty Issues sidebar — auto-expand Browse GitHub so the user lands
+    // on a populated list of things they can start a resolve on, instead
+    // of staring at "0 issues" with no obvious next step.  Mirrors the
+    // empty-state hint rendered in the Issues panel below.
+    ghShow.value = true
+    void refreshGh()
   }
 })
 </script>
@@ -284,6 +348,25 @@ onMounted(async () => {
       </div>
 
       <div class="overflow-y-auto flex-1">
+        <!-- Empty state — no in-flight resolves.  Points the user at the
+             two ways to start one (Browse GitHub picker below, or the
+             paste-URL input above the sidebar) so an empty sidebar
+             doesn't look like the page is broken. -->
+        <div
+          v-if="resolveInstances.length === 0"
+          class="px-3 py-4 text-xs text-gray-500 leading-relaxed"
+        >
+          <p class="text-gray-400 mb-2">No active resolves yet.</p>
+          <p>
+            Pick one from
+            <button
+              class="text-blue-400 hover:text-blue-300 underline-offset-2 hover:underline"
+              @click="ghShow ? null : toggleGhPicker()"
+            >Browse GitHub</button>
+            below, or paste an issue URL into the input above.
+          </p>
+        </div>
+
         <button
           v-for="inst in resolveInstances"
           :key="(inst as any).issueId"
@@ -435,7 +518,7 @@ onMounted(async () => {
       <!-- Tabs -->
       <div class="flex border-b border-border">
         <button
-          v-for="tab in (['diff', 'claude', 'pr'] as const)"
+          v-for="tab in (['diff', 'claude', 'transcript', 'pr'] as const)"
           :key="tab"
           class="px-4 py-2 text-sm transition-colors"
           :class="activeTab === tab
@@ -443,7 +526,7 @@ onMounted(async () => {
             : 'text-gray-500 hover:text-gray-300'"
           @click="activeTab = tab"
         >
-          {{ tab === 'diff' ? 'Diff' : tab === 'claude' ? 'Claude' : 'PR' }}
+          {{ tab === 'diff' ? 'Diff' : tab === 'claude' ? 'Claude' : tab === 'transcript' ? 'Transcript' : 'PR' }}
         </button>
         <div class="flex-1" />
         <div class="px-3 py-2 text-xs text-gray-500">
@@ -501,6 +584,79 @@ onMounted(async () => {
             :disabled="!askMessage || askStream.running.value"
             @click="sendAsk"
           >Send</button>
+        </div>
+      </div>
+
+      <!-- Transcript tab — segmented per-step view of the persisted resolve log -->
+      <div v-if="activeTab === 'transcript'" class="flex-1 overflow-auto">
+        <div v-if="transcriptLoading" class="p-4 text-gray-500 text-sm">Loading transcript...</div>
+        <div v-else-if="!transcript || transcript.steps.length === 0" class="p-4 text-gray-500 text-sm">
+          No transcript yet. Start a resolve run from the issue list — every line streamed during the run is persisted here.
+        </div>
+        <div v-else class="flex flex-col h-full">
+          <!-- Totals strip — sticky header, glanceable at any scroll position. -->
+          <div class="px-4 py-2 border-b border-border bg-surface-dark text-xs flex flex-wrap gap-x-6 gap-y-1">
+            <span class="text-gray-500">Total:</span>
+            <span class="text-gray-300">
+              <span class="text-blue-400">{{ fmtTokens(transcript.totals.tokens.input) }}</span>
+              in
+              <span v-if="transcript.totals.tokens.cachedInput > 0" class="text-gray-500">
+                ({{ fmtTokens(transcript.totals.tokens.cachedInput) }} cached)
+              </span>
+            </span>
+            <span class="text-gray-300">
+              <span class="text-emerald-400">{{ fmtTokens(transcript.totals.tokens.output) }}</span>
+              out
+            </span>
+            <span v-if="transcript.totals.tokens.reasoning > 0" class="text-gray-300">
+              <span class="text-purple-400">{{ fmtTokens(transcript.totals.tokens.reasoning) }}</span>
+              reasoning
+            </span>
+            <span v-if="transcript.totals.costUsd !== null" class="text-gray-300">
+              <span class="text-yellow-400">{{ fmtCost(transcript.totals.costUsd) }}</span>
+            </span>
+            <span class="text-gray-500 ml-auto">
+              {{ fmtDuration(transcript.totals.durationMs) }} · {{ transcript.totals.lineCount }} lines
+            </span>
+          </div>
+
+          <!-- Per-step accordion -->
+          <div class="flex-1 overflow-auto">
+            <div
+              v-for="step in transcript.steps"
+              :key="step.step"
+              class="border-b border-border last:border-b-0"
+            >
+              <!-- Header row — click to expand/collapse. -->
+              <button
+                class="w-full flex items-center gap-3 px-4 py-2 text-left hover:bg-surface-hover transition-colors"
+                @click="toggleStep(step.step)"
+              >
+                <span class="text-gray-500 text-xs w-3">{{ expandedSteps.has(step.step) ? '▾' : '▸' }}</span>
+                <span class="text-sm text-white font-medium flex-1 truncate">{{ stepHeading(step) }}</span>
+                <span class="text-[11px] text-gray-500 shrink-0">{{ step.lines.length }} lines</span>
+                <span class="text-[11px] text-gray-500 shrink-0 w-12 text-right">{{ fmtDuration(step.durationMs) }}</span>
+                <span class="text-[11px] text-blue-400 shrink-0 w-16 text-right">{{ fmtTokens(step.tokens.input) }} in</span>
+                <span class="text-[11px] text-emerald-400 shrink-0 w-16 text-right">{{ fmtTokens(step.tokens.output) }} out</span>
+              </button>
+
+              <!-- Body — line list, monospace, plain.  Reuses no rendering
+                   logic from the resolve plugin (which formats Claude /
+                   Codex JSONL events as colored rows); the transcript view
+                   is intentionally raw — the user is here to scan the
+                   transcript, not relive the live experience. -->
+              <div
+                v-if="expandedSteps.has(step.step)"
+                class="px-4 pb-3 pt-1 bg-surface-dark"
+              >
+                <pre
+                  v-for="(row, i) in step.lines"
+                  :key="i"
+                  class="text-[11px] text-gray-300 leading-5 whitespace-pre-wrap break-words"
+                >{{ row.line }}</pre>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 

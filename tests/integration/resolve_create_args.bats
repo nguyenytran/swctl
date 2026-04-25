@@ -144,3 +144,42 @@ _probe() {
     actual="$(printf '%s' "$output" | jq -c .)"
     [ "$actual" = "$expected" ]
 }
+
+# ---------------------------------------------------------------------------
+# Branch slug — readable suffix derived from the issue title.
+# ---------------------------------------------------------------------------
+
+@test "branchSlug present: branch becomes <prefix>/<id>-<slug>" {
+    _probe '{"issueId":"6689","branchPrefix":"fix","project":null,"mode":"qa","branchSlug":"manufacturer-language-switch"}'
+    last="$(printf '%s' "$output" | jq -r '.[-1]')"
+    [ "$last" = "fix/6689-manufacturer-language-switch" ]
+}
+
+@test "branchSlug empty string: legacy <prefix>/<id> shape (regression-safe)" {
+    _probe '{"issueId":"6689","branchPrefix":"fix","project":null,"mode":"qa","branchSlug":""}'
+    last="$(printf '%s' "$output" | jq -r '.[-1]')"
+    [ "$last" = "fix/6689" ]
+}
+
+@test "branchSlug undefined: legacy <prefix>/<id> shape (back-compat)" {
+    # Field not present at all — existing callers / tests that pre-date
+    # the slug feature must keep producing the same argv.
+    _probe '{"issueId":"6689","branchPrefix":"fix","project":null,"mode":"qa"}'
+    last="$(printf '%s' "$output" | jq -r '.[-1]')"
+    [ "$last" = "fix/6689" ]
+}
+
+@test "branchSlug whitespace-only: trimmed to empty → legacy shape" {
+    _probe '{"issueId":"6689","branchPrefix":"fix","project":null,"mode":"qa","branchSlug":"   "}'
+    last="$(printf '%s' "$output" | jq -r '.[-1]')"
+    [ "$last" = "fix/6689" ]
+}
+
+@test "branchSlug with project: <prefix>/<id>-<slug> still applies" {
+    _probe '{"issueId":"5523","branchPrefix":"fix","project":"SwagCommercial","mode":"qa","branchSlug":"cart-recalc-bug"}'
+    last="$(printf '%s' "$output" | jq -r '.[-1]')"
+    [ "$last" = "fix/5523-cart-recalc-bug" ]
+    # Project flag is unchanged
+    has_project="$(printf '%s' "$output" | jq 'any(. == "SwagCommercial")')"
+    [ "$has_project" = "true" ]
+}

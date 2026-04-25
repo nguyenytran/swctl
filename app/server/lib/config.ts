@@ -18,6 +18,16 @@ const CONFIG_FILE =
   process.env.SWCTL_CONFIG_FILE ||
   path.join(process.env.HOME || '/root', '.swctl/config.json')
 
+/**
+ * Backends swctl knows how to spawn for the resolve workflow.  Add a new
+ * one here, then teach `_ai_*` (bash) and `buildSpawnArgs` (TS) about it.
+ *
+ * Exported as a const tuple so the validators / UI can iterate without
+ * duplicating the list.
+ */
+export const KNOWN_BACKENDS = ['claude', 'codex'] as const
+export type KnownBackend = typeof KNOWN_BACKENDS[number]
+
 export interface UserConfig {
   features: {
     /**
@@ -28,8 +38,20 @@ export interface UserConfig {
     resolveEnabled?: boolean
   }
   ai: {
-    /** "claude" | "codex" — default backend for new resolves. */
-    defaultBackend?: 'claude' | 'codex'
+    /**
+     * Default backend for new resolves.  MUST be one of `enabledBackends`
+     * (validated on PUT — caller gets a 400 if not).  Selecting in the
+     * resolve form's AI dropdown overrides this per-issue, but only
+     * within the enabled set.
+     */
+    defaultBackend?: KnownBackend
+    /**
+     * Subset of `KNOWN_BACKENDS` the user has opted into.  An empty/missing
+     * list defaults to `['claude']` for back-compat with pre-redesign
+     * configs that only had `defaultBackend`.  Resolve UI's backend
+     * dropdown only shows these values.
+     */
+    enabledBackends?: KnownBackend[]
     claude?: {
       bin?: string
       configDir?: string
@@ -39,6 +61,42 @@ export interface UserConfig {
       configDir?: string
     }
   }
+}
+
+/**
+ * Resolve which backends are enabled, applying the back-compat default
+ * when the field is missing.  Centralised so every reader (server,
+ * plugin via the API response, tests) agrees on the rule:
+ *
+ *   - explicit non-empty list → use it (de-duped, filtered to known)
+ *   - missing OR empty        → ['claude']  (the pre-redesign default)
+ *   - includes only unknown   → ['claude']  (defensive — config is
+ *                                            recoverable rather than
+ *                                            "no backends" deadlock)
+ */
+export function resolveEnabledBackends(config: UserConfig): KnownBackend[] {
+  const raw = config.ai?.enabledBackends ?? []
+  const filtered = raw.filter((b): b is KnownBackend => (KNOWN_BACKENDS as readonly string[]).includes(b))
+  // Dedupe while preserving first-occurrence order — set semantics, but
+  // the order users picked in the UI is meaningful for "first enabled" fallbacks.
+  const seen = new Set<KnownBackend>()
+  const out: KnownBackend[] = []
+  for (const b of filtered) if (!seen.has(b)) { seen.add(b); out.push(b) }
+  return out.length > 0 ? out : ['claude']
+}
+
+/**
+ * Resolve the effective default backend, applying the
+ * "must-be-enabled" invariant.  Returns the first enabled backend
+ * when defaultBackend is missing OR refers to a now-disabled backend
+ * (which can happen if the user disabled their default-of-record without
+ * picking a new one — be forgiving rather than throwing).
+ */
+export function resolveDefaultBackend(config: UserConfig): KnownBackend {
+  const enabled = resolveEnabledBackends(config)
+  const def = config.ai?.defaultBackend
+  if (def && enabled.includes(def)) return def
+  return enabled[0]   // resolveEnabledBackends guarantees length ≥ 1
 }
 
 /** Read + parse the user config file.  Never throws — returns defaults. */
@@ -121,6 +179,10 @@ export function writeUserConfig(next: Partial<UserConfig> | null | undefined): U
   // Merge two levels deep for `ai` so e.g. saving just `ai.defaultBackend`
   // doesn't clobber `ai.claude.*` or `ai.codex.*`.  `stripUndefined`
   // at every level keeps "absent key" distinct from "set to undefined."
+  //
+  // `enabledBackends` is an array — overwrite-on-supply, preserve-on-absent.
+  // (We don't union-merge: if the user unticks a backend in the UI,
+  // the resulting array MUST replace the on-disk list, not merge with it.)
   const merged: UserConfig = {
     features: { ...curFeatures, ...nextFeatures },
     ai: {
@@ -141,6 +203,197 @@ export function writeUserConfig(next: Partial<UserConfig> | null | undefined): U
 /** Absolute path to the config file (for `swctl config path` parity). */
 export function configFilePath(): string {
   return CONFIG_FILE
+}
+
+/**
+ * Per-backend skill installation status.  Used by the Config page's
+ * "Test skill" button (and the equivalent /api/user-config/test-skill
+ * endpoint) to give the user a one-click "yes, the agent will
+ * actually find shopware-resolve when it runs" signal.
+ *
+ * Static check only — file existence + content match — no spawn.  If
+ * a future heavier "spawn the agent and ask it to list skills" probe
+ * lands, it goes alongside, not in place of, this fast pre-flight.
+ *
+ * Per backend:
+ *
+ *   claude  Symlink/dir at <claude-config-dir>/skills/shopware-resolve.
+ *           SKILL.md inside has YAML front-matter `name: shopware-resolve`.
+ *           Claude Code's slash-command discovery walks that directory
+ *           tree at startup, so file presence ≡ skill discoverability.
+ *
+ *   codex   <codex-config-dir>/AGENTS.md exists and contains the
+ *           swctl-managed marker block.  Inside the block, the skill's
+ *           own SKILL.md was spliced verbatim so its `name:` line is
+ *           still present.  Codex reads AGENTS.md on every run, so
+ *           presence-of-block ≡ ambient-context-availability.
+ */
+export interface SkillTestResult {
+  ok: boolean
+  backend: KnownBackend
+  /** Absolute path the test inspected (regardless of pass/fail). */
+  location: string
+  /** Human-readable detail; mostly relevant on failure but also used
+   *  to confirm "yes, this is the version you just installed". */
+  detail: string
+  /** Failure reason — null on success. */
+  error?: string
+}
+
+const SKILL_NAME = 'shopware-resolve'
+const CODEX_BLOCK_BEGIN = '<!-- swctl:shopware-resolve:begin -->'
+const CODEX_BLOCK_END   = '<!-- swctl:shopware-resolve:end -->'
+
+/**
+ * Smoke-test the skill install for a backend.  The check is the
+ * minimum that distinguishes "installed and the agent will find it"
+ * from "the install command pretended to succeed but the file is
+ * absent or has been edited away."
+ */
+export function testSkillInstall(backend: KnownBackend): SkillTestResult {
+  const cfgDir = configDirFor(backend)
+
+  if (backend === 'claude') {
+    const dir  = path.join(cfgDir, 'skills', SKILL_NAME)
+    const file = path.join(dir, 'SKILL.md')
+    if (!fs.existsSync(file)) {
+      return {
+        ok: false, backend, location: file, detail: 'SKILL.md not found',
+        error: `Run \`swctl skill install --user --target claude\` on the host to create the symlink at ${dir}.`,
+      }
+    }
+    let body: string
+    try { body = fs.readFileSync(file, 'utf-8') }
+    catch (e: any) {
+      return { ok: false, backend, location: file, detail: 'unreadable', error: e?.message || String(e) }
+    }
+    const frontMatter = readSkillFrontMatterName(body)
+    if (frontMatter !== SKILL_NAME) {
+      return {
+        ok: false, backend, location: file,
+        detail: `front-matter name was "${frontMatter ?? '(missing)'}", expected "${SKILL_NAME}"`,
+        error: 'SKILL.md is present but doesn\'t look like our shopware-resolve skill — was it overwritten?',
+      }
+    }
+    return {
+      ok: true, backend, location: file,
+      detail: `present — ${body.length.toLocaleString()} bytes, name=${frontMatter}`,
+    }
+  }
+
+  // codex — block in AGENTS.md
+  const file = path.join(cfgDir, 'AGENTS.md')
+  if (!fs.existsSync(file)) {
+    return {
+      ok: false, backend, location: file, detail: 'AGENTS.md not found',
+      error: `Run \`swctl skill install --user --target codex\` on the host to create the file with the skill block.`,
+    }
+  }
+  let body: string
+  try { body = fs.readFileSync(file, 'utf-8') }
+  catch (e: any) {
+    return { ok: false, backend, location: file, detail: 'unreadable', error: e?.message || String(e) }
+  }
+  const beginIdx = body.indexOf(CODEX_BLOCK_BEGIN)
+  const endIdx   = body.indexOf(CODEX_BLOCK_END)
+  if (beginIdx < 0 || endIdx < 0 || endIdx < beginIdx) {
+    return {
+      ok: false, backend, location: file,
+      detail: 'swctl-managed block missing',
+      error: 'AGENTS.md exists but lacks the `<!-- swctl:shopware-resolve:* -->` markers — ' +
+             'reinstall via `swctl skill install --user --target codex`.',
+    }
+  }
+  const block = body.slice(beginIdx, endIdx + CODEX_BLOCK_END.length)
+  const blockBody = body.slice(beginIdx + CODEX_BLOCK_BEGIN.length, endIdx)
+  const frontMatter = readSkillFrontMatterName(blockBody)
+  if (frontMatter !== SKILL_NAME) {
+    return {
+      ok: false, backend, location: file,
+      detail: `block present but name="${frontMatter ?? '(missing)'}"`,
+      error: 'AGENTS.md has the markers but no `name: shopware-resolve` front-matter inside — ' +
+             'block was edited; reinstall to repair.',
+    }
+  }
+  return {
+    ok: true, backend, location: file,
+    detail: `block present — ${block.length.toLocaleString()} bytes between markers, name=${frontMatter}`,
+  }
+}
+
+/** Compute the per-backend config dir, mirroring `_ai_backend_config_dir` in swctl. */
+function configDirFor(backend: KnownBackend): string {
+  if (backend === 'claude') {
+    return process.env.CLAUDE_CONFIG_DIR
+        || readUserConfig().ai?.claude?.configDir
+        || path.join(process.env.HOME || '/root', '.claude')
+  }
+  return process.env.CODEX_CONFIG_DIR
+      || readUserConfig().ai?.codex?.configDir
+      || path.join(process.env.HOME || '/root', '.codex')
+}
+
+/**
+ * Pull `name: <value>` out of a SKILL.md front-matter block.  Tolerant
+ * — only matches at the start of a line, ignores leading/trailing
+ * whitespace, accepts both `"shopware-resolve"` and bare token.  Used
+ * by both backends since the codex install splices SKILL.md verbatim
+ * into AGENTS.md, so the front-matter is the same shape.
+ */
+function readSkillFrontMatterName(body: string): string | null {
+  const m = body.match(/^name:\s*['"]?([A-Za-z0-9_.\-]+)['"]?\s*$/m)
+  return m ? m[1] : null
+}
+
+/**
+ * Pre-write validation of the AI section.  Checks the cross-field
+ * invariants that read-time fallbacks would happily paper over but the
+ * user probably didn't intend.  Returns null if OK, an error message if
+ * not.
+ *
+ * Rules:
+ *  - If `enabledBackends` is supplied, it must be a non-empty array.
+ *    "no backends" is a misconfiguration that breaks the resolve flow.
+ *  - Every entry of `enabledBackends` must be a known backend.
+ *  - If `defaultBackend` is supplied, it must be in `enabledBackends`
+ *    (or, when `enabledBackends` isn't supplied in this PUT, in the
+ *    on-disk effective list — we read it via resolveEnabledBackends
+ *    so a partial save doesn't pin to a stale list).
+ *
+ * Called by the PUT handler before writeUserConfig so a 400 reaches the
+ * UI with an actionable message; the writer itself stays terse.
+ */
+export function validateAiConfig(
+  next: Partial<UserConfig> | null | undefined,
+  current: UserConfig,
+): string | null {
+  const ai = next?.ai
+  if (!ai) return null
+
+  if (ai.enabledBackends !== undefined) {
+    if (!Array.isArray(ai.enabledBackends) || ai.enabledBackends.length === 0) {
+      return 'enabledBackends must be a non-empty array (at least one backend has to be on, otherwise the resolve flow has nothing to spawn)'
+    }
+    for (const b of ai.enabledBackends) {
+      if (!(KNOWN_BACKENDS as readonly string[]).includes(b)) {
+        return `enabledBackends contains unknown backend "${b}"; allowed: ${KNOWN_BACKENDS.join(', ')}`
+      }
+    }
+  }
+
+  if (ai.defaultBackend !== undefined) {
+    if (!(KNOWN_BACKENDS as readonly string[]).includes(ai.defaultBackend)) {
+      return `defaultBackend "${ai.defaultBackend}" is not a known backend; allowed: ${KNOWN_BACKENDS.join(', ')}`
+    }
+    // Build the effective enabled list as it would be POST-merge:
+    // explicit incoming list wins, otherwise fall back to current.
+    const effective = ai.enabledBackends ?? resolveEnabledBackends(current)
+    if (!effective.includes(ai.defaultBackend)) {
+      return `defaultBackend "${ai.defaultBackend}" must be one of enabledBackends (${effective.join(', ')})`
+    }
+  }
+
+  return null
 }
 
 /**

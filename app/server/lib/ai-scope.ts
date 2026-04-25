@@ -57,7 +57,16 @@ export interface AiScopeDecision {
   method: 'heuristic' | 'ai' | 'fallback'
 }
 
-const AI_TIMEOUT_MS = 12_000
+// Per-backend timeouts.  Claude (-p single-shot) usually returns in
+// 3-6s; Codex's first invocation is slower (~15-25s — model warmup,
+// auth/login state checks, sandbox setup) so a single number doesn't
+// fit both.  These match the slowest p99 we've seen in practice with
+// some headroom; tune via env if your model picks a different one.
+const AI_TIMEOUT_CLAUDE_MS = 12_000
+const AI_TIMEOUT_CODEX_MS  = 30_000
+function aiTimeoutFor(backend: ResolveBackend): number {
+  return backend === 'codex' ? AI_TIMEOUT_CODEX_MS : AI_TIMEOUT_CLAUDE_MS
+}
 const MAX_STDOUT_BYTES = 16 * 1024 // AI is asked for a ~200 B JSON object
 const STDOUT_LOG_CAP = 120
 
@@ -91,9 +100,10 @@ export async function detectScopeWithAI(input: AiScopeInput): Promise<AiScopeDec
   const bin = backendBinary(input.backend)
   const prompt = buildPrompt(input)
   const args = buildArgs(input.backend, prompt)
+  const timeoutMs = aiTimeoutFor(input.backend)
 
   try {
-    const stdout = await runOnce(bin, args, AI_TIMEOUT_MS)
+    const stdout = await runOnce(bin, args, timeoutMs)
     const parsed = parseDecision(stdout, input.pluginNames)
     if (!parsed) {
       return fallback(input, heuristicProject, heuristicPrefix, bin,
@@ -104,7 +114,7 @@ export async function detectScopeWithAI(input: AiScopeInput): Promise<AiScopeDec
     const reason = err?.code === 'ENOENT'
       ? `binary not found (${bin})`
       : err?.code === 'ETIMEDOUT'
-        ? `timeout after ${AI_TIMEOUT_MS} ms`
+        ? `timeout after ${timeoutMs} ms`
         : err?.message || String(err)
     return fallback(input, heuristicProject, heuristicPrefix, bin, reason)
   }
@@ -146,9 +156,26 @@ function buildPrompt(input: AiScopeInput): string {
 
 function buildArgs(backend: ResolveBackend, prompt: string): string[] {
   if (backend === 'codex') {
-    // Codex's `exec --message` is the one-shot equivalent of Claude's -p.
-    // MVP flag surface — matches what _ai_spawn_args uses on the bash side.
-    return ['exec', '--message', prompt]
+    // Codex 0.x's exec subcommand takes the prompt POSITIONALLY — there's
+    // no `--message` flag (that was an early MVP guess that exited 2).
+    // `--json` produces JSONL events; the parser walks every line for the
+    // schema-shaped decision object (Codex wraps the model output in
+    // `thread.started` / `item.completed` envelope events that the older
+    // "first balanced { }" extractor would mis-grab).
+    //
+    // `--dangerously-bypass-approvals-and-sandbox` rather than `--full-auto`:
+    // `--full-auto` triggers the workspace-write bwrap sandbox which
+    // requires unprivileged user namespaces — not available in the
+    // swctl-ui Alpine container.  Even if it did work, this call is
+    // pure classification (no FS writes), so a sandbox is over-spec.
+    // `--skip-git-repo-check` lets us run from any cwd.
+    return [
+      'exec',
+      '--json',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--skip-git-repo-check',
+      prompt,
+    ]
   }
   // Claude default.  `plan` permission mode blocks any tool usage (pure
   // classification — we don't want it editing files), and an empty
@@ -245,19 +272,53 @@ function runOnce(bin: string, args: string[], timeoutMs: number): Promise<string
 }
 
 /**
- * Extract the first balanced `{...}` block from stdout and validate against
- * the schema.  Returns null on any parse / validation failure — caller treats
- * as fallback.
+ * Walk every balanced `{...}` block in stdout, validating each against the
+ * decision schema.  Return the first match.
+ *
+ * Why not "first balanced object"?  Codex `--json` is JSONL with several
+ * envelope events per turn — `{"type":"thread.started",…}`,
+ * `{"type":"turn.started"}`, then `{"type":"item.completed","item":{…,"text":…}}`
+ * which actually contains the model's reply.  The decision JSON we want
+ * is buried in `item.text`, not at the top of stdout.  The previous
+ * "first balanced object" extractor always grabbed `thread.started` and
+ * fell through to fallback (user-reported as `[scope] fallback → … parse
+ * /schema failure: {"type":"thread.started",…}` for #6689).
+ *
+ * For Claude `-p --output-format text` stdout is the model reply directly,
+ * so the first balanced object IS the decision — both backends are
+ * handled by the same walker.  For maximum tolerance we also walk into
+ * `item.text` strings (which themselves contain nested JSON) — those are
+ * Codex's actual model output.
  */
 function parseDecision(stdout: string, pluginNames: string[]): Omit<AiScopeDecision, 'method'> | null {
-  const block = extractFirstJsonObject(stdout)
-  if (!block) return null
+  for (const block of iterateBalancedObjects(stdout)) {
+    const decision = tryDecision(block, pluginNames)
+    if (decision) return decision
 
+    // Codex envelope: { type: "item.completed", item: { type: "agent_message", text: "<JSON or prose>" } }
+    // The text payload may be the actual decision wrapped in prose.
+    let parsed: unknown
+    try { parsed = JSON.parse(block) } catch { continue }
+    const text = (parsed as any)?.item?.text
+    if (typeof text === 'string') {
+      for (const innerBlock of iterateBalancedObjects(text)) {
+        const innerDecision = tryDecision(innerBlock, pluginNames)
+        if (innerDecision) return innerDecision
+      }
+    }
+  }
+  return null
+}
+
+function tryDecision(block: string, pluginNames: string[]): Omit<AiScopeDecision, 'method'> | null {
   let obj: unknown
   try { obj = JSON.parse(block) } catch { return null }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null
 
   const o = obj as Record<string, unknown>
+  // Skip Codex envelope events fast — they don't carry `branchPrefix`.
+  if (typeof o.type === 'string' && !('branchPrefix' in o)) return null
+
   const project = o.project === null
     ? null
     : typeof o.project === 'string' && o.project.trim() !== ''
@@ -283,11 +344,11 @@ function parseDecision(stdout: string, pluginNames: string[]): Omit<AiScopeDecis
 }
 
 /**
- * Walk the string tracking brace depth; return the first balanced object.
- * Tolerates leading prose (some CLIs wrap output in "Assistant: {...}"),
- * trailing prose, and strings that contain braces.
+ * Generator that walks the string tracking brace depth and yields each
+ * balanced top-level `{...}` object.  Tolerates leading/trailing prose,
+ * strings that contain braces, and JSONL.
  */
-function extractFirstJsonObject(s: string): string | null {
+function* iterateBalancedObjects(s: string): Generator<string> {
   let start = -1
   let depth = 0
   let inString = false
@@ -306,10 +367,12 @@ function extractFirstJsonObject(s: string): string | null {
       depth++
     } else if (c === '}') {
       depth--
-      if (depth === 0 && start !== -1) return s.slice(start, i + 1)
+      if (depth === 0 && start !== -1) {
+        yield s.slice(start, i + 1)
+        start = -1
+      }
     }
   }
-  return null
 }
 
 function fallback(
