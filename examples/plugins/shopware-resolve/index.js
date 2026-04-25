@@ -22,6 +22,31 @@ async function fetchRuns() {
   }
 }
 
+// ---------- Backend (Claude / Codex) selection ----------
+//
+// The user's last AI-backend choice persists across reloads via
+// localStorage.  Initial value falls back to `claude` to match the
+// server-side default.  Eventually this should also seed from
+// `/api/user-config` (.ai.defaultBackend) — but localStorage wins
+// once the user has picked something explicitly in this UI.
+//
+// IMPORTANT: the user-facing radio in this plugin's create form is
+// what actually drives spawn.  Without passing `?backend=<value>` in
+// the stream URL, the server falls back to claude regardless of any
+// other config — which is exactly the bug a previous attempt left
+// in place.
+
+const BACKEND_LS_KEY = 'swctl.resolve.backend'
+function getBackend() {
+  try {
+    const v = localStorage.getItem(BACKEND_LS_KEY)
+    return v === 'codex' ? 'codex' : 'claude'
+  } catch { return 'claude' }
+}
+function setBackend(v) {
+  try { localStorage.setItem(BACKEND_LS_KEY, v === 'codex' ? 'codex' : 'claude') } catch {}
+}
+
 // ---------- Stream helper (used by route + action) ----------
 
 function startStream(issue, project, mode, out, onDone) {
@@ -29,6 +54,12 @@ function startStream(issue, project, mode, out, onDone) {
   params.set('issue', issue)
   if (project) params.set('project', project)
   if (mode) params.set('mode', mode)
+  // Forward the user-selected backend.  Server's `coerceBackend`
+  // treats any other value (or absent) as 'claude', so omitting it
+  // when the user picked Codex would silently spawn Claude — the
+  // exact bug PR #6's spawn fix exposed.
+  const backend = getBackend()
+  if (backend && backend !== 'claude') params.set('backend', backend)
 
   const url = `/api/skill/resolve/stream?${params.toString()}`
   const es = new EventSource(url)
@@ -74,6 +105,8 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
   params.set('issue', issue)
   if (project) params.set('project', project)
   if (mode) params.set('mode', mode)
+  const backend = getBackend()
+  if (backend && backend !== 'claude') params.set('backend', backend)
 
   const url = `/api/skill/resolve/stream?${params.toString()}`
   const es = new EventSource(url)
@@ -821,7 +854,21 @@ function renderResolvePage(el, ctx) {
             <input id="sr-repo" type="text" placeholder="Repository (e.g. shopware/shopware)" value="shopware/shopware" style="width:220px;flex:none;" />
             <button id="sr-fetch" class="sr-fetch-btn">Fetch issues</button>
             <button id="sr-run" disabled>Resolve selected</button>
-            <label class="sr-concurrency-label" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9ca3af;margin-left:auto;">
+            <!--
+              Backend selector — Claude (default) vs Codex.  The
+              chosen value is forwarded as a backend= query param on
+              the SSE stream URL; the server reads it and dispatches
+              to the right CLI in buildSpawnArgs.  Persisted to
+              localStorage so the choice sticks across reloads.
+            -->
+            <label class="sr-backend-label" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9ca3af;margin-left:auto;">
+              AI
+              <select id="sr-backend" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 6px;font-size:12px;">
+                <option value="claude">Claude</option>
+                <option value="codex">Codex</option>
+              </select>
+            </label>
+            <label class="sr-concurrency-label" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9ca3af;">
               Concurrency
               <select id="sr-concurrency" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 6px;font-size:12px;">
                 <option value="1">1</option>
@@ -1363,6 +1410,21 @@ function renderResolvePage(el, ctx) {
     manualInput.value = ''
     updateManualBtn()
   })
+
+  // ---- Backend dropdown ----------------------------------------------
+  //
+  // Reflects + persists `swctl.resolve.backend` in localStorage
+  // (same key the dead Vue ResolvePage.vue used, kept stable for
+  // forward-compat).  Without this binding, the user's pick never
+  // reaches the server: startStream / startStreamWithSteps both
+  // call getBackend(), which reads from this same key.
+  const backendSel = el.querySelector('#sr-backend')
+  if (backendSel) {
+    backendSel.value = getBackend()
+    backendSel.addEventListener('change', () => {
+      setBackend(backendSel.value)
+    })
+  }
 
   // Wire the concurrency dropdown.  Value persists in localStorage
   // under `swctl.resolve.concurrency`.  `auto` resolves at click time
