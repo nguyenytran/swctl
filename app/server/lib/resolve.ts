@@ -432,10 +432,11 @@ export function buildResolvePrompt(input: ResolvePromptInput): string {
       `Issue id:  ${input.issueId}    ← pass to swctl_setup in Step 5`,
       `Worktree:  ${input.worktreePath}    ← already on the fix branch; do all edits + commits here`,
       ``,
-      `Run-time invariants (this is a NON-INTERACTIVE \`codex exec --full-auto\` run):`,
-      `- Workspace-write sandbox granted; you have edit access to the`,
-      `  worktree above.  No human will approve anything mid-run; make`,
-      `  decisions and proceed.`,
+      `Run-time invariants (this is a NON-INTERACTIVE \`codex exec\` run with`,
+      `--dangerously-bypass-approvals-and-sandbox; the swctl-ui container is`,
+      `the actual sandbox):`,
+      `- Full edit access to the worktree above.  No human will approve`,
+      `  anything mid-run; make decisions and proceed.`,
       `- Run tests as part of Step 6.  Surface failures in the final summary.`,
       `- COMMIT each step's changes before moving on (use conventional-commit`,
       `  messages; reference issue ${input.issueId} in the body).  Codex's default`,
@@ -466,7 +467,17 @@ export function buildSpawnArgs(input: SpawnArgsInput): SpawnArgsResult {
       args: [
         'exec',
         '--json',
-        '--full-auto',
+        // Why not `--full-auto`?  `--full-auto` is shorthand for
+        // `--ask-for-approval=never --sandbox=workspace-write`, and the
+        // workspace-write sandbox uses bubblewrap (bwrap) on Linux.
+        // Our swctl-ui base image is Alpine without `kernel.unprivileged_userns_clone=1`,
+        // so bwrap fails with "No permissions to create a new namespace"
+        // on every write attempt — the run "succeeds" with zero edits.
+        // The whole swctl-ui container is already a hardened sandbox
+        // (read-only host bind-mounts, dedicated network, scoped to
+        // SWCTL_BROWSE_ROOT), so a second bwrap layer adds no security
+        // and breaks the agent.  Swap to the explicit bypass flag.
+        '--dangerously-bypass-approvals-and-sandbox',
         '--skip-git-repo-check',
         '--cd', input.worktreePath,
         input.prompt,
@@ -734,6 +745,22 @@ function observeStreamLine(state: ResolveStreamState, raw: string): void {
         }
       }
     }
+  }
+
+  // Codex JSONL: { type: "item.completed", item: { type: "agent_message", text } }
+  // Step markers live inside the agent_message text, mirroring Claude's
+  // stream-json shape — same regex, different envelope.
+  if (ev.type === 'item.completed' && ev.item?.type === 'agent_message' && typeof ev.item.text === 'string') {
+    const matches = ev.item.text.matchAll(/###\s*STEP\s+(\d)\s+END\b/gi)
+    for (const m of matches) {
+      state.lastCompletedStep = Math.max(state.lastCompletedStep, parseInt(m[1], 10))
+    }
+  }
+  // Codex thread.started carries the only session-id-like value Codex
+  // surfaces over `--json`.  Capturing it lets `swctl resolve resume`
+  // (when wired) target the right session.
+  if (ev.type === 'thread.started' && typeof ev.thread_id === 'string') {
+    if (!state.sessionId) state.sessionId = ev.thread_id
   }
 
   if (ev.type === 'result') {

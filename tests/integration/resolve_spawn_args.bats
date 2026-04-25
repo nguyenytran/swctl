@@ -115,10 +115,19 @@ _probe() {
     [ "$has_json" = "true" ]
 }
 
-@test "codex: args include --full-auto (unattended sandbox mode)" {
+@test "codex: args include --dangerously-bypass-approvals-and-sandbox (Alpine container is the sandbox)" {
+    # We deliberately do NOT use --full-auto.  --full-auto enables Codex's
+    # workspace-write bwrap sandbox, which requires unprivileged user
+    # namespaces and silently breaks every file write inside Alpine
+    # (bwrap: "No permissions to create a new namespace").  The swctl-ui
+    # container itself is the sandbox boundary.  Regression guard for
+    # the user-reported "0/8 steps emitted an END marker" failure.
     _probe '{"backend":"codex","prompt":"p","sessionId":"u","worktreePath":"/tmp/w","allowedTools":""}'
-    has_auto="$(printf '%s' "$output" | jq '.args | any(. == "--full-auto")')"
-    [ "$has_auto" = "true" ]
+    has_bypass="$(printf '%s' "$output" | jq '.args | any(. == "--dangerously-bypass-approvals-and-sandbox")')"
+    [ "$has_bypass" = "true" ]
+    # And explicitly assert the broken flag is NOT present.
+    has_full_auto="$(printf '%s' "$output" | jq '.args | any(. == "--full-auto")')"
+    [ "$has_full_auto" = "false" ]
 }
 
 @test "codex: args include --cd <worktreePath>" {

@@ -551,8 +551,96 @@ function renderLine(pre, raw) {
     return
   }
 
+  // ---- Codex `--json` JSONL events ----
+  // Codex wraps everything in turn / item envelopes.  We render only on
+  // item.completed (item.started would double-render) and decode the
+  // item-type payload into the same row vocabulary Claude already uses
+  // (text / tool_use / tool_result / banner) so the two backends look
+  // visually consistent.
+  if (type === 'thread.started') {
+    return row('sr-log-banner', `● codex session ${(event.thread_id || '').slice(0, 8) || 'started'}`)
+  }
+  if (type === 'turn.started' || type === 'item.started') {
+    // Suppress — turn.started carries no info; item.started is followed
+    // by item.completed which has the actual content.
+    return
+  }
+  if (type === 'turn.completed') {
+    const u = event.usage || {}
+    const tok = (u.input_tokens || 0) + (u.output_tokens || 0)
+    if (!tok) return
+    return row('sr-log-banner', `● turn complete (${tok.toLocaleString()} tokens)`)
+  }
+  if (type === 'thread.completed') {
+    return row('sr-log-banner-ok', `● codex session done`)
+  }
+  if (type === 'item.completed' && event.item && typeof event.item === 'object') {
+    return renderCodexItem(pre, row, event.item)
+  }
+
   // Unknown event types: show a compact one-liner
   row('sr-log-banner', `● ${type || 'event'}`)
+}
+
+/**
+ * Render one completed Codex item as the same kind of row Claude's
+ * stream-json blocks render to.  Item shape (Codex 0.x):
+ *   - { type: "agent_message", text: "..." }
+ *   - { type: "command_execution", command, aggregated_output, exit_code, status }
+ *   - { type: "file_change", changes: [{ path, kind: "add"|"update"|"delete" }], status }
+ */
+function renderCodexItem(pre, row, item) {
+  if (item.type === 'agent_message' && typeof item.text === 'string') {
+    // Reuse the same line-by-line + STEP marker logic as Claude's text blocks
+    const lines = item.text.split('\n')
+    for (const line of lines) {
+      if (!line.trim()) { row('sr-log-text', ' '); continue }
+      if (/^###\s*STEP\s+\d+\s+END\b/i.test(line)) { row('sr-log-step-end', line); continue }
+      if (/^###\s*STEP\s+\d+\s+START\b/i.test(line)) { row('sr-log-step', line); continue }
+      row('sr-log-text', line)
+    }
+    return
+  }
+
+  if (item.type === 'command_execution') {
+    const cmd = String(item.command || '').replace(/\s+/g, ' ').slice(0, 240)
+    row('sr-log-tool-bash', `▸ Bash: ${cmd}`)
+    const out = String(item.aggregated_output || '').replace(/\r\n/g, '\n')
+    if (out.trim()) {
+      const firstLine = (out.split('\n').find(l => l.trim()) || '').slice(0, 200)
+      const totalLines = out.split('\n').length
+      const code = item.exit_code
+      const err = (typeof code === 'number' && code !== 0) ? ` (exit ${code})` : ''
+      const container = document.createElement('div')
+      container.className = 'sr-log-row sr-log-result'
+      const head = document.createElement('div')
+      head.innerHTML = `<span class="sr-log-caret"></span>⤷ <span>${escape(firstLine)}</span><span style="color:#475569;margin-left:6px;">…(${totalLines} line${totalLines === 1 ? '' : 's'})${err}</span>`
+      const body = document.createElement('div')
+      body.className = 'sr-log-result-body'
+      body.textContent = out
+      body.style.display = 'none'
+      head.style.cursor = 'pointer'
+      head.addEventListener('click', () => {
+        body.style.display = body.style.display === 'none' ? 'block' : 'none'
+      })
+      container.appendChild(head)
+      container.appendChild(body)
+      pre.appendChild(container)
+      pre.scrollTop = pre.scrollHeight
+    }
+    return
+  }
+
+  if (item.type === 'file_change' && Array.isArray(item.changes)) {
+    for (const ch of item.changes) {
+      const verb = ch.kind === 'add' ? '✎ Add' : ch.kind === 'delete' ? '✎ Delete' : '✎ Edit'
+      row('sr-log-tool-edit', `${verb}: ${ch.path || ''}`)
+    }
+    return
+  }
+
+  // Unknown item type — fall back to a compact banner
+  row('sr-log-banner', `● ${item.type || 'item'}`)
 }
 
 function renderBlock(pre, row, block, eventType) {
