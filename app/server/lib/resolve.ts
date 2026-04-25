@@ -11,6 +11,7 @@ import { readProjects } from './projects.js'
 import { emit } from './events.js'
 import { isResolveEnabled } from './config.js'
 import { detectScopeWithAI, type AiScopeDecision } from './ai-scope.js'
+import { ensureTranscriptPath, appendTranscriptLine, resetTranscript } from './transcript.js'
 
 const STATE_DIR = process.env.SWCTL_STATE_DIR || ''
 const RUNS_FILE = STATE_DIR ? path.join(STATE_DIR, 'resolve-runs.json') : ''
@@ -881,8 +882,27 @@ export function startResolveStream(
 
   // Stream SSE: first create worktree, then launch Claude
   return streamSSE(c, async (stream) => {
+    // Persist every `log` event to the per-issue transcript so the user
+    // can scroll back through the run after the fact.  Writes are
+    // best-effort (a full disk shouldn't break the live SSE stream),
+    // and the transcript is truncated at the start of each fresh
+    // resolve so a retry doesn't bake the previous run's noise in.
+    const transcriptFile = ensureTranscriptPath(issueId)
+    if (transcriptFile) resetTranscript(transcriptFile)
+
     const sendEvent = async (event: string, data: object) => {
       try { await stream.writeSSE({ event, data: JSON.stringify(data) }) } catch {}
+      // Persist log events.  Other event types ('done', 'step-progress',
+      // etc.) are derived state — recompute on read from the line stream.
+      if (transcriptFile && event === 'log') {
+        const d = data as { line?: string; ts?: number }
+        if (typeof d.line === 'string') {
+          appendTranscriptLine(transcriptFile, {
+            ts: typeof d.ts === 'number' ? d.ts : Date.now(),
+            line: d.line,
+          })
+        }
+      }
     }
 
     // Step 1: Check if worktree already exists
@@ -1254,8 +1274,22 @@ export function startResolveResumeStream(
     `Pick up at Step ${nextStep} now, following the same ground rules from the skill.`
 
   return streamSSE(c, async (stream) => {
+    // Resume APPENDS to the existing transcript (no reset) — the user
+    // wants to see the full picture: original run's log + the resume
+    // continuation, in chronological order.
+    const transcriptFile = ensureTranscriptPath(issueId)
+
     const sendEvent = async (event: string, data: object) => {
       try { await stream.writeSSE({ event, data: JSON.stringify(data) }) } catch {}
+      if (transcriptFile && event === 'log') {
+        const d = data as { line?: string; ts?: number }
+        if (typeof d.line === 'string') {
+          appendTranscriptLine(transcriptFile, {
+            ts: typeof d.ts === 'number' ? d.ts : Date.now(),
+            line: d.line,
+          })
+        }
+      }
     }
 
     await sendEvent('log', { line: `[resume] Continuing session ${sessionId.slice(0, 8)}... from Step ${nextStep}`, ts: Date.now() })

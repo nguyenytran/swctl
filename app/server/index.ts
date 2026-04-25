@@ -28,6 +28,7 @@ import {
 } from './lib/github.js'
 import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
 import { startResolveStream, startResolveResumeStream, listResolveRuns, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
+import { transcriptPath, parseTranscript } from './lib/transcript.js'
 import {
   readUserConfig,
   writeUserConfig,
@@ -1516,6 +1517,31 @@ app.get('/api/skill/resolve/stream', (c) => {
 
 app.get('/api/skill/resolve/runs', (c) => {
   return c.json(listResolveRuns())
+})
+
+/**
+ * Per-issue transcript view.  Returns the segmented log + token totals
+ * the user can render in the Resolve page's "Transcript" tab.
+ *
+ * Endpoint reads the transcript JSONL from
+ *   <STATE_DIR>/instances/<projectSlug>/<issueId>.transcript.jsonl
+ * and segments it client-server-side (cheap regex walk; the transcript
+ * is bounded by run duration ~ thousands of lines).  No caching — the
+ * file is append-only and a live run can be polling this endpoint.
+ */
+app.get('/api/skill/resolve/transcript', (c) => {
+  const issueId = c.req.query('issueId') || ''
+  if (!issueId) return c.json({ error: 'Missing issueId' }, 400)
+  const file = transcriptPath(issueId)
+  if (!file) {
+    // No instance for this issue → empty transcript (not an error; the
+    // UI just shows an empty state).
+    return c.json({
+      steps: [],
+      totals: { tokens: { input: 0, cachedInput: 0, output: 0, reasoning: 0 }, costUsd: null, durationMs: 0, lineCount: 0 },
+    })
+  }
+  return c.json(parseTranscript(file))
 })
 
 // Resume a previously-interrupted resolve run for an issue, re-using
