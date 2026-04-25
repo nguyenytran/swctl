@@ -1418,17 +1418,70 @@ function renderResolvePage(el, ctx) {
 
   // ---- Backend dropdown ----------------------------------------------
   //
-  // Reflects + persists `swctl.resolve.backend` in localStorage
-  // (same key the dead Vue ResolvePage.vue used, kept stable for
-  // forward-compat).  Without this binding, the user's pick never
-  // reaches the server: startStream / startStreamWithSteps both
-  // call getBackend(), which reads from this same key.
+  // Reflects + persists `swctl.resolve.backend` in localStorage (same
+  // key the dead Vue ResolvePage.vue used, kept stable for forward-
+  // compat).  startStream / startStreamWithSteps read via getBackend()
+  // and forward as ?backend= on the SSE URL.
+  //
+  // The available options are filtered by `ai.enabledBackends` from
+  // `/api/user-config` — if the user disabled Codex in /#/config, this
+  // dropdown won't even show it.  Default selection comes from the
+  // server-side `resolved.defaultBackend` (which respects
+  // ai.defaultBackend, falling back to first-enabled).  localStorage
+  // wins iff the localStorage value is in the enabled set; otherwise
+  // we fall back to the resolved default to avoid a stale "Codex" pick
+  // surviving after the user disables it.
   const backendSel = el.querySelector('#sr-backend')
   if (backendSel) {
-    backendSel.value = getBackend()
-    backendSel.addEventListener('change', () => {
-      setBackend(backendSel.value)
-    })
+    ;(async () => {
+      let enabled = ['claude']           // safe back-compat fallback
+      let defaultBackend = 'claude'
+      try {
+        const res = await fetch('/api/user-config')
+        if (res.ok) {
+          const body = await res.json()
+          if (body?.resolved?.enabledBackends?.length) {
+            enabled = body.resolved.enabledBackends
+          }
+          if (body?.resolved?.defaultBackend) {
+            defaultBackend = body.resolved.defaultBackend
+          }
+        }
+      } catch {
+        // /api/user-config unreachable (server still booting, etc.) →
+        // fall through to the static [claude, codex] markup so the
+        // dropdown stays usable.  No ?backend=codex will be sent if
+        // claude is the selected value, so this is safe.
+      }
+
+      // Strip options not in the enabled set.
+      Array.from(backendSel.options).forEach((opt) => {
+        if (!enabled.includes(opt.value)) opt.remove()
+      })
+      // Hide the dropdown entirely when there's exactly one choice — a
+      // 1-option <select> is just visual noise.
+      if (enabled.length <= 1) {
+        const label = backendSel.closest('.sr-backend-label')
+        if (label) label.style.display = 'none'
+      }
+
+      // Reconcile localStorage with the enabled set: if the persisted
+      // value is now disabled (e.g. user just turned off Codex), drop
+      // it back to the resolved default.  Don't re-write LS until the
+      // user explicitly picks something — keeps "their last pick"
+      // sticky if they re-enable later.
+      const persisted = getBackend()
+      const initial = enabled.includes(persisted) ? persisted : defaultBackend
+      if (enabled.includes(initial)) {
+        backendSel.value = initial
+      } else if (backendSel.options.length > 0) {
+        backendSel.value = backendSel.options[0].value
+      }
+
+      backendSel.addEventListener('change', () => {
+        setBackend(backendSel.value)
+      })
+    })()
   }
 
   // Wire the concurrency dropdown.  Value persists in localStorage

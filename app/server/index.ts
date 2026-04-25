@@ -28,7 +28,18 @@ import {
 } from './lib/github.js'
 import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
 import { startResolveStream, startResolveResumeStream, listResolveRuns, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
-import { readUserConfig, writeUserConfig, configFilePath, isResolveEnabled } from './lib/config.js'
+import {
+  readUserConfig,
+  writeUserConfig,
+  configFilePath,
+  isResolveEnabled,
+  validateAiConfig,
+  resolveEnabledBackends,
+  resolveDefaultBackend,
+  KNOWN_BACKENDS,
+  type KnownBackend,
+} from './lib/config.js'
+import { spawn as childSpawn } from 'child_process'
 
 const app = new Hono()
 
@@ -420,9 +431,18 @@ app.get('/api/features', (c) => {
 // started from the CLI sees the same binary + config dir as one started
 // from the UI.
 app.get('/api/user-config', (c) => {
+  const cfg = readUserConfig()
   return c.json({
     path: configFilePath(),
-    config: readUserConfig(),
+    config: cfg,
+    // Resolved values that apply the back-compat defaults — clients can
+    // skip duplicating the resolveEnabledBackends / resolveDefaultBackend
+    // logic and just trust this projection.  Important for the resolve
+    // plugin's dropdown filtering.
+    resolved: {
+      enabledBackends: resolveEnabledBackends(cfg),
+      defaultBackend:  resolveDefaultBackend(cfg),
+    },
   })
 })
 
@@ -437,6 +457,7 @@ app.put('/api/user-config', async (c) => {
       features?: { resolveEnabled?: unknown }
       ai?: {
         defaultBackend?: unknown
+        enabledBackends?: unknown
         claude?: { bin?: unknown; configDir?: unknown }
         codex?:  { bin?: unknown; configDir?: unknown }
       }
@@ -470,6 +491,23 @@ app.put('/api/user-config', async (c) => {
       if (incoming.ai.defaultBackend === 'claude' || incoming.ai.defaultBackend === 'codex') {
         aiPartial.defaultBackend = incoming.ai.defaultBackend
       }
+      // enabledBackends — accept ONLY a non-empty array of known
+      // backends.  Junk (string, object, mixed types, unknown values)
+      // is dropped here so it can't reach validateAiConfig + reject the
+      // whole save.  An invalid-but-present value just preserves the
+      // on-disk list, matching the rest of the PUT's "absent ⇒ keep"
+      // semantics.
+      if (Array.isArray(incoming.ai.enabledBackends)) {
+        const filtered: ('claude' | 'codex')[] = []
+        const seen = new Set<string>()
+        for (const v of incoming.ai.enabledBackends) {
+          if ((v === 'claude' || v === 'codex') && !seen.has(v)) {
+            seen.add(v)
+            filtered.push(v)
+          }
+        }
+        if (filtered.length > 0) aiPartial.enabledBackends = filtered
+      }
       if (incoming.ai.claude && typeof incoming.ai.claude === 'object') {
         const claudeBin = toStr(incoming.ai.claude.bin)
         const claudeDir = toStr(incoming.ai.claude.configDir)
@@ -491,11 +529,112 @@ app.put('/api/user-config', async (c) => {
       if (Object.keys(aiPartial).length > 0) clean.ai = aiPartial
     }
 
+    // Cross-field validation (default-must-be-enabled, non-empty list,
+    // known backends).  Reject with 400 + actionable message rather
+    // than silently dropping into a nonsensical config.
+    const validationError = validateAiConfig(clean, readUserConfig())
+    if (validationError) {
+      return c.json({ error: validationError }, 400)
+    }
+
     const saved = writeUserConfig(clean)
-    return c.json({ ok: true, path: configFilePath(), config: saved })
+    return c.json({
+      ok: true,
+      path: configFilePath(),
+      config: saved,
+      // Echo the resolved values too so the UI can show the same
+      // semantics the rest of the system uses (resolveEnabledBackends
+      // applies the back-compat default, resolveDefaultBackend picks
+      // first-enabled-when-default-is-disabled, etc.).
+      resolved: {
+        enabledBackends: resolveEnabledBackends(saved),
+        defaultBackend:  resolveDefaultBackend(saved),
+      },
+    })
   } catch (err: any) {
     return c.json({ error: err?.message || 'Failed to save config' }, 500)
   }
+})
+
+// ── CLI smoke-test for a backend ──────────────────────────────────────
+//
+// Spawn `<bin> --version` with a hard 5s timeout.  Returns {ok, version|error}
+// so the /#/config UI's "Test" button can tell the user, in one click,
+// whether the binary it's about to spawn for resolves is actually on
+// PATH inside the swctl-ui container.
+//
+// History: users repeatedly hit "spawn codex ENOENT" with no way to
+// pre-flight check before kicking a real resolve.  This endpoint is
+// the deliberate pre-flight.
+app.get('/api/user-config/test-cli', async (c) => {
+  const backend = c.req.query('backend') as KnownBackend | undefined
+  if (!backend || !(KNOWN_BACKENDS as readonly string[]).includes(backend)) {
+    return c.json({
+      ok: false,
+      error: `unknown backend "${backend ?? '(none)'}"; allowed: ${KNOWN_BACKENDS.join(', ')}`,
+    }, 400)
+  }
+
+  // Resolve the configured binary path, falling back to the bare
+  // command name (which lets PATH lookup happen inside spawn).  This
+  // mirrors how the real spawn sites resolve binaries.
+  const cfg = readUserConfig()
+  const bin = (cfg.ai?.[backend]?.bin || backend).trim() || backend
+
+  const result = await new Promise<{ ok: boolean; version?: string; error?: string; bin: string }>((resolve) => {
+    let settled = false
+    const settle = (r: { ok: boolean; version?: string; error?: string }) => {
+      if (settled) return
+      settled = true
+      resolve({ ...r, bin })
+    }
+
+    let child: ReturnType<typeof childSpawn>
+    try {
+      child = childSpawn(bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (e: any) {
+      settle({ ok: false, error: `spawn threw: ${e?.message || String(e)}` })
+      return
+    }
+
+    const chunks: Buffer[] = []
+    let stderr = ''
+    child.stdout?.on('data', (b: Buffer) => chunks.push(b))
+    child.stderr?.on('data', (b: Buffer) => { stderr += b.toString('utf-8') })
+
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch {}
+      settle({ ok: false, error: 'timeout after 5000ms' })
+    }, 5000)
+
+    child.once('error', (err: NodeJS.ErrnoException) => {
+      clearTimeout(timer)
+      settle({
+        ok: false,
+        error: err.code === 'ENOENT'
+          ? `binary not found in container PATH (looked for: ${bin})`
+          : err.message || String(err),
+      })
+    })
+
+    child.once('close', (code) => {
+      clearTimeout(timer)
+      const stdout = Buffer.concat(chunks).toString('utf-8').trim()
+      // Some CLIs print version to stderr; fall back to that if stdout is empty.
+      const version = stdout || stderr.trim() || '(no version output)'
+      if (code === 0) {
+        // Take just the first line — claude / codex both print one line.
+        settle({ ok: true, version: version.split('\n')[0].slice(0, 200) })
+      } else {
+        settle({
+          ok: false,
+          error: `${bin} --version exited ${code}; stderr: ${stderr.slice(0, 200) || '(empty)'}`,
+        })
+      }
+    })
+  })
+
+  return c.json(result)
 })
 
 app.get('/api/projects', (c) => {

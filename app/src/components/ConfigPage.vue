@@ -1,18 +1,26 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
-import { fetchConfig, saveConfig, type UserConfig } from '@/api/config'
+import {
+  fetchConfig, saveConfig, testCli,
+  KNOWN_BACKENDS,
+  type UserConfig,
+  type KnownBackend,
+  type TestCliResult,
+} from '@/api/config'
 
 /**
  * /#/config — edits ~/.swctl/config.json.
  *
  * Sections:
- *   1. Features — toggles like `resolveEnabled` (gates the Resolve route + APIs).
- *   2. AI backend — default backend, claude/codex binary + config-dir overrides.
+ *   1. Features (read-only)         — gated flags like `resolveEnabled`.
+ *   2. AI backends                  — pick which CLIs are available
+ *      (multi-select), pick the default (single-select, restricted to
+ *      the enabled set), test that each one actually works, and
+ *      override its binary path / config dir.
  *
  * The page loads the full config on mount, lets the user mutate a local
- * draft, and POSTs the whole object back on Save.  Env vars still win
- * over config on the server, so "leave empty to use the default" actually
- * means "use the env var if set, else the built-in default."
+ * draft, and POSTs the whole AI subtree back on Save.  Env vars still
+ * win over config on the server; an empty input means "fall back".
  */
 
 const path = ref('')
@@ -21,86 +29,139 @@ const saving = ref(false)
 const error = ref('')
 const saved = ref(false)
 
-// Draft state — populated from GET /api/config, mutated by the form,
-// posted back on Save.  Pre-seed the nested shape so v-model bindings
-// (`draft.ai.claude!.bin`) don't blow up between mount and the first
-// /api/config response.
 const draft = ref<UserConfig>(emptyDraft())
+
+// Per-backend test results from the /api/user-config/test-cli endpoint.
+// Keyed by backend name; missing key = "never tested in this session".
+const testResults = ref<Partial<Record<KnownBackend, TestCliResult>>>({})
+const testing = ref<Partial<Record<KnownBackend, boolean>>>({})
 
 function emptyDraft(): UserConfig {
   return {
     features: {},
     ai: {
+      // Pre-seed with the back-compat default so the dropdown / checkboxes
+      // have something coherent to bind against during the load round-trip.
+      enabledBackends: ['claude'],
+      defaultBackend: 'claude',
       claude: {},
       codex:  {},
     },
   }
 }
 
-// Accept anything, always return a fully-populated UserConfig.  Must not
-// throw, even on nulls / unexpected shapes — the /config page is the
-// user's escape hatch for a broken config, so it has to keep rendering.
-function normaliseDraft(c: unknown): UserConfig {
+function normaliseDraft(c: unknown, resolved?: { enabledBackends: KnownBackend[]; defaultBackend: KnownBackend }): UserConfig {
   const any = (c || {}) as Partial<UserConfig> & Record<string, unknown>
   const ai = (any.ai || {}) as NonNullable<UserConfig['ai']>
   const features = (any.features || {}) as NonNullable<UserConfig['features']>
+  // Trust the server-provided `resolved` projection when present —
+  // it's already applied the back-compat defaults (empty list → claude,
+  // unknown values filtered).  Fall back to client-side derivation
+  // when the server didn't include `resolved` (older server).
+  const enabledFromServer = resolved?.enabledBackends ?? (
+    Array.isArray(ai.enabledBackends) && ai.enabledBackends.length > 0
+      ? ai.enabledBackends.filter(isKnownBackend)
+      : ['claude']
+  )
+  const defaultFromServer = resolved?.defaultBackend ?? (
+    isKnownBackend(ai.defaultBackend) && enabledFromServer.includes(ai.defaultBackend!)
+      ? ai.defaultBackend
+      : enabledFromServer[0]
+  )
   return {
     features: { ...features },
     ai: {
-      defaultBackend: ai.defaultBackend,
+      enabledBackends: enabledFromServer,
+      defaultBackend:  defaultFromServer,
       claude: { ...(ai.claude || {}) },
       codex:  { ...(ai.codex  || {}) },
     },
   }
 }
 
+function isKnownBackend(v: unknown): v is KnownBackend {
+  return v === 'claude' || v === 'codex'
+}
+
 onMounted(async () => {
   try {
     const resp = await fetchConfig()
     path.value = resp?.path || ''
-    draft.value = normaliseDraft(resp?.config)
+    draft.value = normaliseDraft(resp?.config, resp?.resolved)
   } catch (e: any) {
     error.value = e?.message || 'Failed to load config'
-    // Keep the form usable even if the initial load fails — user can
-    // fill in values and hit Save to create the file from scratch.
     draft.value = emptyDraft()
   } finally {
     loading.value = false
   }
 })
 
-// Read-only: feature flags are not mutable from the UI.  They're
-// displayed here so users can see the current state at a glance, but
-// changes must happen via `swctl config set features.<name> <value>` or
-// by editing ~/.swctl/config.json directly.  See the PUT payload below
-// — `features` is deliberately NOT sent, so a future writable field on
-// this page can't accidentally round-trip an old cached value back to
-// disk.
 const resolveEnabled = computed<boolean>(() => draft.value.features.resolveEnabled === true)
 
-const defaultBackend = computed<'claude' | 'codex'>({
-  get: () => draft.value.ai.defaultBackend || 'claude',
+/**
+ * Two-way binding for "is backend X enabled?".  Toggling this updates
+ * the array on the draft; if the user disables what was the default,
+ * we auto-pick the first remaining enabled backend so we never end up
+ * with `defaultBackend ∉ enabledBackends` (which the server would
+ * 400 on Save).
+ */
+function isEnabled(b: KnownBackend): boolean {
+  return (draft.value.ai.enabledBackends || []).includes(b)
+}
+function setEnabled(b: KnownBackend, on: boolean): void {
+  const cur = new Set(draft.value.ai.enabledBackends || [])
+  if (on) cur.add(b)
+  else    cur.delete(b)
+  // Preserve a stable order matching KNOWN_BACKENDS so the UI doesn't
+  // shuffle when ticking/unticking.
+  const next = KNOWN_BACKENDS.filter(x => cur.has(x))
+  draft.value.ai.enabledBackends = next
+  // Self-heal default: if the user disabled the current default,
+  // shift to the first remaining enabled backend.  Don't 400 on Save
+  // for a recoverable choice.
+  if (next.length > 0 && !next.includes(draft.value.ai.defaultBackend!)) {
+    draft.value.ai.defaultBackend = next[0]
+  }
+}
+
+const enabledList = computed<KnownBackend[]>(() => draft.value.ai.enabledBackends || [])
+
+const defaultBackend = computed<KnownBackend>({
+  get: () => draft.value.ai.defaultBackend || enabledList.value[0] || 'claude',
   set: (v) => { draft.value.ai.defaultBackend = v },
 })
+
+/** Display label per backend — keeps copy in one place. */
+function backendLabel(b: KnownBackend): string {
+  return b === 'claude' ? 'Claude Code' : 'Codex CLI'
+}
+
+async function onTest(b: KnownBackend) {
+  testing.value = { ...testing.value, [b]: true }
+  // Clear the previous result while the new probe is in flight so
+  // stale state can't be mistaken for fresh.
+  testResults.value = { ...testResults.value, [b]: undefined }
+  try {
+    const r = await testCli(b)
+    testResults.value = { ...testResults.value, [b]: r }
+  } catch (e: any) {
+    testResults.value = { ...testResults.value, [b]: { ok: false, bin: '', error: e?.message || 'request failed' } }
+  } finally {
+    testing.value = { ...testing.value, [b]: false }
+  }
+}
 
 async function onSave() {
   saving.value = true
   error.value = ''
   saved.value = false
   try {
-    // IMPORTANT: do NOT include `features` in the PUT payload.  That
-    // subtree is treated as read-only by this page (users must edit
-    // config.json or run `swctl config set` to flip a feature flag), and
-    // omitting it here means a stale cached value can never be written
-    // back to disk through a Save click.  The server's writeUserConfig()
-    // merges, so existing `features.*` keys on disk are preserved
-    // untouched.
-    //
-    // Also strip empty strings so the server treats them as "unset" and
-    // falls back to env / defaults, rather than storing an empty override.
+    // Send only the AI subtree.  Features stay read-only here; the
+    // server merges, so anything we don't include is preserved.
     const clean: Partial<UserConfig> = {
       ai: {
-        defaultBackend: draft.value.ai.defaultBackend,
+        defaultBackend:  draft.value.ai.defaultBackend,
+        enabledBackends: draft.value.ai.enabledBackends,
         claude: {
           bin:       strOrUndef(draft.value.ai.claude?.bin),
           configDir: strOrUndef(draft.value.ai.claude?.configDir),
@@ -112,11 +173,8 @@ async function onSave() {
       },
     }
     const resp = await saveConfig(clean as UserConfig)
-    draft.value = normaliseDraft(resp?.config)
+    draft.value = normaliseDraft(resp?.config, resp?.resolved)
     if (resp?.path) path.value = resp.path
-    // Nothing here touches features — so no plugin/feature refetch is
-    // required.  AI changes take effect on the next `swctl resolve …`
-    // spawn (CLI reads the same file on every call).
     saved.value = true
     setTimeout(() => { saved.value = false }, 2000)
   } catch (e: any) {
@@ -144,8 +202,7 @@ function strOrUndef(v?: string): string | undefined {
         take effect in the very next <code class="text-gray-300">swctl resolve …</code> run.
       </p>
       <p class="text-[11px] text-gray-600 mt-1">
-        This page writes only the AI backend section.  Feature flags are
-        read-only here — edit <code>~/.swctl/config.json</code> directly
+        Feature flags are read-only here — edit <code>~/.swctl/config.json</code> directly
         or use <code>swctl config set features.&lt;name&gt; &lt;value&gt;</code>
         to flip them.  Env vars
         (<code>SWCTL_RESOLVE_ENABLED</code>,
@@ -163,6 +220,7 @@ function strOrUndef(v?: string): string | undefined {
       v-if="error && !saving"
       class="text-sm text-red-400 border border-red-500/30 bg-red-500/10 rounded px-3 py-2"
     >{{ error }}</div>
+
     <template v-if="!loading && draft && draft.ai && draft.ai.claude && draft.ai.codex">
       <!-- Features (read-only) -->
       <section class="border border-border rounded-lg bg-surface p-4 space-y-3">
@@ -173,24 +231,9 @@ function strOrUndef(v?: string): string | undefined {
           </span>
         </div>
 
-        <p class="text-[11px] text-gray-500 leading-relaxed">
-          Feature flags are intentionally not editable from the UI.  Edit
-          <code class="bg-surface-dark px-1 py-0.5 rounded text-gray-300">{{ path || '~/.swctl/config.json' }}</code>
-          directly (or run
-          <code class="text-gray-300">swctl config set features.&lt;name&gt; &lt;value&gt;</code>
-          on the host) so turning a gated feature on/off is a deliberate,
-          auditable change — not a stray click.
-        </p>
-
         <div>
           <label class="flex items-center gap-2.5 cursor-not-allowed select-none opacity-80">
-            <input
-              :checked="resolveEnabled"
-              type="checkbox"
-              class="swctl-checkbox"
-              disabled
-              aria-readonly="true"
-            />
+            <input :checked="resolveEnabled" type="checkbox" class="swctl-checkbox" disabled aria-readonly="true" />
             <span class="text-sm text-gray-300">Resolve workflow</span>
             <span
               class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded"
@@ -208,73 +251,140 @@ function strOrUndef(v?: string): string | undefined {
       </section>
 
       <!-- AI backends -->
-      <section class="border border-border rounded-lg bg-surface p-4 space-y-4">
+      <section class="border border-border rounded-lg bg-surface p-4 space-y-5">
         <div>
-          <h3 class="text-sm font-semibold text-white">AI backend</h3>
-          <p class="text-[11px] text-gray-500 mt-0.5">
-            Pick the CLI that drives <code>swctl resolve</code>.  Per-issue
-            selection in the Resolve page always overrides this default.
+          <h3 class="text-sm font-semibold text-white">AI backends</h3>
+          <p class="text-[11px] text-gray-500 mt-0.5 leading-relaxed">
+            Pick which CLIs are available for <code>swctl resolve</code> (multi-select),
+            and which one is the default.  Per-issue selection in the Resolve
+            page overrides the default — but only within the enabled set.
+            Use <span class="text-gray-300">Test</span> to confirm a binary is reachable
+            inside the swctl-ui container before kicking a real resolve.
           </p>
         </div>
 
-        <div class="flex items-center gap-4">
-          <span class="text-xs text-gray-400 w-32">Default backend</span>
-          <label class="flex items-center gap-1.5 cursor-pointer select-none">
-            <input v-model="defaultBackend" type="radio" value="claude" class="accent-blue-500" />
-            <span class="text-sm" :class="defaultBackend === 'claude' ? 'text-gray-200' : 'text-gray-500'">Claude Code</span>
-          </label>
-          <label class="flex items-center gap-1.5 cursor-pointer select-none">
-            <input v-model="defaultBackend" type="radio" value="codex" class="accent-blue-500" />
-            <span class="text-sm" :class="defaultBackend === 'codex' ? 'text-gray-200' : 'text-gray-500'">Codex CLI</span>
-          </label>
-          <span v-if="defaultBackend === 'codex'" class="text-[11px] text-amber-500/80">experimental</span>
+        <!-- Enabled backends (multi-select) -->
+        <div>
+          <div class="text-xs font-medium text-gray-300 mb-2">Enabled backends</div>
+          <div class="flex flex-col gap-2">
+            <div v-for="b in KNOWN_BACKENDS" :key="`enabled-${b}`"
+                 class="flex items-center gap-3 flex-wrap">
+              <label class="flex items-center gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  class="swctl-checkbox"
+                  :checked="isEnabled(b)"
+                  :disabled="isEnabled(b) && enabledList.length === 1"
+                  :title="isEnabled(b) && enabledList.length === 1 ? 'At least one backend has to stay enabled.' : ''"
+                  @change="setEnabled(b, ($event.target as HTMLInputElement).checked)"
+                />
+                <span class="text-sm" :class="isEnabled(b) ? 'text-gray-200' : 'text-gray-500'">
+                  {{ backendLabel(b) }}
+                </span>
+              </label>
+
+              <button
+                type="button"
+                class="text-[11px] px-2 py-0.5 rounded border border-border bg-surface-dark text-gray-300 hover:bg-surface hover:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                :disabled="testing[b]"
+                @click="onTest(b)"
+              >
+                {{ testing[b] ? 'Testing…' : 'Test' }}
+              </button>
+
+              <!-- Inline test result.  Empty until the user clicks Test. -->
+              <span v-if="testResults[b]" class="text-[11px] flex items-center gap-1 max-w-full">
+                <template v-if="testResults[b]?.ok">
+                  <span class="text-emerald-400">✓</span>
+                  <span class="text-emerald-300/90 truncate">{{ testResults[b]?.version }}</span>
+                  <span class="text-gray-600">({{ testResults[b]?.bin }})</span>
+                </template>
+                <template v-else>
+                  <span class="text-red-400">✗</span>
+                  <span class="text-red-300/90 truncate" :title="testResults[b]?.error">
+                    {{ testResults[b]?.error }}
+                  </span>
+                </template>
+              </span>
+            </div>
+          </div>
+          <p class="text-[10px] text-gray-600 mt-2">
+            At least one backend must stay enabled — otherwise the resolve
+            flow has nothing to spawn and the server rejects the save.
+          </p>
         </div>
 
-        <!-- Claude -->
-        <div class="border-t border-border/50 pt-3 space-y-2">
-          <h4 class="text-xs font-semibold text-gray-300 uppercase tracking-wide">Claude Code</h4>
-          <div class="grid grid-cols-[8rem_1fr] items-center gap-x-3 gap-y-2">
-            <label class="text-xs text-gray-400">Binary</label>
-            <input
-              v-model="draft.ai.claude!.bin"
-              type="text"
-              placeholder="claude"
-              class="bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
-            />
-            <label class="text-xs text-gray-400">Config dir</label>
-            <input
-              v-model="draft.ai.claude!.configDir"
-              type="text"
-              :placeholder="'~/.claude'"
-              class="bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
-            />
+        <!-- Default backend (single-select, restricted to enabled list) -->
+        <div class="border-t border-border/50 pt-4">
+          <div class="text-xs font-medium text-gray-300 mb-2">Default backend</div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <select
+              v-model="defaultBackend"
+              class="bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-blue-500"
+            >
+              <option v-for="b in enabledList" :key="`default-${b}`" :value="b">
+                {{ backendLabel(b) }}
+              </option>
+            </select>
+            <span class="text-[11px] text-gray-500">
+              used when an issue has no explicit per-issue choice.
+            </span>
+            <span v-if="defaultBackend === 'codex'" class="text-[11px] text-amber-500/80">experimental</span>
           </div>
         </div>
 
-        <!-- Codex -->
-        <div class="border-t border-border/50 pt-3 space-y-2">
-          <h4 class="text-xs font-semibold text-gray-300 uppercase tracking-wide">Codex CLI</h4>
-          <div class="grid grid-cols-[8rem_1fr] items-center gap-x-3 gap-y-2">
-            <label class="text-xs text-gray-400">Binary</label>
-            <input
-              v-model="draft.ai.codex!.bin"
-              type="text"
-              placeholder="codex"
-              class="bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
-            />
-            <label class="text-xs text-gray-400">Config dir</label>
-            <input
-              v-model="draft.ai.codex!.configDir"
-              type="text"
-              :placeholder="'~/.codex'"
-              class="bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
-            />
+        <!-- Per-backend bin / configDir overrides -->
+        <div class="border-t border-border/50 pt-4 space-y-4">
+          <!-- Claude -->
+          <div :class="isEnabled('claude') ? '' : 'opacity-50'">
+            <h4 class="text-xs font-semibold text-gray-300 uppercase tracking-wide">
+              {{ backendLabel('claude') }}
+            </h4>
+            <div class="grid grid-cols-[8rem_1fr] items-center gap-x-3 gap-y-2 mt-2">
+              <label class="text-xs text-gray-400">Binary</label>
+              <input
+                v-model="draft.ai.claude!.bin"
+                type="text"
+                placeholder="claude"
+                class="bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
+              />
+              <label class="text-xs text-gray-400">Config dir</label>
+              <input
+                v-model="draft.ai.claude!.configDir"
+                type="text"
+                :placeholder="'~/.claude'"
+                class="bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
+              />
+            </div>
           </div>
-        </div>
 
-        <p class="text-[11px] text-gray-600">
-          Leave any field empty to fall back to the env var (if set) and then the built-in default.
-        </p>
+          <!-- Codex -->
+          <div :class="isEnabled('codex') ? '' : 'opacity-50'">
+            <h4 class="text-xs font-semibold text-gray-300 uppercase tracking-wide">
+              {{ backendLabel('codex') }}
+            </h4>
+            <div class="grid grid-cols-[8rem_1fr] items-center gap-x-3 gap-y-2 mt-2">
+              <label class="text-xs text-gray-400">Binary</label>
+              <input
+                v-model="draft.ai.codex!.bin"
+                type="text"
+                placeholder="codex"
+                class="bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
+              />
+              <label class="text-xs text-gray-400">Config dir</label>
+              <input
+                v-model="draft.ai.codex!.configDir"
+                type="text"
+                :placeholder="'~/.codex'"
+                class="bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
+              />
+            </div>
+          </div>
+
+          <p class="text-[11px] text-gray-600">
+            Leave any field empty to fall back to the env var (if set) and then the built-in default.
+          </p>
+        </div>
       </section>
 
       <!-- Actions -->
@@ -294,11 +404,6 @@ function strOrUndef(v?: string): string | undefined {
 </template>
 
 <style scoped>
-/* Custom checkbox — the browser default on dark backgrounds renders a
-   tiny white box with a tick that's barely visible.  This makes the
-   unchecked state a clear outlined square and the checked state a
-   solid blue with a white ✓ drawn via a data-URL SVG background.
-   `appearance: none` strips the native widget so nothing clashes. */
 .swctl-checkbox {
   appearance: none;
   -webkit-appearance: none;
@@ -306,8 +411,8 @@ function strOrUndef(v?: string): string | undefined {
   height: 1rem;
   flex-shrink: 0;
   border-radius: 3px;
-  border: 1px solid rgb(107 114 128);          /* gray-500 */
-  background-color: rgb(24 24 27);             /* bg-surface-dark-ish */
+  border: 1px solid rgb(107 114 128);
+  background-color: rgb(24 24 27);
   cursor: pointer;
   transition: background-color 120ms, border-color 120ms;
   display: inline-block;
@@ -315,10 +420,10 @@ function strOrUndef(v?: string): string | undefined {
   position: relative;
 }
 .swctl-checkbox:hover {
-  border-color: rgb(156 163 175);              /* gray-400 */
+  border-color: rgb(156 163 175);
 }
 .swctl-checkbox:checked {
-  background-color: rgb(37 99 235);            /* blue-600 */
+  background-color: rgb(37 99 235);
   border-color: rgb(37 99 235);
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='white' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='3.5 8.5 6.5 11.5 12.5 4.5'/></svg>");
   background-size: 90% 90%;
@@ -326,17 +431,14 @@ function strOrUndef(v?: string): string | undefined {
   background-repeat: no-repeat;
 }
 .swctl-checkbox:focus-visible {
-  outline: 2px solid rgb(59 130 246);          /* blue-500 */
+  outline: 2px solid rgb(59 130 246);
   outline-offset: 1px;
 }
-/* Feature-flag checkboxes are intentionally read-only.  Keep the
-   checked state fully legible (same blue + tick as live ones) but
-   disable the hover affordance so it doesn't invite clicks. */
 .swctl-checkbox:disabled {
   cursor: not-allowed;
 }
 .swctl-checkbox:disabled:not(:checked) {
-  border-color: rgb(75 85 99);                 /* gray-600 */
+  border-color: rgb(75 85 99);
   background-color: rgb(24 24 27);
 }
 .swctl-checkbox:disabled:hover {

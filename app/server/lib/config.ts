@@ -18,6 +18,16 @@ const CONFIG_FILE =
   process.env.SWCTL_CONFIG_FILE ||
   path.join(process.env.HOME || '/root', '.swctl/config.json')
 
+/**
+ * Backends swctl knows how to spawn for the resolve workflow.  Add a new
+ * one here, then teach `_ai_*` (bash) and `buildSpawnArgs` (TS) about it.
+ *
+ * Exported as a const tuple so the validators / UI can iterate without
+ * duplicating the list.
+ */
+export const KNOWN_BACKENDS = ['claude', 'codex'] as const
+export type KnownBackend = typeof KNOWN_BACKENDS[number]
+
 export interface UserConfig {
   features: {
     /**
@@ -28,8 +38,20 @@ export interface UserConfig {
     resolveEnabled?: boolean
   }
   ai: {
-    /** "claude" | "codex" — default backend for new resolves. */
-    defaultBackend?: 'claude' | 'codex'
+    /**
+     * Default backend for new resolves.  MUST be one of `enabledBackends`
+     * (validated on PUT — caller gets a 400 if not).  Selecting in the
+     * resolve form's AI dropdown overrides this per-issue, but only
+     * within the enabled set.
+     */
+    defaultBackend?: KnownBackend
+    /**
+     * Subset of `KNOWN_BACKENDS` the user has opted into.  An empty/missing
+     * list defaults to `['claude']` for back-compat with pre-redesign
+     * configs that only had `defaultBackend`.  Resolve UI's backend
+     * dropdown only shows these values.
+     */
+    enabledBackends?: KnownBackend[]
     claude?: {
       bin?: string
       configDir?: string
@@ -39,6 +61,42 @@ export interface UserConfig {
       configDir?: string
     }
   }
+}
+
+/**
+ * Resolve which backends are enabled, applying the back-compat default
+ * when the field is missing.  Centralised so every reader (server,
+ * plugin via the API response, tests) agrees on the rule:
+ *
+ *   - explicit non-empty list → use it (de-duped, filtered to known)
+ *   - missing OR empty        → ['claude']  (the pre-redesign default)
+ *   - includes only unknown   → ['claude']  (defensive — config is
+ *                                            recoverable rather than
+ *                                            "no backends" deadlock)
+ */
+export function resolveEnabledBackends(config: UserConfig): KnownBackend[] {
+  const raw = config.ai?.enabledBackends ?? []
+  const filtered = raw.filter((b): b is KnownBackend => (KNOWN_BACKENDS as readonly string[]).includes(b))
+  // Dedupe while preserving first-occurrence order — set semantics, but
+  // the order users picked in the UI is meaningful for "first enabled" fallbacks.
+  const seen = new Set<KnownBackend>()
+  const out: KnownBackend[] = []
+  for (const b of filtered) if (!seen.has(b)) { seen.add(b); out.push(b) }
+  return out.length > 0 ? out : ['claude']
+}
+
+/**
+ * Resolve the effective default backend, applying the
+ * "must-be-enabled" invariant.  Returns the first enabled backend
+ * when defaultBackend is missing OR refers to a now-disabled backend
+ * (which can happen if the user disabled their default-of-record without
+ * picking a new one — be forgiving rather than throwing).
+ */
+export function resolveDefaultBackend(config: UserConfig): KnownBackend {
+  const enabled = resolveEnabledBackends(config)
+  const def = config.ai?.defaultBackend
+  if (def && enabled.includes(def)) return def
+  return enabled[0]   // resolveEnabledBackends guarantees length ≥ 1
 }
 
 /** Read + parse the user config file.  Never throws — returns defaults. */
@@ -121,6 +179,10 @@ export function writeUserConfig(next: Partial<UserConfig> | null | undefined): U
   // Merge two levels deep for `ai` so e.g. saving just `ai.defaultBackend`
   // doesn't clobber `ai.claude.*` or `ai.codex.*`.  `stripUndefined`
   // at every level keeps "absent key" distinct from "set to undefined."
+  //
+  // `enabledBackends` is an array — overwrite-on-supply, preserve-on-absent.
+  // (We don't union-merge: if the user unticks a backend in the UI,
+  // the resulting array MUST replace the on-disk list, not merge with it.)
   const merged: UserConfig = {
     features: { ...curFeatures, ...nextFeatures },
     ai: {
@@ -141,6 +203,57 @@ export function writeUserConfig(next: Partial<UserConfig> | null | undefined): U
 /** Absolute path to the config file (for `swctl config path` parity). */
 export function configFilePath(): string {
   return CONFIG_FILE
+}
+
+/**
+ * Pre-write validation of the AI section.  Checks the cross-field
+ * invariants that read-time fallbacks would happily paper over but the
+ * user probably didn't intend.  Returns null if OK, an error message if
+ * not.
+ *
+ * Rules:
+ *  - If `enabledBackends` is supplied, it must be a non-empty array.
+ *    "no backends" is a misconfiguration that breaks the resolve flow.
+ *  - Every entry of `enabledBackends` must be a known backend.
+ *  - If `defaultBackend` is supplied, it must be in `enabledBackends`
+ *    (or, when `enabledBackends` isn't supplied in this PUT, in the
+ *    on-disk effective list — we read it via resolveEnabledBackends
+ *    so a partial save doesn't pin to a stale list).
+ *
+ * Called by the PUT handler before writeUserConfig so a 400 reaches the
+ * UI with an actionable message; the writer itself stays terse.
+ */
+export function validateAiConfig(
+  next: Partial<UserConfig> | null | undefined,
+  current: UserConfig,
+): string | null {
+  const ai = next?.ai
+  if (!ai) return null
+
+  if (ai.enabledBackends !== undefined) {
+    if (!Array.isArray(ai.enabledBackends) || ai.enabledBackends.length === 0) {
+      return 'enabledBackends must be a non-empty array (at least one backend has to be on, otherwise the resolve flow has nothing to spawn)'
+    }
+    for (const b of ai.enabledBackends) {
+      if (!(KNOWN_BACKENDS as readonly string[]).includes(b)) {
+        return `enabledBackends contains unknown backend "${b}"; allowed: ${KNOWN_BACKENDS.join(', ')}`
+      }
+    }
+  }
+
+  if (ai.defaultBackend !== undefined) {
+    if (!(KNOWN_BACKENDS as readonly string[]).includes(ai.defaultBackend)) {
+      return `defaultBackend "${ai.defaultBackend}" is not a known backend; allowed: ${KNOWN_BACKENDS.join(', ')}`
+    }
+    // Build the effective enabled list as it would be POST-merge:
+    // explicit incoming list wins, otherwise fall back to current.
+    const effective = ai.enabledBackends ?? resolveEnabledBackends(current)
+    if (!effective.includes(ai.defaultBackend)) {
+      return `defaultBackend "${ai.defaultBackend}" must be one of enabledBackends (${effective.join(', ')})`
+    }
+  }
+
+  return null
 }
 
 /**
