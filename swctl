@@ -6654,20 +6654,161 @@ _ai_targets_for_install() {
 }
 
 # _ai_skill_dst <backend> <scope>
+#
+# Returns the install destination per (backend, scope).  The two
+# backends use VERY different mechanisms:
+#
+#   claude → symlinked SKILL.md directory under <config>/skills/.
+#            Claude Code auto-discovers anything in there and exposes
+#            it as a `/shopware-resolve` slash command.
+#
+#   codex  → injected into <config>/AGENTS.md.  Codex doesn't have a
+#            slash-command skill registry; it reads AGENTS.md as
+#            ambient project / global instructions.  swctl wraps the
+#            bundled SKILL.md in marker comments so reinstall is
+#            idempotent and uninstall can strip cleanly.
+#
+# The path returned reflects WHERE we install (not WHAT shape it has):
+#   - claude/user → ~/.claude/skills/shopware-resolve  (symlink)
+#   - claude/repo → $(pwd)/.claude/skills/shopware-resolve
+#   - codex/user  → ~/.codex/AGENTS.md                 (file with block)
+#   - codex/repo  → $(pwd)/AGENTS.md                   (file with block)
 _ai_skill_dst() {
     local backend="$1" scope="$2"
-    case "$scope" in
-        user)
-            local cfg
-            cfg="$(_ai_backend_config_dir "$backend")" || return 1
-            printf '%s/skills/shopware-resolve' "$cfg"
+    case "$backend" in
+        claude)
+            case "$scope" in
+                user)
+                    local cfg
+                    cfg="$(_ai_backend_config_dir "$backend")" || return 1
+                    printf '%s/skills/shopware-resolve' "$cfg"
+                    ;;
+                repo)
+                    printf '%s/.claude/skills/shopware-resolve' "$(pwd)"
+                    ;;
+                *) return 1 ;;
+            esac
             ;;
-        repo)
-            # Repo-scoped: drop into .<backend>/skills/ next to .swctl.conf.
-            printf '%s/.%s/skills/shopware-resolve' "$(pwd)" "$backend"
+        codex)
+            case "$scope" in
+                user)
+                    local cfg
+                    cfg="$(_ai_backend_config_dir "$backend")" || return 1
+                    printf '%s/AGENTS.md' "$cfg"
+                    ;;
+                repo)
+                    # Per-project AGENTS.md is what Codex picks up
+                    # automatically when run with --cd <project>.
+                    printf '%s/AGENTS.md' "$(pwd)"
+                    ;;
+                *) return 1 ;;
+            esac
             ;;
         *) return 1 ;;
     esac
+}
+
+# Marker tags used to bracket swctl-managed content inside a Codex
+# AGENTS.md.  Reinstall replaces whatever is between the tags;
+# uninstall removes the tags + the content + ONE adjacent blank line
+# (so files don't accumulate empty lines on re-install/uninstall).
+_swctl_codex_skill_begin() { printf '<!-- swctl:shopware-resolve:begin -->'; }
+_swctl_codex_skill_end()   { printf '<!-- swctl:shopware-resolve:end -->'; }
+
+# Splice (or replace) the bundled SKILL.md content into the given
+# AGENTS.md, between marker comments.  Atomic via tmp + rename so a
+# concurrent reader never sees a half-written file.  If the file
+# doesn't exist, creates it with just the marker block.
+_codex_skill_install_block() {
+    local dst="$1" src_md="$2"
+
+    [ -f "$src_md" ] || die "Bundled skill SKILL.md not found at $src_md"
+    mkdir -p "$(dirname "$dst")"
+
+    local begin end
+    begin="$(_swctl_codex_skill_begin)"
+    end="$(_swctl_codex_skill_end)"
+
+    # Build the new content: (existing-with-block-stripped) + block.
+    local existing=""
+    [ -f "$dst" ] && existing="$(_codex_skill_strip_block "$dst")"
+
+    # Ensure exactly one blank line between any prior content and our block.
+    local sep=""
+    if [ -n "$existing" ]; then
+        # Trim trailing whitespace/newlines, then re-append exactly one blank line.
+        existing="$(printf '%s' "$existing" | awk '{print}' | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')"
+        sep=$'\n\n'
+    fi
+
+    local block_body
+    block_body="$(cat "$src_md")"
+
+    local tmp
+    tmp="$(mktemp)"
+    {
+        if [ -n "$existing" ]; then printf '%s%s' "$existing" "$sep"; fi
+        printf '%s\n' "$begin"
+        printf '<!-- managed by swctl — do not edit between these markers; '
+        # shellcheck disable=SC2016  # backticks are part of the literal markdown emitted to AGENTS.md
+        printf 're-run `swctl skill install --target codex` to update -->\n'
+        printf '%s\n' "$block_body"
+        printf '%s\n' "$end"
+    } > "$tmp"
+
+    mv "$tmp" "$dst"
+}
+
+# Strip the swctl-managed block + its surrounding markers from
+# AGENTS.md.  Prints the resulting content.  Uses awk for portability
+# (BSD sed's lookbehind support is spotty across macOS / Linux).
+_codex_skill_strip_block() {
+    local file="$1"
+    [ -f "$file" ] || { printf ''; return 0; }
+
+    awk '
+        /<!-- swctl:shopware-resolve:begin -->/ { inblock = 1; next }
+        /<!-- swctl:shopware-resolve:end -->/   { inblock = 0; next }
+        !inblock { print }
+    ' "$file"
+}
+
+# Idempotent uninstall: removes the marker block, atomic write.
+# If after stripping the file is just whitespace, deletes the file
+# entirely (don't leave behind empty AGENTS.md the user didn't create).
+_codex_skill_uninstall_block() {
+    local dst="$1" stripped
+
+    if [ ! -f "$dst" ]; then
+        return 1   # nothing to do — caller distinguishes "no-op"
+    fi
+
+    if ! grep -q "$(_swctl_codex_skill_begin)" "$dst" 2>/dev/null; then
+        return 1   # marker not present — caller treats as not-installed
+    fi
+
+    stripped="$(_codex_skill_strip_block "$dst")"
+    # Trim trailing blank lines for cleanliness.
+    stripped="$(printf '%s' "$stripped" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')"
+
+    if [ -z "$stripped" ]; then
+        # File is now empty — nothing else lived there, delete.
+        rm -f "$dst"
+        return 0
+    fi
+
+    local tmp
+    tmp="$(mktemp)"
+    printf '%s\n' "$stripped" > "$tmp"
+    mv "$tmp" "$dst"
+    return 0
+}
+
+# Returns 0 if the swctl-managed block is present in $1.
+_codex_skill_block_present() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    grep -q "$(_swctl_codex_skill_begin)" "$file"
 }
 
 cmd_skill_install() {
@@ -6699,26 +6840,42 @@ cmd_skill_install() {
         [ -n "$backend" ] || continue
         local dst
         dst="$(_ai_skill_dst "$backend" "$scope")" || die "Cannot compute dest for backend '$backend'."
-        mkdir -p "$(dirname "$dst")"
 
-        if [ -L "$dst" ]; then
-            local current
-            current="$(readlink "$dst" 2>/dev/null || true)"
-            if [ "$current" = "$src" ]; then
-                ok "[$backend] shopware-resolve skill already linked at $dst"
-                continue
-            fi
-            warn "[$backend] Replacing existing symlink ($current → $src)"
-            ln -sfn "$src" "$dst"
-        elif [ -e "$dst" ]; then
-            die "[$backend] $dst already exists as a file/dir (not a symlink). Move it aside or run 'swctl skill uninstall' first."
-        else
-            ln -sfn "$src" "$dst"
-        fi
-        ok "[$backend] Linked shopware-resolve skill → $dst"
+        case "$backend" in
+            claude)
+                # Symlink-based install — Claude Code auto-discovers
+                # SKILL.md in this directory and registers the
+                # /shopware-resolve slash command.
+                mkdir -p "$(dirname "$dst")"
+                if [ -L "$dst" ]; then
+                    local current
+                    current="$(readlink "$dst" 2>/dev/null || true)"
+                    if [ "$current" = "$src" ]; then
+                        ok "[claude] shopware-resolve skill already linked at $dst"
+                        continue
+                    fi
+                    warn "[claude] Replacing existing symlink ($current → $src)"
+                    ln -sfn "$src" "$dst"
+                elif [ -e "$dst" ]; then
+                    die "[claude] $dst already exists as a file/dir (not a symlink). Move it aside or run 'swctl skill uninstall' first."
+                else
+                    ln -sfn "$src" "$dst"
+                fi
+                ok "[claude] Linked shopware-resolve skill → $dst"
+                ;;
+            codex)
+                # Block-injection install — Codex reads AGENTS.md as
+                # ambient context (no skill registry).  Splice the
+                # bundled SKILL.md between marker comments so the file
+                # remains user-editable elsewhere and reinstalls are
+                # idempotent.
+                _codex_skill_install_block "$dst" "$src/SKILL.md"
+                ok "[codex] Wrote shopware-resolve block → $dst"
+                ;;
+        esac
     done <<< "$targets"
 
-    info "Run 'claude /shopware-resolve' (or 'codex /shopware-resolve') from a terminal to use it on the host."
+    info "Run 'claude /shopware-resolve' (or invoke 'codex' on a worktree where AGENTS.md was installed) to use the skill."
 }
 
 cmd_skill_uninstall() {
@@ -6752,14 +6909,26 @@ cmd_skill_uninstall() {
         [ -n "$backend" ] || continue
         local dst
         dst="$(_ai_skill_dst "$backend" "$scope")" || die "Cannot compute dest for backend '$backend'."
-        if [ -L "$dst" ]; then
-            rm -f "$dst"
-            ok "[$backend] Removed shopware-resolve skill symlink: $dst"
-        elif [ -e "$dst" ]; then
-            warn "[$backend] $dst is not a symlink — refusing to delete (user-owned content)."
-        else
-            info "[$backend] No shopware-resolve skill linked at $dst"
-        fi
+
+        case "$backend" in
+            claude)
+                if [ -L "$dst" ]; then
+                    rm -f "$dst"
+                    ok "[claude] Removed shopware-resolve skill symlink: $dst"
+                elif [ -e "$dst" ]; then
+                    warn "[claude] $dst is not a symlink — refusing to delete (user-owned content)."
+                else
+                    info "[claude] No shopware-resolve skill linked at $dst"
+                fi
+                ;;
+            codex)
+                if _codex_skill_uninstall_block "$dst"; then
+                    ok "[codex] Stripped shopware-resolve block from $dst"
+                else
+                    info "[codex] No shopware-resolve block in $dst"
+                fi
+                ;;
+        esac
     done <<< "$targets"
 }
 
@@ -6774,30 +6943,46 @@ cmd_skill_status() {
         warn "  MISSING — reinstall swctl"
     fi
 
-    local backend
-    for backend in claude codex; do
-        local user_dst repo_dst
-        user_dst="$(_ai_skill_dst "$backend" "user")"
-        repo_dst="$(_ai_skill_dst "$backend" "repo")"
+    # Claude — symlink-based discovery
+    local user_dst repo_dst
+    user_dst="$(_ai_skill_dst "claude" "user")"
+    repo_dst="$(_ai_skill_dst "claude" "repo")"
+    printf '\n%b[claude] user-level link (%s):%b\n' "${COLOR_BOLD:-}" "$user_dst" "${COLOR_RESET:-}"
+    if [ -L "$user_dst" ]; then
+        ok "  → $(readlink "$user_dst")"
+    elif [ -e "$user_dst" ]; then
+        warn "  present but not a symlink (user-installed content)"
+    else
+        info "  not linked (run 'swctl skill install --user --target claude')"
+    fi
+    printf '%b[claude] repo-level link (%s):%b\n' "${COLOR_BOLD:-}" "$repo_dst" "${COLOR_RESET:-}"
+    if [ -L "$repo_dst" ]; then
+        ok "  → $(readlink "$repo_dst")"
+    elif [ -e "$repo_dst" ]; then
+        warn "  present but not a symlink"
+    else
+        info "  not linked"
+    fi
 
-        printf '\n%b[%s] user-level link (%s):%b\n' "${COLOR_BOLD:-}" "$backend" "$user_dst" "${COLOR_RESET:-}"
-        if [ -L "$user_dst" ]; then
-            ok "  → $(readlink "$user_dst")"
-        elif [ -e "$user_dst" ]; then
-            warn "  present but not a symlink (user-installed content)"
-        else
-            info "  not linked (run 'swctl skill install --user --target $backend')"
-        fi
-
-        printf '%b[%s] repo-level link (%s):%b\n' "${COLOR_BOLD:-}" "$backend" "$repo_dst" "${COLOR_RESET:-}"
-        if [ -L "$repo_dst" ]; then
-            ok "  → $(readlink "$repo_dst")"
-        elif [ -e "$repo_dst" ]; then
-            warn "  present but not a symlink"
-        else
-            info "  not linked"
-        fi
-    done
+    # Codex — block-in-AGENTS.md
+    user_dst="$(_ai_skill_dst "codex" "user")"
+    repo_dst="$(_ai_skill_dst "codex" "repo")"
+    printf '\n%b[codex] user-level block (%s):%b\n' "${COLOR_BOLD:-}" "$user_dst" "${COLOR_RESET:-}"
+    if _codex_skill_block_present "$user_dst"; then
+        ok "  installed (swctl-managed block present)"
+    elif [ -f "$user_dst" ]; then
+        info "  AGENTS.md exists but no swctl block (run 'swctl skill install --user --target codex')"
+    else
+        info "  not installed (run 'swctl skill install --user --target codex')"
+    fi
+    printf '%b[codex] repo-level block (%s):%b\n' "${COLOR_BOLD:-}" "$repo_dst" "${COLOR_RESET:-}"
+    if _codex_skill_block_present "$repo_dst"; then
+        ok "  installed"
+    elif [ -f "$repo_dst" ]; then
+        info "  AGENTS.md exists but no swctl block"
+    else
+        info "  not installed"
+    fi
 }
 
 cmd_skill() {
