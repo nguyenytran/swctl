@@ -691,6 +691,143 @@ EOF
     return 0
 }
 
+# --- Orphan-state recovery ----------------------------------------------------
+#
+# When a `swctl create` (typically driven by `swctl resolve`) crashes after
+# `git worktree add -b <branch>` but before writing the metadata env file,
+# subsequent `swctl clean <issue>` invocations bail with "no tracked
+# worktree found" — even though the half-baked branch (and sometimes a bare
+# directory) still blocks the next create.  This helper sweeps that state.
+#
+# What it removes:
+#   - PROJECT_ROOT branches matching the issue id pattern
+#       fix/<id>     feat/<id>     chore/<id>
+#       fix/<id>-*   feat/<id>-*   chore/<id>-*
+#     (only when the branch has zero commits ahead of $BASE_REF; with
+#     --force, deletion is unconditional).
+#   - The default worktree path "$SW_WORKTREE_ROOT/sw-<id>" if it exists on
+#     disk but isn't registered with `git worktree list`.
+#
+# Returns 0 if it found and acted on anything (caller treats as a success
+# clean); 1 if there was no orphan state (caller falls through to its
+# "nothing to clean" warning).
+#
+# Safe to call even when PROJECT_ROOT or SW_WORKTREE_ROOT are unset — both
+# paths short-circuit and the function returns 1.
+_clean_orphan_state() {
+    local issue_input="$1"
+    local force="${2:-0}"
+    local issue_id
+    issue_id="$(sanitize_slug "$issue_input")"
+
+    [ -n "$issue_id" ] || return 1
+    [ -n "${PROJECT_ROOT:-}" ] || return 1
+    [ -d "${PROJECT_ROOT}/.git" ] || [ -f "${PROJECT_ROOT}/.git" ] || return 1
+
+    local found=0
+
+    # 1. Orphan worktree directory — exists on disk but not registered.
+    # Compare canonical paths in both directions: on macOS `/var/folders/…`
+    # resolves to `/private/var/folders/…`, and `git worktree list` prints
+    # the resolved form, so a literal grep would always think the dir is
+    # unregistered.
+    if [ -n "${SW_WORKTREE_ROOT:-}" ]; then
+        local default_path="$SW_WORKTREE_ROOT/sw-${issue_id}"
+        if [ -d "$default_path" ]; then
+            local default_real registered=0
+            default_real="$(cd "$default_path" 2>/dev/null && pwd -P)"
+            local _wt_line _wt_path _wt_real
+            while IFS= read -r _wt_line; do
+                case "$_wt_line" in
+                    worktree\ *)
+                        _wt_path="${_wt_line#worktree }"
+                        _wt_real="$(cd "$_wt_path" 2>/dev/null && pwd -P || printf '%s' "$_wt_path")"
+                        if [ "$_wt_real" = "$default_real" ]; then
+                            registered=1
+                            break
+                        fi
+                        ;;
+                esac
+            done < <(git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null)
+
+            if [ "$registered" = "0" ]; then
+                warn "Found orphan worktree directory: $default_path"
+                git -C "$PROJECT_ROOT" worktree prune 2>/dev/null || true
+                if rm -rf "$default_path" 2>/dev/null; then
+                    ok "Removed orphan directory '$default_path'."
+                else
+                    warn "Could not remove '$default_path' (permissions?)."
+                fi
+                found=1
+            fi
+        fi
+    fi
+
+    # 2. Resolve a base ref to evaluate "is this branch empty" against.
+    # git_base_ref dies on missing branch; suppress and fall back to the
+    # configured SW_BASE_BRANCH name (still useful for rev-list count).
+    local base_ref=""
+    base_ref="$(git_base_ref 2>/dev/null || true)"
+    [ -n "$base_ref" ] || base_ref="${SW_BASE_BRANCH:-trunk}"
+
+    # 3. Orphan branches.  for-each-ref accepts glob patterns at the ref
+    # component level, so we list every branch-prefix combination once.
+    local branch ahead worktree_holder
+    while IFS= read -r branch; do
+        [ -n "$branch" ] || continue
+
+        # Skip if the branch is currently checked out somewhere — that's
+        # not an orphan, it's an active worktree (which the metadata-driven
+        # path should be handling).  `git branch -D` would refuse anyway,
+        # but the explicit check gives a clearer error.
+        worktree_holder="$(git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null \
+            | awk -v b="refs/heads/$branch" '
+                /^worktree / { wt=$2 }
+                $1=="branch" && $2==b { print wt; exit }
+            ')"
+        if [ -n "$worktree_holder" ]; then
+            warn "Skipping orphan branch '$branch' — checked out at '$worktree_holder'."
+            found=1
+            continue
+        fi
+
+        if [ "$force" = "1" ]; then
+            if git -C "$PROJECT_ROOT" branch -D "$branch" >/dev/null 2>&1; then
+                ok "Deleted orphan branch '$branch' (forced)."
+            else
+                warn "Could not delete orphan branch '$branch'."
+            fi
+            found=1
+            continue
+        fi
+
+        # Empty branch (zero commits ahead of base) → safe to delete.
+        ahead="$(git -C "$PROJECT_ROOT" rev-list --count "$base_ref..$branch" 2>/dev/null || printf '0')"
+        if [ "$ahead" = "0" ]; then
+            if git -C "$PROJECT_ROOT" branch -D "$branch" >/dev/null 2>&1; then
+                ok "Deleted empty orphan branch '$branch'."
+            else
+                warn "Could not delete orphan branch '$branch'."
+            fi
+        else
+            warn "Skipping orphan branch '$branch' — has $ahead commit(s) ahead of $base_ref. Use 'swctl clean --force ${issue_id}' to delete anyway."
+        fi
+        found=1
+    done < <(
+        git -C "$PROJECT_ROOT" for-each-ref \
+            --format='%(refname:short)' \
+            "refs/heads/fix/${issue_id}" \
+            "refs/heads/feat/${issue_id}" \
+            "refs/heads/chore/${issue_id}" \
+            "refs/heads/fix/${issue_id}-*" \
+            "refs/heads/feat/${issue_id}-*" \
+            "refs/heads/chore/${issue_id}-*" \
+            2>/dev/null
+    )
+
+    [ "$found" = "1" ]
+}
+
 # --- Project registry ---
 
 ensure_projects_file() {
@@ -4875,6 +5012,13 @@ cmd_clean() {
     maybe_load_project_config >/dev/null 2>&1 || true
 
     meta_file="$(resolve_instance_file_by_issue "$issue_input")" || {
+        # No metadata env file — but a half-failed `swctl create` can still
+        # leave an orphan branch (or unregistered worktree dir) lying around
+        # that blocks the next create.  Sweep that before giving up.
+        if _clean_orphan_state "$issue_input" "$force"; then
+            ok "Cleaned orphan state for issue '$issue_input'."
+            return 0
+        fi
         warn "No tracked worktree found for issue '$issue_input'. Nothing to clean."
         return 0
     }
