@@ -206,6 +206,146 @@ export function configFilePath(): string {
 }
 
 /**
+ * Per-backend skill installation status.  Used by the Config page's
+ * "Test skill" button (and the equivalent /api/user-config/test-skill
+ * endpoint) to give the user a one-click "yes, the agent will
+ * actually find shopware-resolve when it runs" signal.
+ *
+ * Static check only — file existence + content match — no spawn.  If
+ * a future heavier "spawn the agent and ask it to list skills" probe
+ * lands, it goes alongside, not in place of, this fast pre-flight.
+ *
+ * Per backend:
+ *
+ *   claude  Symlink/dir at <claude-config-dir>/skills/shopware-resolve.
+ *           SKILL.md inside has YAML front-matter `name: shopware-resolve`.
+ *           Claude Code's slash-command discovery walks that directory
+ *           tree at startup, so file presence ≡ skill discoverability.
+ *
+ *   codex   <codex-config-dir>/AGENTS.md exists and contains the
+ *           swctl-managed marker block.  Inside the block, the skill's
+ *           own SKILL.md was spliced verbatim so its `name:` line is
+ *           still present.  Codex reads AGENTS.md on every run, so
+ *           presence-of-block ≡ ambient-context-availability.
+ */
+export interface SkillTestResult {
+  ok: boolean
+  backend: KnownBackend
+  /** Absolute path the test inspected (regardless of pass/fail). */
+  location: string
+  /** Human-readable detail; mostly relevant on failure but also used
+   *  to confirm "yes, this is the version you just installed". */
+  detail: string
+  /** Failure reason — null on success. */
+  error?: string
+}
+
+const SKILL_NAME = 'shopware-resolve'
+const CODEX_BLOCK_BEGIN = '<!-- swctl:shopware-resolve:begin -->'
+const CODEX_BLOCK_END   = '<!-- swctl:shopware-resolve:end -->'
+
+/**
+ * Smoke-test the skill install for a backend.  The check is the
+ * minimum that distinguishes "installed and the agent will find it"
+ * from "the install command pretended to succeed but the file is
+ * absent or has been edited away."
+ */
+export function testSkillInstall(backend: KnownBackend): SkillTestResult {
+  const cfgDir = configDirFor(backend)
+
+  if (backend === 'claude') {
+    const dir  = path.join(cfgDir, 'skills', SKILL_NAME)
+    const file = path.join(dir, 'SKILL.md')
+    if (!fs.existsSync(file)) {
+      return {
+        ok: false, backend, location: file, detail: 'SKILL.md not found',
+        error: `Run \`swctl skill install --user --target claude\` on the host to create the symlink at ${dir}.`,
+      }
+    }
+    let body: string
+    try { body = fs.readFileSync(file, 'utf-8') }
+    catch (e: any) {
+      return { ok: false, backend, location: file, detail: 'unreadable', error: e?.message || String(e) }
+    }
+    const frontMatter = readSkillFrontMatterName(body)
+    if (frontMatter !== SKILL_NAME) {
+      return {
+        ok: false, backend, location: file,
+        detail: `front-matter name was "${frontMatter ?? '(missing)'}", expected "${SKILL_NAME}"`,
+        error: 'SKILL.md is present but doesn\'t look like our shopware-resolve skill — was it overwritten?',
+      }
+    }
+    return {
+      ok: true, backend, location: file,
+      detail: `present — ${body.length.toLocaleString()} bytes, name=${frontMatter}`,
+    }
+  }
+
+  // codex — block in AGENTS.md
+  const file = path.join(cfgDir, 'AGENTS.md')
+  if (!fs.existsSync(file)) {
+    return {
+      ok: false, backend, location: file, detail: 'AGENTS.md not found',
+      error: `Run \`swctl skill install --user --target codex\` on the host to create the file with the skill block.`,
+    }
+  }
+  let body: string
+  try { body = fs.readFileSync(file, 'utf-8') }
+  catch (e: any) {
+    return { ok: false, backend, location: file, detail: 'unreadable', error: e?.message || String(e) }
+  }
+  const beginIdx = body.indexOf(CODEX_BLOCK_BEGIN)
+  const endIdx   = body.indexOf(CODEX_BLOCK_END)
+  if (beginIdx < 0 || endIdx < 0 || endIdx < beginIdx) {
+    return {
+      ok: false, backend, location: file,
+      detail: 'swctl-managed block missing',
+      error: 'AGENTS.md exists but lacks the `<!-- swctl:shopware-resolve:* -->` markers — ' +
+             'reinstall via `swctl skill install --user --target codex`.',
+    }
+  }
+  const block = body.slice(beginIdx, endIdx + CODEX_BLOCK_END.length)
+  const blockBody = body.slice(beginIdx + CODEX_BLOCK_BEGIN.length, endIdx)
+  const frontMatter = readSkillFrontMatterName(blockBody)
+  if (frontMatter !== SKILL_NAME) {
+    return {
+      ok: false, backend, location: file,
+      detail: `block present but name="${frontMatter ?? '(missing)'}"`,
+      error: 'AGENTS.md has the markers but no `name: shopware-resolve` front-matter inside — ' +
+             'block was edited; reinstall to repair.',
+    }
+  }
+  return {
+    ok: true, backend, location: file,
+    detail: `block present — ${block.length.toLocaleString()} bytes between markers, name=${frontMatter}`,
+  }
+}
+
+/** Compute the per-backend config dir, mirroring `_ai_backend_config_dir` in swctl. */
+function configDirFor(backend: KnownBackend): string {
+  if (backend === 'claude') {
+    return process.env.CLAUDE_CONFIG_DIR
+        || readUserConfig().ai?.claude?.configDir
+        || path.join(process.env.HOME || '/root', '.claude')
+  }
+  return process.env.CODEX_CONFIG_DIR
+      || readUserConfig().ai?.codex?.configDir
+      || path.join(process.env.HOME || '/root', '.codex')
+}
+
+/**
+ * Pull `name: <value>` out of a SKILL.md front-matter block.  Tolerant
+ * — only matches at the start of a line, ignores leading/trailing
+ * whitespace, accepts both `"shopware-resolve"` and bare token.  Used
+ * by both backends since the codex install splices SKILL.md verbatim
+ * into AGENTS.md, so the front-matter is the same shape.
+ */
+function readSkillFrontMatterName(body: string): string | null {
+  const m = body.match(/^name:\s*['"]?([A-Za-z0-9_.\-]+)['"]?\s*$/m)
+  return m ? m[1] : null
+}
+
+/**
  * Pre-write validation of the AI section.  Checks the cross-field
  * invariants that read-time fallbacks would happily paper over but the
  * user probably didn't intend.  Returns null if OK, an error message if

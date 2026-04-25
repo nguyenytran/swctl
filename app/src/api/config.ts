@@ -55,6 +55,17 @@ export interface TestCliResult {
   error?: string
 }
 
+export interface TestSkillResult {
+  ok: boolean
+  backend: KnownBackend
+  /** Absolute path the server-side check inspected. */
+  location: string
+  /** Human-readable detail (size + name on success, what's missing on failure). */
+  detail: string
+  /** Failure reason — null on success. */
+  error?: string
+}
+
 const USER_CONFIG_URL = '/api/user-config'
 
 export async function fetchConfig(): Promise<ConfigResponse> {
@@ -86,5 +97,16 @@ export async function testCli(backend: KnownBackend): Promise<TestCliResult> {
   const res = await fetch(`${USER_CONFIG_URL}/test-cli?backend=${encodeURIComponent(backend)}`)
   // 400 (unknown backend) returns a TestCliResult-shaped body too,
   // so we don't throw — let the UI surface the error inline.
+  return res.json()
+}
+
+/**
+ * Skill-install pre-flight check.  Static — no spawn.  Confirms the
+ * shopware-resolve skill is installed where the backend will look:
+ *   - claude: ~/.claude/skills/shopware-resolve/SKILL.md
+ *   - codex:  swctl marker block in ~/.codex/AGENTS.md
+ */
+export async function testSkill(backend: KnownBackend): Promise<TestSkillResult> {
+  const res = await fetch(`${USER_CONFIG_URL}/test-skill?backend=${encodeURIComponent(backend)}`)
   return res.json()
 }

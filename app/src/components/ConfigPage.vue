@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import {
-  fetchConfig, saveConfig, testCli,
+  fetchConfig, saveConfig, testCli, testSkill,
   KNOWN_BACKENDS,
   type UserConfig,
   type KnownBackend,
   type TestCliResult,
+  type TestSkillResult,
 } from '@/api/config'
 
 /**
@@ -31,10 +32,14 @@ const saved = ref(false)
 
 const draft = ref<UserConfig>(emptyDraft())
 
-// Per-backend test results from the /api/user-config/test-cli endpoint.
+// Per-backend test results.  Two independent probes:
+//   - testResults / testing: `<bin> --version` (test-cli endpoint)
+//   - skillResults / skillTesting: shopware-resolve install probe (test-skill endpoint)
 // Keyed by backend name; missing key = "never tested in this session".
 const testResults = ref<Partial<Record<KnownBackend, TestCliResult>>>({})
 const testing = ref<Partial<Record<KnownBackend, boolean>>>({})
+const skillResults = ref<Partial<Record<KnownBackend, TestSkillResult>>>({})
+const skillTesting = ref<Partial<Record<KnownBackend, boolean>>>({})
 
 function emptyDraft(): UserConfig {
   return {
@@ -148,6 +153,22 @@ async function onTest(b: KnownBackend) {
     testResults.value = { ...testResults.value, [b]: { ok: false, bin: '', error: e?.message || 'request failed' } }
   } finally {
     testing.value = { ...testing.value, [b]: false }
+  }
+}
+
+async function onTestSkill(b: KnownBackend) {
+  skillTesting.value = { ...skillTesting.value, [b]: true }
+  skillResults.value = { ...skillResults.value, [b]: undefined }
+  try {
+    const r = await testSkill(b)
+    skillResults.value = { ...skillResults.value, [b]: r }
+  } catch (e: any) {
+    skillResults.value = {
+      ...skillResults.value,
+      [b]: { ok: false, backend: b, location: '', detail: '', error: e?.message || 'request failed' },
+    }
+  } finally {
+    skillTesting.value = { ...skillTesting.value, [b]: false }
   }
 }
 
@@ -288,12 +309,24 @@ function strOrUndef(v?: string): string | undefined {
                 class="text-[11px] px-2 py-0.5 rounded border border-border bg-surface-dark text-gray-300 hover:bg-surface hover:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 :disabled="testing[b]"
                 @click="onTest(b)"
+                title="Probe the binary: spawn `<bin> --version` with a 5s timeout"
               >
-                {{ testing[b] ? 'Testing…' : 'Test' }}
+                {{ testing[b] ? 'Testing…' : 'Test CLI' }}
               </button>
 
-              <!-- Inline test result.  Empty until the user clicks Test. -->
-              <span v-if="testResults[b]" class="text-[11px] flex items-center gap-1 max-w-full">
+              <button
+                type="button"
+                class="text-[11px] px-2 py-0.5 rounded border border-border bg-surface-dark text-gray-300 hover:bg-surface hover:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                :disabled="skillTesting[b]"
+                @click="onTestSkill(b)"
+                title="Static check: confirms the shopware-resolve skill is installed where the agent will look (~/.claude/skills/ or ~/.codex/AGENTS.md)"
+              >
+                {{ skillTesting[b] ? 'Checking…' : 'Test skill' }}
+              </button>
+
+              <!-- Inline CLI result.  Empty until the user clicks Test CLI. -->
+              <span v-if="testResults[b]" class="text-[11px] flex items-center gap-1 max-w-full basis-full">
+                <span class="text-gray-500 w-16 flex-shrink-0">CLI:</span>
                 <template v-if="testResults[b]?.ok">
                   <span class="text-emerald-400">✓</span>
                   <span class="text-emerald-300/90 truncate">{{ testResults[b]?.version }}</span>
@@ -303,6 +336,23 @@ function strOrUndef(v?: string): string | undefined {
                   <span class="text-red-400">✗</span>
                   <span class="text-red-300/90 truncate" :title="testResults[b]?.error">
                     {{ testResults[b]?.error }}
+                  </span>
+                </template>
+              </span>
+
+              <!-- Inline skill result.  Empty until the user clicks Test skill. -->
+              <span v-if="skillResults[b]" class="text-[11px] flex items-center gap-1 max-w-full basis-full">
+                <span class="text-gray-500 w-16 flex-shrink-0">Skill:</span>
+                <template v-if="skillResults[b]?.ok">
+                  <span class="text-emerald-400">✓</span>
+                  <span class="text-emerald-300/90 truncate" :title="skillResults[b]?.location">
+                    {{ skillResults[b]?.detail }}
+                  </span>
+                </template>
+                <template v-else>
+                  <span class="text-red-400">✗</span>
+                  <span class="text-red-300/90 truncate" :title="skillResults[b]?.error">
+                    {{ skillResults[b]?.detail || skillResults[b]?.error }}
                   </span>
                 </template>
               </span>

@@ -36,6 +36,7 @@ import {
   validateAiConfig,
   resolveEnabledBackends,
   resolveDefaultBackend,
+  testSkillInstall,
   KNOWN_BACKENDS,
   type KnownBackend,
 } from './lib/config.js'
@@ -635,6 +636,36 @@ app.get('/api/user-config/test-cli', async (c) => {
   })
 
   return c.json(result)
+})
+
+// ── Skill install pre-flight check ────────────────────────────────────
+//
+// Sibling to /test-cli, but answers a different question: "is the
+// shopware-resolve skill installed where the agent will look?"
+//
+//   claude → ~/.claude/skills/shopware-resolve/SKILL.md exists +
+//            front-matter name matches.  Claude Code's slash-command
+//            registry walks that tree at startup, so file presence ≡
+//            slash-command discoverability.
+//
+//   codex  → ~/.codex/AGENTS.md exists, contains the swctl-managed
+//            marker block, and the SKILL.md inside the block has
+//            `name: shopware-resolve` front-matter.  Codex reads
+//            AGENTS.md as ambient context every run, so block presence
+//            ≡ skill availability to the agent.
+//
+// Static check only (no spawn).  Useful as a one-click pre-flight in
+// the /#/config page so the user knows the skill will actually be
+// found before spending a real resolve cycle on it.
+app.get('/api/user-config/test-skill', (c) => {
+  const backend = c.req.query('backend') as KnownBackend | undefined
+  if (!backend || !(KNOWN_BACKENDS as readonly string[]).includes(backend)) {
+    return c.json({
+      ok: false,
+      error: `unknown backend "${backend ?? '(none)'}"; allowed: ${KNOWN_BACKENDS.join(', ')}`,
+    }, 400)
+  }
+  return c.json(testSkillInstall(backend))
 })
 
 app.get('/api/projects', (c) => {

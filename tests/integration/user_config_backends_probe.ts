@@ -17,7 +17,9 @@ import {
   resolveEnabledBackends,
   resolveDefaultBackend,
   validateAiConfig,
+  testSkillInstall,
   type UserConfig,
+  type KnownBackend,
 } from '../../app/server/lib/config.ts'
 
 async function main(): Promise<void> {
@@ -48,6 +50,9 @@ async function main(): Promise<void> {
         break
       case 'validateAiConfig':
         out = validateAiConfig(req.args[0] as Partial<UserConfig>, req.args[1] as UserConfig)
+        break
+      case 'testSkillInstall':
+        out = testSkillInstall(req.args[0] as KnownBackend)
         break
       default:
         process.stdout.write(JSON.stringify({ probeError: `unknown fn: ${req.fn}` }) + '\n')
