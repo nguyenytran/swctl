@@ -7,6 +7,7 @@ import { fetchDiff, fetchGitHubIssues, fetchDefaultIssueLabels } from '@/api'
 import { buildResolveStreamUrl, buildAskStreamUrl, finishResolve } from '@/api/resolve'
 import type { PrInfo, ResolveBackend } from '@/api/resolve'
 import type { GitHubItem } from '@/types'
+import { filterResolvableIssues } from '@/utils/filterResolvable'
 import LogPanel from './LogPanel.vue'
 
 const { instances, refresh: refreshInstances } = useInstances()
@@ -48,6 +49,7 @@ const ghShow = ref(false)
 const ghLoading = ref(false)
 const ghError = ref('')
 const ghItems = ref<GitHubItem[]>([])
+const ghHiddenCount = ref(0)   // issues filtered out because they have an active (open/draft/merged) linked PR
 const ghDefaultLabels = ref<string[]>([])
 const ghSelectedLabels = ref<string[]>([])
 let ghDefaultsLoaded = false
@@ -75,8 +77,17 @@ async function refreshGh() {
         ? 'GitHub authentication required (Dashboard → GitHub).'
         : result.error
       ghItems.value = []
+      ghHiddenCount.value = 0
     } else {
-      ghItems.value = (result.items || []).filter((it) => it.category === 'assigned')
+      // Hide issues already linked to an active PR — resolving them
+      // again would duplicate the fix.  The manual-entry input below
+      // still accepts any URL/number for cases where the user
+      // deliberately wants to work on a covered issue (e.g. to verify
+      // an existing PR with a fresh worktree).
+      const assigned = (result.items || []).filter((it) => it.category === 'assigned')
+      const { kept, hidden } = filterResolvableIssues(assigned)
+      ghItems.value = kept
+      ghHiddenCount.value = hidden
     }
   } catch (err: any) {
     ghError.value = err?.message || 'Failed to fetch'
@@ -335,7 +346,13 @@ onMounted(async () => {
 
           <div v-if="ghLoading" class="text-xs text-gray-500 italic px-1 py-2">Loading…</div>
           <div v-else-if="ghError" class="text-xs text-red-400 px-1 py-2">{{ ghError }}</div>
-          <div v-else-if="ghItems.length === 0" class="text-xs text-gray-600 italic px-1 py-2">No issues match.</div>
+          <div v-else-if="ghItems.length === 0" class="text-xs text-gray-600 italic px-1 py-2">
+            No issues match.
+            <span v-if="ghHiddenCount > 0" class="block mt-1 text-[10px] text-gray-500">
+              ({{ ghHiddenCount }} hidden — already linked to a PR.
+              Paste the URL below to resolve one anyway.)
+            </span>
+          </div>
           <div v-else class="max-h-48 overflow-y-auto border border-border rounded bg-surface-dark">
             <button
               v-for="item in ghItems"
@@ -348,13 +365,28 @@ onMounted(async () => {
               <div class="text-gray-300 truncate">{{ item.title }}</div>
             </button>
           </div>
+          <!-- Helper note when issues were filtered out but some still shown. -->
+          <div
+            v-if="!ghLoading && !ghError && ghItems.length > 0 && ghHiddenCount > 0"
+            class="text-[10px] text-gray-500 italic px-1 py-1.5"
+          >
+            {{ ghHiddenCount }} hidden (already linked to a PR).
+            Paste an issue URL below to override.
+          </div>
         </div>
       </div>
 
-      <!-- New resolve input -->
+      <!-- Manual-entry: paste any GitHub issue URL or #number.  Works for
+           issues that were filtered out of the Browse list above (e.g.
+           already linked to a PR) or live in a repo the list never
+           surfaces. -->
       <div class="p-2 border-t border-border">
+        <label class="block text-[11px] text-gray-500 mb-1" for="resolve-manual-input">
+          Or paste any issue URL / #number:
+        </label>
         <div class="flex gap-1">
           <input
+            id="resolve-manual-input"
             v-model="newIssueUrl"
             placeholder="Issue URL or #number"
             class="flex-1 bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"

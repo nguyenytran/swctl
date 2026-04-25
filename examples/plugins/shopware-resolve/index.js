@@ -835,6 +835,23 @@ function renderResolvePage(el, ctx) {
             <div id="sr-smart-input" class="sr-smart-input" contenteditable="true" spellcheck="false" data-placeholder="Type filter: label:priority/low label:domain/inventory  (Enter to search, Tab to autocomplete)"></div>
             <div id="sr-smart-autocomplete" class="sr-smart-ac" hidden></div>
           </div>
+          <!--
+            Manual-entry: paste any GitHub issue URL or #number and hit
+            Enter / Resolve.  Bypasses both the label-filter above AND
+            the linked-PR filter in the picker below — lets the user
+            resolve anything (including hidden issues) deliberately.
+          -->
+          <div id="sr-manual-row" style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:12px;color:#9ca3af;">
+            <span style="color:#6b7280;flex-shrink:0;">Or paste:</span>
+            <input
+              id="sr-manual-input"
+              type="text"
+              placeholder="Issue URL or #number  (e.g. https://github.com/shopware/shopware/issues/6689 or 6689)"
+              style="flex:1;background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:4px 8px;font-size:12px;"
+              autocomplete="off"
+              spellcheck="false" />
+            <button id="sr-manual-run" class="sr-fetch-btn" style="flex-shrink:0;" disabled>Resolve</button>
+          </div>
           <div id="sr-issue-picker" class="sr-issue-picker" style="display:none;"></div>
           <div id="sr-selected-count" class="sr-selected-count" style="display:none;"></div>
         </div>
@@ -1154,35 +1171,110 @@ function renderResolvePage(el, ctx) {
       if (defaultLabels.length > 0) params.set('labels', selectedLabels.join(','))
       const res = await fetch(`/api/github/issues?${params}`)
       const data = await res.json()
-      const issues = (data.items || []).filter(i => !i.isPR)
+      const nonPrs = (data.items || []).filter(i => !i.isPR)
+
+      // Two-stage filter, policy mirrored from
+      // app/src/utils/filterResolvable.ts + tests in
+      // tests/integration/filter_resolvable.bats — keep all three in sync.
+      //
+      // Stage 1 — onlyBug (default on): Resolve is scoped to fixing
+      //   bugs.  Improvements, Stories, Tasks, or issues with no type
+      //   are hidden here.  Case-insensitive match on issueType.  The
+      //   manual-entry input below is the escape hatch for non-Bug
+      //   issues.
+      //
+      // Stage 2 — no-active-linked-PR: hides issues whose linked PRs
+      //   include an open/draft/merged PR (resolving them would
+      //   duplicate in-flight or already-shipped work).  All-closed or
+      //   no linkedPRs = fair game.
+      //
+      // Unknown future states are treated as active (safe default:
+      // hide and force the user to override via manual entry rather
+      // than risk duplicating work).
+      const isBug = (it) => String(it.issueType || '').toLowerCase() === 'bug'
+      const hasActivePr = (it) => {
+        const prs = Array.isArray(it.linkedPRs) ? it.linkedPRs : []
+        return prs.some(pr => pr && pr.state !== 'closed')
+      }
+      let hiddenByType = 0
+      let hiddenByPr = 0
+      const issues = nonPrs.filter((it) => {
+        if (!isBug(it)) { hiddenByType++; return false }
+        if (hasActivePr(it)) { hiddenByPr++; return false }
+        return true
+      })
+      const hiddenCount = hiddenByType + hiddenByPr
 
       if (issues.length === 0) {
-        pickerEl.innerHTML = '<div style="padding:12px;color:#6b7280;font-size:12px;">No issues found.</div>'
+        const reasons = []
+        if (hiddenByType > 0) reasons.push(`${hiddenByType} non-Bug`)
+        if (hiddenByPr > 0)   reasons.push(`${hiddenByPr} already linked to a PR`)
+        const hint = hiddenCount > 0
+          ? `<div style="padding:12px;color:#6b7280;font-size:12px;">
+               No resolvable Bug issues.
+               <span style="display:block;margin-top:4px;color:#9ca3af;font-size:11px;">
+                 (${reasons.join(', ')} hidden.
+                 Paste the URL in the manual-entry input above to
+                 resolve any issue anyway.)
+               </span>
+             </div>`
+          : '<div style="padding:12px;color:#6b7280;font-size:12px;">No issues found.</div>'
+        pickerEl.innerHTML = hint
         pickerEl.style.display = ''
         updateSelectedCount()
         return
       }
 
       pickerEl.style.display = ''
-      pickerEl.innerHTML = issues.map(i => `
-        <div class="sr-issue-row" data-number="${i.number}" data-url="${escape(i.url || '')}">
+      let hiddenFooter = ''
+      if (hiddenCount > 0) {
+        const parts = []
+        if (hiddenByType > 0) parts.push(`${hiddenByType} non-Bug`)
+        if (hiddenByPr   > 0) parts.push(`${hiddenByPr} linked to a PR`)
+        hiddenFooter = `<div style="padding:8px 12px;color:#6b7280;font-size:11px;font-style:italic;border-top:1px solid #1f2937;">
+             ${parts.join(' · ')} hidden.
+             Paste the URL in the manual-entry input to resolve any issue anyway.
+           </div>`
+      }
+      // Render issue rows.  The #<number> is an <a> that opens the
+      // issue on GitHub in a new tab (middle-click / cmd-click behaves
+      // like any other link; normal click opens in a new tab and does
+      // NOT toggle the row's checkbox — user request).  Row body still
+      // acts as the checkbox-toggle target so the usual "click the
+      // title to select" ergonomic stays.
+      pickerEl.innerHTML = issues.map(i => {
+        const issueUrl = i.url || (i.repo && i.number
+          ? `https://github.com/${i.repo}/issues/${i.number}`
+          : `https://github.com/shopware/shopware/issues/${i.number}`)
+        return `
+        <div class="sr-issue-row" data-number="${i.number}" data-url="${escape(issueUrl)}">
           <input type="checkbox" />
-          <span class="sr-issue-num">#${i.number}</span>
+          <a class="sr-issue-num" href="${escape(issueUrl)}" target="_blank" rel="noopener noreferrer"
+             title="Open #${i.number} on GitHub"
+             style="color:#60a5fa;text-decoration:none;">#${i.number}</a>
           <span class="sr-issue-title">${escape(i.title)}</span>
           <span class="sr-issue-labels">${(i.labels || []).slice(0, 3).map(l =>
             `<span class="sr-issue-label" style="border-left:2px solid #${l.color || '666'}">${escape(l.name)}</span>`
           ).join('')}</span>
         </div>
-      `).join('')
+      `
+      }).join('') + hiddenFooter
 
       // Wire checkboxes
       pickerEl.querySelectorAll('.sr-issue-row').forEach(row => {
         const cb = row.querySelector('input[type=checkbox]')
         const num = row.dataset.number
         const url = row.dataset.url
+        const numLink = row.querySelector('.sr-issue-num')
 
         row.addEventListener('click', (e) => {
-          if (e.target === cb) return // let checkbox handle itself
+          if (e.target === cb) return          // let checkbox handle itself
+          // Clicking the #<number> link opens GitHub — don't also
+          // toggle the row's checkbox.  Without this guard the row's
+          // click handler would flip the selection state, which is
+          // confusing (the user meant "go look at the issue", not
+          // "queue it for resolve").
+          if (numLink && (e.target === numLink || numLink.contains(e.target))) return
           cb.checked = !cb.checked
           cb.dispatchEvent(new Event('change'))
         })
@@ -1206,6 +1298,70 @@ function renderResolvePage(el, ctx) {
       fetchBtn.textContent = 'Fetch issues'
       updateSelectedCount()
     }
+  })
+
+  // ---- Manual-entry: paste any issue URL or #number and Resolve ----
+  //
+  // Bypasses both the label filter (above) and the linked-PR filter
+  // (in the picker) — lets the user resolve anything deliberately.
+  // Implementation: replace `selectedIssues` with a single-item set
+  // and dispatch a click on the same btn handler.  Reuses the whole
+  // existing batch pipeline (stepper, console, result card) without
+  // duplicating its logic.
+  const manualInput = el.querySelector('#sr-manual-input')
+  const manualBtn   = el.querySelector('#sr-manual-run')
+
+  // Normalize the input: GitHub URL, `owner/repo#N`, or plain `#N`/`N`.
+  // Returns '' for input we can't turn into a stream argument.
+  function normalizeIssueRef(raw) {
+    const s = String(raw || '').trim()
+    if (!s) return ''
+    // Full GitHub URL: keep as-is (the server parses the `/issues/N` form).
+    if (/^https?:\/\/github\.com\/[^/]+\/[^/]+\/issues\/\d+/.test(s)) return s
+    // owner/repo#NNN
+    const m1 = s.match(/^([^/\s]+)\/([^/\s#]+)#(\d+)$/)
+    if (m1) return `https://github.com/${m1[1]}/${m1[2]}/issues/${m1[3]}`
+    // #NNN  or  NNN  → use the repo field as the repo (default shopware/shopware).
+    const m2 = s.match(/^#?(\d+)$/)
+    if (m2) {
+      const repo = (repoInput.value || 'shopware/shopware').trim()
+      return `https://github.com/${repo}/issues/${m2[1]}`
+    }
+    return ''
+  }
+
+  const updateManualBtn = () => {
+    manualBtn.disabled = !normalizeIssueRef(manualInput.value)
+  }
+  manualInput.addEventListener('input', updateManualBtn)
+  manualInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !manualBtn.disabled) {
+      e.preventDefault()
+      manualBtn.click()
+    }
+  })
+
+  manualBtn.addEventListener('click', () => {
+    const url = normalizeIssueRef(manualInput.value)
+    if (!url) return
+    // Kick off a single-issue resolve by stashing the value in
+    // selectedIssues and re-using the same btn click handler as the
+    // "Resolve selected" button.
+    selectedIssues.clear()
+    selectedIssues.add(url)
+    updateSelectedCount()
+    // Visually deselect any picker rows so the user isn't surprised
+    // that "selected" state is reset.
+    pickerEl.querySelectorAll('.sr-issue-row.selected').forEach(r => {
+      r.classList.remove('selected')
+      const cb = r.querySelector('input[type=checkbox]')
+      if (cb) cb.checked = false
+    })
+    btn.click()
+    // Clear the input so a follow-up "Resolve" doesn't accidentally
+    // fire on the same URL again.
+    manualInput.value = ''
+    updateManualBtn()
   })
 
   // Wire the concurrency dropdown.  Value persists in localStorage
