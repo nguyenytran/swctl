@@ -242,6 +242,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
             </div>
           </div>
           <div class="sr-result-actions">
+            <button class="sr-result-btn" data-transcript="${issueId}" title="View per-step transcript and token usage">📊 Transcript</button>
             <button class="sr-result-btn sr-result-btn-primary" data-goto="/dashboard/instance/${issueId}">View Detail</button>
             ${prHtml ? `<a class="sr-result-btn" href="${resultEl.querySelector?.('a')?.href || '#'}" target="_blank">Open PR</a>` : ''}
           </div>
@@ -279,6 +280,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
             </div>
           </div>
           <div class="sr-result-actions">
+            <button class="sr-result-btn" data-transcript="${issueId}" title="View per-step transcript and token usage">📊 Transcript</button>
             ${canResume ? `<button class="sr-result-btn sr-result-btn-primary" data-resume="${issueId}" data-next-step="${nextStep}" title="Re-launch Claude with --resume and pick up from Step ${nextStep}">↻ Resume from Step ${nextStep}</button>` : ''}
             <button class="sr-result-btn" data-goto="/dashboard/instance/${issueId}">View Detail</button>
           </div>
@@ -309,6 +311,14 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
       btn.addEventListener('click', (ev) => {
         ev.preventDefault()
         goTo(btn.getAttribute('data-goto'))
+      })
+    })
+
+    // Wire transcript buttons (success + failure cards both render one).
+    resultEl.querySelectorAll('[data-transcript]').forEach((btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        openTranscriptModal(btn.getAttribute('data-transcript'))
       })
     })
 
@@ -2006,6 +2016,196 @@ function escape(s) {
   return String(s).replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
   ))
+}
+
+// ─── Transcript modal ───────────────────────────────────────────────────────
+//
+// Reads /api/skill/resolve/transcript?issueId=N and renders the per-step
+// breakdown in a centered overlay modal.  Header strip shows totals
+// (tokens in/out, cached, reasoning, cost, duration); body is an
+// accordion of steps, each toggle-able.  Esc / background-click /
+// X-button closes; the modal owns its own DOM so multiple instances
+// don't stack.  Idempotent — calling it twice just rebuilds the
+// modal content.
+
+function fmtTokens(n) {
+  return n > 0 ? n.toLocaleString() : '—'
+}
+
+function fmtCost(usd) {
+  if (usd === null || usd === undefined) return '—'
+  return '$' + Number(usd).toFixed(2)
+}
+
+function fmtDuration(ms) {
+  if (!ms || ms < 0) return '—'
+  const s = Math.round(ms / 1000)
+  if (s < 60) return s + 's'
+  const m = Math.floor(s / 60), rs = s % 60
+  if (m < 60) return rs ? `${m}m ${rs}s` : `${m}m`
+  const h = Math.floor(m / 60), rm = m % 60
+  return rm ? `${h}h ${rm}m` : `${h}h`
+}
+
+function stepHeading(s) {
+  if (s.step === 0) return 'Preamble'
+  return s.name ? `Step ${s.step}: ${s.name}` : `Step ${s.step}`
+}
+
+async function openTranscriptModal(issueId) {
+  // Tear down any prior modal so we never stack.
+  document.querySelectorAll('.sr-tr-overlay').forEach((n) => n.remove())
+
+  // Inject styles once.
+  if (!document.getElementById('sr-tr-styles')) {
+    const style = document.createElement('style')
+    style.id = 'sr-tr-styles'
+    style.textContent = `
+      .sr-tr-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 24px; }
+      .sr-tr-modal { background: #0f172a; border: 1px solid #1f2937; border-radius: 8px; width: min(900px, 100%); max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+      .sr-tr-head  { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid #1f2937; }
+      .sr-tr-title { font: 600 14px ui-sans-serif, sans-serif; color: #e5e7eb; }
+      .sr-tr-close { margin-left: auto; background: transparent; border: none; color: #9ca3af; font-size: 18px; cursor: pointer; padding: 4px 8px; border-radius: 4px; }
+      .sr-tr-close:hover { background: #1f2937; color: #fff; }
+      .sr-tr-totals { padding: 10px 18px; border-bottom: 1px solid #1f2937; background: #111827; font: 11px ui-monospace, monospace; color: #9ca3af; display: flex; flex-wrap: wrap; gap: 4px 16px; }
+      .sr-tr-totals .lbl { color: #6b7280; }
+      .sr-tr-totals .num-in   { color: #60a5fa; }
+      .sr-tr-totals .num-out  { color: #34d399; }
+      .sr-tr-totals .num-cached  { color: #6b7280; }
+      .sr-tr-totals .num-reason  { color: #c084fc; }
+      .sr-tr-totals .num-cost    { color: #fbbf24; }
+      .sr-tr-totals .right    { margin-left: auto; color: #6b7280; }
+      .sr-tr-body  { flex: 1; overflow: auto; }
+      .sr-tr-empty { padding: 32px 18px; color: #9ca3af; font-size: 13px; text-align: center; }
+      .sr-tr-step  { border-bottom: 1px solid #1f2937; }
+      .sr-tr-step:last-child { border-bottom: none; }
+      .sr-tr-step-head {
+        display: grid; grid-template-columns: 14px 1fr auto auto auto auto;
+        gap: 12px; align-items: center;
+        padding: 10px 18px; cursor: pointer; transition: background 0.1s;
+        background: transparent; border: none; width: 100%; text-align: left;
+        font: inherit; color: inherit;
+      }
+      .sr-tr-step-head:hover { background: #111827; }
+      .sr-tr-step-caret { color: #6b7280; font-size: 11px; }
+      .sr-tr-step-name  { color: #e5e7eb; font: 600 13px ui-sans-serif, sans-serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .sr-tr-step-meta  { font: 11px ui-monospace, monospace; color: #6b7280; min-width: 60px; text-align: right; }
+      .sr-tr-step-tok-in  { font: 11px ui-monospace, monospace; color: #60a5fa; min-width: 70px; text-align: right; }
+      .sr-tr-step-tok-out { font: 11px ui-monospace, monospace; color: #34d399; min-width: 70px; text-align: right; }
+      .sr-tr-step-body  { padding: 8px 18px 14px 44px; background: #0a1020; border-top: 1px solid #1f2937; max-height: 360px; overflow: auto; }
+      .sr-tr-line { font: 11px/1.55 ui-monospace, monospace; color: #cbd5e1; white-space: pre-wrap; word-break: break-word; margin: 0; }
+    `
+    document.head.appendChild(style)
+  }
+
+  // Build the modal scaffold up front so we can show "Loading…" while we
+  // fetch.  Avoids a flash of empty modal on slow networks.
+  const overlay = document.createElement('div')
+  overlay.className = 'sr-tr-overlay'
+  overlay.innerHTML = `
+    <div class="sr-tr-modal" role="dialog" aria-label="Resolve transcript for #${escape(issueId)}">
+      <div class="sr-tr-head">
+        <span class="sr-tr-title">Transcript — Issue #${escape(issueId)}</span>
+        <button class="sr-tr-close" aria-label="Close">✕</button>
+      </div>
+      <div class="sr-tr-totals" id="sr-tr-totals">Loading…</div>
+      <div class="sr-tr-body" id="sr-tr-body"></div>
+    </div>
+  `
+  document.body.appendChild(overlay)
+
+  const close = () => overlay.remove()
+  overlay.querySelector('.sr-tr-close').addEventListener('click', close)
+  overlay.addEventListener('click', (ev) => {
+    if (ev.target === overlay) close()
+  })
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') {
+      close()
+      document.removeEventListener('keydown', onKey)
+    }
+  }
+  document.addEventListener('keydown', onKey)
+
+  // Fetch + render.
+  let data
+  try {
+    const res = await fetch(`/api/skill/resolve/transcript?issueId=${encodeURIComponent(issueId)}`)
+    data = await res.json()
+  } catch (err) {
+    overlay.querySelector('#sr-tr-totals').textContent = ''
+    overlay.querySelector('#sr-tr-body').innerHTML =
+      `<div class="sr-tr-empty">Failed to load transcript: ${escape(String(err && err.message || err))}</div>`
+    return
+  }
+
+  if (!data || !Array.isArray(data.steps) || data.steps.length === 0) {
+    overlay.querySelector('#sr-tr-totals').textContent = ''
+    overlay.querySelector('#sr-tr-body').innerHTML = `
+      <div class="sr-tr-empty">
+        No transcript yet.<br>
+        <span style="color:#6b7280;font-size:11px;">
+          Transcripts started recording in v0.5.9. Earlier runs don't have one;
+          the next time you resolve this issue, every line is captured here.
+        </span>
+      </div>`
+    return
+  }
+
+  // Totals strip.
+  const t = data.totals.tokens
+  const totalsEl = overlay.querySelector('#sr-tr-totals')
+  totalsEl.innerHTML = `
+    <span class="lbl">Total:</span>
+    <span><span class="num-in">${escape(fmtTokens(t.input))}</span> in</span>
+    ${t.cachedInput > 0 ? `<span><span class="num-cached">${escape(fmtTokens(t.cachedInput))}</span> cached</span>` : ''}
+    <span><span class="num-out">${escape(fmtTokens(t.output))}</span> out</span>
+    ${t.reasoning > 0 ? `<span><span class="num-reason">${escape(fmtTokens(t.reasoning))}</span> reasoning</span>` : ''}
+    ${data.totals.costUsd !== null ? `<span><span class="num-cost">${escape(fmtCost(data.totals.costUsd))}</span></span>` : ''}
+    <span class="right">${escape(fmtDuration(data.totals.durationMs))} · ${data.totals.lineCount} lines</span>
+  `
+
+  // Per-step accordion.  Auto-expand the highest-numbered step (most
+  // recent activity); rest are collapsed until the user clicks.
+  const body = overlay.querySelector('#sr-tr-body')
+  const lastStep = data.steps[data.steps.length - 1]
+  const initialOpen = lastStep ? lastStep.step : -1
+
+  for (const step of data.steps) {
+    const stepEl = document.createElement('div')
+    stepEl.className = 'sr-tr-step'
+    const isOpen = step.step === initialOpen
+    stepEl.innerHTML = `
+      <button class="sr-tr-step-head" type="button">
+        <span class="sr-tr-step-caret">${isOpen ? '▾' : '▸'}</span>
+        <span class="sr-tr-step-name">${escape(stepHeading(step))}</span>
+        <span class="sr-tr-step-meta">${escape(String(step.lines.length))} lines</span>
+        <span class="sr-tr-step-meta">${escape(fmtDuration(step.durationMs))}</span>
+        <span class="sr-tr-step-tok-in">${escape(fmtTokens(step.tokens.input))} in</span>
+        <span class="sr-tr-step-tok-out">${escape(fmtTokens(step.tokens.output))} out</span>
+      </button>
+      <div class="sr-tr-step-body" style="${isOpen ? '' : 'display:none;'}">
+        ${step.lines.map((row) => `<pre class="sr-tr-line">${escape(row.line)}</pre>`).join('')}
+      </div>
+    `
+    const head = stepEl.querySelector('.sr-tr-step-head')
+    const bodyEl = stepEl.querySelector('.sr-tr-step-body')
+    const caret = stepEl.querySelector('.sr-tr-step-caret')
+    head.addEventListener('click', () => {
+      const showing = bodyEl.style.display !== 'none'
+      bodyEl.style.display = showing ? 'none' : ''
+      caret.textContent = showing ? '▸' : '▾'
+    })
+    body.appendChild(stepEl)
+  }
+}
+
+// Expose on window for ad-hoc console invocation:
+//   openTranscriptModal('6689')
+// Useful when debugging or when the user wants to view the transcript
+// for an issue that doesn't currently have a result-card on screen.
+if (typeof window !== 'undefined') {
+  window.openTranscriptModal = openTranscriptModal
 }
 
 export default plugin
