@@ -365,6 +365,100 @@ export interface SpawnArgsResult {
  *     capturing Codex's session id from its first-line output + plumbing
  *     it into metadata).
  */
+/**
+ * Build the resolve prompt per backend.
+ *
+ * Backends consume prompts very differently:
+ *
+ *   - **Claude Code** invokes the bundled `shopware-resolve` skill via
+ *     its slash-command registry (`~/.claude/skills/shopware-resolve/`
+ *     populated by `swctl skill install --target claude`).  The whole
+ *     8-step workflow content is the skill's SKILL.md; Claude only
+ *     needs the trigger string.
+ *
+ *   - **Codex** has no slash-command registry.  The skill content was
+ *     written into `~/.codex/AGENTS.md` (or the worktree's AGENTS.md)
+ *     by `swctl skill install --target codex` — Codex picks it up as
+ *     ambient context.  But Codex still needs an explicit task
+ *     description: "go run that workflow on this issue, edit files,
+ *     commit."  Without that, `codex exec` will produce a chatty
+ *     "here's what I'd do" response and exit cleanly with zero
+ *     changes — which is exactly what the user hit on issue #6689
+ *     ("No commits on fix/6689 vs trunk").
+ *
+ * The Codex prompt deliberately:
+ *   - states the worktree path so Codex knows where to operate (also
+ *     passed via `--cd` but agents tend to anchor on prompt content)
+ *   - emphasises that this is a NON-INTERACTIVE run (no approvals
+ *     coming) and that `--full-auto` already grants workspace-write,
+ *     so it should make decisions and proceed
+ *   - mentions the swctl step markers (`### STEP N END`) so the UI's
+ *     progress stepper can light up just like it does for Claude
+ *   - tells it to commit before moving on (Codex defaults to NOT
+ *     committing — opposite of `claude --permission-mode acceptEdits`)
+ */
+export interface ResolvePromptInput {
+  backend: ResolveBackend
+  /** Full issue ref (URL or `#N` or `N`).  Surfaced verbatim to the agent. */
+  issue: string
+  /** Numeric id extracted from the issue ref — used as the `swctl_setup` arg in Step 5. */
+  issueId: string
+  /** Absolute path to the git worktree the agent should operate in. */
+  worktreePath: string
+}
+
+export function buildResolvePrompt(input: ResolvePromptInput): string {
+  if (input.backend === 'codex') {
+    // Codex has NO slash-command (`/foo`) or at-mention (`@foo`) skill
+    // registry — neither token resolves to anything special.  AGENTS.md
+    // (installed by `swctl skill install --target codex`) is just
+    // ambient context Codex reads on every run.  The prompt has to be
+    // a concrete task description, not a magic invocation.
+    //
+    // We still need to spell out the run-time invariants — `--full-auto`
+    // grants workspace-write but Codex defaults to NOT committing,
+    // which produced the "No commits on fix/<id> vs trunk" empty
+    // result the user hit on issue #6689.  Telling it to commit per
+    // step is what turns a chatty no-op into a reviewable diff.
+    return [
+      `# Resolve Shopware issue ${input.issue}`,
+      ``,
+      `Apply the 8-step Shopware-issue-resolution workflow described in`,
+      `your AGENTS.md (verify → root cause → implement → review → flow`,
+      `impact → test → PR → triage) to this issue.  The full per-step`,
+      `criteria are in AGENTS.md; this prompt is just the task envelope.`,
+      ``,
+      `Issue:     ${input.issue}`,
+      `Issue id:  ${input.issueId}    ← pass to swctl_setup in Step 5`,
+      `Worktree:  ${input.worktreePath}    ← already on the fix branch; do all edits + commits here`,
+      ``,
+      `Run-time invariants (this is a NON-INTERACTIVE \`codex exec --full-auto\` run):`,
+      `- Workspace-write sandbox granted; you have edit access to the`,
+      `  worktree above.  No human will approve anything mid-run; make`,
+      `  decisions and proceed.`,
+      `- Run tests as part of Step 6.  Surface failures in the final summary.`,
+      `- COMMIT each step's changes before moving on (use conventional-commit`,
+      `  messages; reference issue ${input.issueId} in the body).  Codex's default`,
+      `  is NOT to commit — without explicit commits, swctl's diff tab will`,
+      `  read "No commits on fix/${input.issueId} vs trunk" and the run produces`,
+      `  nothing reviewable.`,
+      `- Print "### STEP N END" after each completed step so swctl's UI`,
+      `  stepper can track progress.`,
+      ``,
+      `Do not just describe what you'd do — actually edit files, run tests,`,
+      `and commit.  The diff this run produces is what gets reviewed.`,
+      ``,
+      `If AGENTS.md is empty or missing the resolve workflow, run`,
+      `\`swctl skill install --user --target codex\` on the host first, then`,
+      `retry — that command splices the workflow content into ~/.codex/AGENTS.md.`,
+    ].join('\n')
+  }
+
+  // Claude — slash-command form.  The skill's SKILL.md carries every
+  // ground rule + per-step artifact requirement; this is just the trigger.
+  return `/shopware-resolve ${input.issue}\n\n(issue id for Step 5 swctl refresh: ${input.issueId})`
+}
+
 export function buildSpawnArgs(input: SpawnArgsInput): SpawnArgsResult {
   if (input.backend === 'codex') {
     return {
@@ -673,14 +767,10 @@ export function startResolveStream(
   const issueMatch = issue.match(/\/issues\/(\d+)/) || issue.match(/^(\d+)$/)
   const issueId = issueMatch ? issueMatch[1] : issue.replace(/\D/g, '')
 
-  // The skill's own SKILL.md carries the ground rules, per-step artifact
-  // requirements, and stop criterion — see
-  // `skills/shopware-resolve/SKILL.md` "Ground rules" / "Required
-  // artifact per step" sections.  All three entry points (swctl UI,
-  // swctl CLI, direct `claude /shopware-resolve`) use those same rules,
-  // so we keep this prompt minimal: just the slash command + the
-  // explicit issue id for Step 5.
-  const prompt = `/shopware-resolve ${issue}\n\n(issue id for Step 5 swctl refresh: ${issueId})`
+  // Prompt is built per-backend inside the SSE handler below — Codex
+  // needs the resolved worktreePath baked into the prompt, and that's
+  // not known until the worktree create finishes.  See `buildResolvePrompt`
+  // for the per-backend rationale.
 
   recordStart({ issue, project, mode })
 
@@ -857,7 +947,7 @@ export function startResolveStream(
       ts: Date.now(),
     })
 
-    // Step 3: Launch Claude Code
+    // Step 3: Launch the agent (Claude or Codex) via buildSpawnArgs below.
     //
     // Non-interactive runs need every tool Claude will use to be allow-listed
     // up-front — otherwise `Bash(gh …)`, `Bash(git commit …)`, etc. sit
@@ -868,23 +958,18 @@ export function startResolveStream(
     //
     // `--effort max` gives each turn the widest thinking budget so the skill
     // has room to actually execute every step instead of rushing to a summary.
+    //
+    // The dead `claudeArgs` literal that used to live here was a v0.5.7
+    // remnant; PR #6's `buildSpawnArgs` replaced it.  Removed in this
+    // commit (was triggering TS2454 once the prompt build moved below).
     const allowedTools = [
       'Bash', 'Edit', 'Write', 'Read', 'Grep', 'Glob',
       'Task', 'WebFetch', 'WebSearch', 'TodoWrite',
     ].join(' ')
     // Pre-assign a session id so we can `claude --resume <uuid>` later
-    // from the /api/skill/resolve/resume/stream endpoint.
+    // from the /api/skill/resolve/resume/stream endpoint.  Codex ignores
+    // it (its session model is server-managed under ~/.codex/sessions/).
     const sessionId = newSessionId()
-    const claudeArgs = [
-      '-p', prompt,
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--permission-mode', 'acceptEdits',
-      '--allowedTools', allowedTools,
-      '--session-id', sessionId,
-      '--effort', 'max',
-      '--add-dir', worktreePath,
-    ]
 
     // Persist the session id + running status up-front so a crash/abort
     // still leaves something the UI can resume from.  Also pin the
@@ -911,6 +996,14 @@ export function startResolveStream(
     })
 
     const startTime = Date.now()
+    // Build the per-backend prompt now that worktreePath is known.  Claude
+    // gets the slash-command form (the bundled SKILL.md does the heavy
+    // lifting); Codex gets a concrete task description that explicitly
+    // tells it to commit per step — without that, `codex exec --full-auto`
+    // chats but doesn't write, and the diff tab shows "No commits on
+    // fix/<id> vs trunk".  See buildResolvePrompt for the full rationale.
+    const prompt = buildResolvePrompt({ backend, issue, issueId, worktreePath })
+
     // Resolve the actual (bin, args) pair for the SELECTED backend.  Before
     // v0.5.10 this block hard-coded `backendBinary('claude')` with a
     // "falling back to claude" warning log — so picking Codex in the UI
