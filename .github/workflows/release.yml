@@ -134,30 +134,20 @@ jobs:
             --title '${{ steps.version.outputs.tag }}' \
             --notes-file '${{ steps.notes.outputs.file }}'
 
-      - name: Update Formula URL + SHA in this repo
-        run: |
-          sed -i -E \
-            -e "s|url \"https://github.com/[^/]+/swctl/releases/download/v[0-9.]+/swctl-[0-9.]+\.tar\.gz\"|url \"https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/swctl-${{ steps.version.outputs.version }}.tar.gz\"|" \
-            -e "s|sha256 \"[0-9a-f]{64}\"|sha256 \"${{ steps.sha.outputs.sha }}\"|" \
-            Formula/swctl.rb
-          grep -q '${{ steps.sha.outputs.sha }}' Formula/swctl.rb \
-            || { echo "::error::Formula SHA substitution failed"; exit 1; }
-
-      - name: Commit Formula update to main
-        run: |
-          git config user.name  'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git fetch origin main
-          git checkout main
-          git merge --ff-only FETCH_HEAD || true
-          git add Formula/swctl.rb
-          if git diff --cached --quiet; then
-            echo "Formula already up to date on main."
-          else
-            MSG="chore: update formula SHA for ${{ steps.version.outputs.tag }} (auto-committed by Release workflow)"
-            git commit -m "$MSG"
-            git push origin main
-          fi
+      # NB: We deliberately do NOT auto-commit Formula/swctl.rb back to
+      # this repo's main branch.  Two reasons:
+      #   1. main has branch protection requiring 3 status checks before
+      #      any push.  The workflow's bot can't satisfy them on a
+      #      tag-triggered run, so the push is rejected with
+      #      'GH006: Protected branch update failed' (verified on v0.5.8).
+      #   2. The Formula/swctl.rb in this repo is documentation only.
+      #      `brew install nguyenytran/tap/swctl` reads from the tap repo,
+      #      not from here — the tap is the actual source of truth, and
+      #      it gets PUT-updated below via the GitHub Contents API
+      #      (which doesn't trip branch protection).
+      # If we ever want this repo's Formula in sync, do it as a separate
+      # PR after the release lands so it goes through the normal review +
+      # status-check pipeline.
 
       - name: Update Formula in homebrew-tap
         env:
