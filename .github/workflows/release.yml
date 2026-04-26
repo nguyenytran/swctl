@@ -156,13 +156,35 @@ jobs:
         # in the tap.  Requires TAP_DEPLOY_TOKEN (fine-grained PAT with
         # Contents: write on nguyenytran/homebrew-tap).  Without it, the
         # step is skipped with a warning so the release still succeeds.
+        #
+        # Substitution happens INLINE here — we don't commit the edited
+        # Formula/swctl.rb back to this repo's main (PR #9 removed that
+        # path because branch protection blocked it).  The in-repo
+        # Formula is documentation; the tap is the source of truth for
+        # `brew install`.  Reading the in-repo file as a TEMPLATE and
+        # substituting URL + SHA before upload keeps it that way.
         run: |
           if [ -z "$TAP_TOKEN" ]; then
             echo "::warning::TAP_DEPLOY_TOKEN secret not set — skipping homebrew-tap update."
             echo "::warning::Update nguyenytran/homebrew-tap:Formula/swctl.rb manually, or add the PAT and re-run."
             exit 0
           fi
-          content_b64=$(base64 -w0 < Formula/swctl.rb)
+
+          # Substitute the new tag's URL + SHA into the in-repo Formula
+          # template; emit the result to /tmp.  The in-repo file is
+          # whatever version it was last manually synced to (often
+          # several releases stale) — without this substitution we'd
+          # upload a regressed Formula and break `brew upgrade swctl`.
+          sed -E \
+            -e "s|url \"https://github.com/[^/]+/swctl/releases/download/v[0-9.]+/swctl-[0-9.]+\.tar\.gz\"|url \"https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/swctl-${{ steps.version.outputs.version }}.tar.gz\"|" \
+            -e "s|sha256 \"[0-9a-f]{64}\"|sha256 \"${{ steps.sha.outputs.sha }}\"|" \
+            Formula/swctl.rb > /tmp/formula-new.rb
+          grep -q '${{ steps.sha.outputs.sha }}' /tmp/formula-new.rb \
+            || { echo "::error::Formula SHA substitution failed — sed didn't match"; exit 1; }
+          grep -q '${{ steps.version.outputs.tag }}/swctl-${{ steps.version.outputs.version }}' /tmp/formula-new.rb \
+            || { echo "::error::Formula URL substitution failed — sed didn't match"; exit 1; }
+
+          content_b64=$(base64 -w0 < /tmp/formula-new.rb)
           current_sha=$(curl -sS \
               -H "Authorization: token $TAP_TOKEN" \
               -H "Accept: application/vnd.github+json" \
