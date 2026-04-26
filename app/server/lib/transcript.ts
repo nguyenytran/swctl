@@ -135,6 +135,20 @@ export function hasTranscript(issueId: string): boolean {
   return false
 }
 
+/**
+ * Surface the resolve backend recorded for an issue (`claude` / `codex`),
+ * or `null` if the instance has no env file or RESOLVE_BACKEND wasn't
+ * persisted (pre-0.5.7 runs).  Used by the issues table to render a
+ * per-row backend badge so the user can tell at a glance which AI ran
+ * each transcript.
+ *
+ * Cheap — same reader as hasTranscript, no file walking.
+ */
+export function getResolveBackend(issueId: string): 'claude' | 'codex' | null {
+  const meta = readInstanceMeta(issueId)
+  return meta ? meta.backend : null
+}
+
 // ── Instance metadata reader ────────────────────────────────────────────────
 
 interface InstanceMeta {

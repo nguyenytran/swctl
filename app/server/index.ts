@@ -28,7 +28,7 @@ import {
 } from './lib/github.js'
 import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
 import { startResolveStream, startResolveResumeStream, listResolveRuns, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
-import { parseTranscript, hasTranscript } from './lib/transcript.js'
+import { parseTranscript, hasTranscript, getResolveBackend } from './lib/transcript.js'
 import {
   readUserConfig,
   writeUserConfig,
@@ -132,6 +132,7 @@ app.get('/api/instances', cacheGet({ ttlMs: 5_000, tag: 'instances' }), async (c
       inst.containerInfo = ''
     }
     inst.hasTranscript = hasTranscript(inst.issueId)
+    inst.resolveBackend = getResolveBackend(inst.issueId)
   }
 
   // Discover external worktrees via git (Claude Code, Codex, manual)
