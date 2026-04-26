@@ -1705,12 +1705,19 @@ function renderResolvePage(el, ctx) {
       return
     }
 
+    // Show only instances with a real resolve transcript on disk.  An
+    // instance created by `swctl create` (no resolve run yet) and
+    // managed-but-pre-feature instances both have no session log to
+    // show; surfacing them here was just noise.  `hasTranscript` is
+    // computed server-side per instance in /api/instances.
     const resolveInstances = instances.filter(i =>
-      i.kind === 'managed' && (i.branch?.startsWith('fix/') || i.branch?.startsWith('resolve/'))
+      i.kind === 'managed'
+      && (i.branch?.startsWith('fix/') || i.branch?.startsWith('resolve/'))
+      && i.hasTranscript === true
     )
 
     if (resolveInstances.length === 0) {
-      tableContainer.innerHTML = '<div style="color:#6b7280;font-size:12px;padding:8px;">No resolved issues yet. Use the form above to start.</div>'
+      tableContainer.innerHTML = '<div style="color:#6b7280;font-size:12px;padding:8px;">No resolved issues with transcripts yet. Run a resolve from the form above to populate this list.</div>'
       tableLoading.textContent = ''
       painting = false
       return
@@ -1727,6 +1734,7 @@ function renderResolvePage(el, ctx) {
           <tr>
             <th>Issue</th>
             <th>Branch</th>
+            <th>AI</th>
             <th>Status</th>
             <th>PR</th>
             <th style="text-align:right;">Actions</th>
@@ -1748,6 +1756,17 @@ function renderResolvePage(el, ctx) {
               statusHtml = '<span class="sr-pr-badge" style="background:#1f2937;color:#9ca3af;">complete</span>'
             }
 
+            // Backend badge — Claude (orange/amber), Codex (purple),
+            // unknown (gray dim).  Shape matches the existing sr-pr-badge
+            // style but uses backend-specific colors so the eye can scan
+            // the column quickly.
+            let backendHtml = '<span class="sr-pr-badge sr-pr-none">—</span>'
+            if (item.resolveBackend === 'claude') {
+              backendHtml = '<span class="sr-pr-badge" style="background:rgba(217,119,6,0.18);color:#fbbf24;border:1px solid rgba(217,119,6,0.4);">Claude</span>'
+            } else if (item.resolveBackend === 'codex') {
+              backendHtml = '<span class="sr-pr-badge" style="background:rgba(124,58,237,0.18);color:#c084fc;border:1px solid rgba(124,58,237,0.4);">Codex</span>'
+            }
+
             let prCell = '<span class="sr-pr-badge sr-pr-none">no PR</span>'
             if (hasPr) {
               const cls = pr.draft ? 'sr-pr-draft' : pr.state === 'MERGED' ? 'sr-pr-merged' : pr.state === 'CLOSED' ? 'sr-pr-closed' : 'sr-pr-open'
@@ -1759,10 +1778,17 @@ function renderResolvePage(el, ctx) {
             }
 
             const actions = []
-            // Transcript button — always available; modal handles the
-            // empty-state if no transcript file exists for this issue
-            // (e.g. resolve ran before v0.5.9 added persistence).
-            actions.push(`<button class="sr-btn" data-transcript="${escape(item.issueId)}" title="View per-step transcript and token usage">📊</button>`)
+            // Transcript button — render ONLY when a session log is
+            // actually reachable for this issue.  Server computes
+            // `hasTranscript` per instance in /api/instances by stat'ing
+            // the relevant session-log path (Claude: ~/.claude/projects/
+            // <encoded-cwd>/<sessionId>.jsonl; Codex: matching rollout in
+            // ~/.codex/sessions/).  Hiding the button on rows without a
+            // transcript avoids the "click → modal opens → 'No transcript
+            // yet'" paper cut.
+            if (item.hasTranscript) {
+              actions.push(`<button class="sr-btn" data-transcript="${escape(item.issueId)}" title="View per-step transcript and token usage">📊</button>`)
+            }
             actions.push(`<button class="sr-btn" data-goto="/dashboard/instance/${escape(item.issueId)}" style="text-decoration:none;">Detail</button>`)
             actions.push(`<button class="sr-btn" data-action="push" data-issue="${escape(item.issueId)}">Push</button>`)
             if (!hasPr) {
@@ -1774,6 +1800,7 @@ function renderResolvePage(el, ctx) {
             return `<tr>
               <td><span style="color:#60a5fa;font-weight:600;">#${escape(item.issueId)}</span></td>
               <td style="color:#9ca3af;font-size:11px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escape(item.branch || '—')}</td>
+              <td>${backendHtml}</td>
               <td>${statusHtml}</td>
               <td>${prCell}</td>
               <td style="text-align:right;display:flex;gap:4px;justify-content:flex-end;">${actions.join('')}</td>

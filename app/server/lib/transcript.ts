@@ -106,6 +106,49 @@ export function parseTranscript(issueId: string): ParsedTranscript {
 // intentionally gone.  startResolveStream + startResolveResumeStream no
 // longer call them; the only consumer is parseTranscript above.
 
+/**
+ * Cheap "is a transcript reachable for this issue" probe — locates the
+ * session log without parsing it.  Used to decide whether to render the
+ * 📊 button in the issues table (showing the button on rows that would
+ * just open an empty modal is a UX paper-cut we'd rather avoid).
+ *
+ * Cost:
+ *   - Claude: 1 fs.existsSync.  Microseconds.
+ *   - Codex:  walks ~/.codex/sessions/ year/month/day buckets, reads
+ *             the first line of each rollout file in the last 30 days,
+ *             matches by cwd.  Bounded but not free.  Caller is expected
+ *             to call this in a loop over a handful of issues; the
+ *             walk repeats per call which is fine at typical scale
+ *             (5–20 tracked instances, 5s response cache upstream).
+ *             If perf becomes an issue, swap to a per-request cwd→file
+ *             index built once and shared across all instances.
+ */
+export function hasTranscript(issueId: string): boolean {
+  const meta = readInstanceMeta(issueId)
+  if (!meta) return false
+  if (meta.backend === 'claude') {
+    return locateClaudeSessionFile(meta.worktreePath, meta.sessionId) !== null
+  }
+  if (meta.backend === 'codex') {
+    return locateCodexSessionFile(meta.worktreePath, meta.startedAt) !== null
+  }
+  return false
+}
+
+/**
+ * Surface the resolve backend recorded for an issue (`claude` / `codex`),
+ * or `null` if the instance has no env file or RESOLVE_BACKEND wasn't
+ * persisted (pre-0.5.7 runs).  Used by the issues table to render a
+ * per-row backend badge so the user can tell at a glance which AI ran
+ * each transcript.
+ *
+ * Cheap — same reader as hasTranscript, no file walking.
+ */
+export function getResolveBackend(issueId: string): 'claude' | 'codex' | null {
+  const meta = readInstanceMeta(issueId)
+  return meta ? meta.backend : null
+}
+
 // ── Instance metadata reader ────────────────────────────────────────────────
 
 interface InstanceMeta {
