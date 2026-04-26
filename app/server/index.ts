@@ -28,7 +28,7 @@ import {
 } from './lib/github.js'
 import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
 import { startResolveStream, startResolveResumeStream, listResolveRuns, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
-import { parseTranscript } from './lib/transcript.js'
+import { parseTranscript, hasTranscript } from './lib/transcript.js'
 import {
   readUserConfig,
   writeUserConfig,
@@ -115,7 +115,9 @@ app.get('/api/instances', cacheGet({ ttlMs: 5_000, tag: 'instances' }), async (c
     checkoutIssueId = m?.[1] || m?.[2] || m?.[3] || ''
   } catch {}
 
-  // Enrich managed instances with Docker container status
+  // Enrich managed instances with Docker container status + transcript
+  // availability (used by the resolve plugin's issues table to decide
+  // whether to render the 📊 Transcript button on each row).
   for (const inst of instances) {
     inst.kind = 'managed'
     if (checkoutIssueId && inst.issueId === checkoutIssueId) {
@@ -129,6 +131,7 @@ app.get('/api/instances', cacheGet({ ttlMs: 5_000, tag: 'instances' }), async (c
       inst.containerStatus = 'missing'
       inst.containerInfo = ''
     }
+    inst.hasTranscript = hasTranscript(inst.issueId)
   }
 
   // Discover external worktrees via git (Claude Code, Codex, manual)

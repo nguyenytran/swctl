@@ -106,6 +106,35 @@ export function parseTranscript(issueId: string): ParsedTranscript {
 // intentionally gone.  startResolveStream + startResolveResumeStream no
 // longer call them; the only consumer is parseTranscript above.
 
+/**
+ * Cheap "is a transcript reachable for this issue" probe — locates the
+ * session log without parsing it.  Used to decide whether to render the
+ * 📊 button in the issues table (showing the button on rows that would
+ * just open an empty modal is a UX paper-cut we'd rather avoid).
+ *
+ * Cost:
+ *   - Claude: 1 fs.existsSync.  Microseconds.
+ *   - Codex:  walks ~/.codex/sessions/ year/month/day buckets, reads
+ *             the first line of each rollout file in the last 30 days,
+ *             matches by cwd.  Bounded but not free.  Caller is expected
+ *             to call this in a loop over a handful of issues; the
+ *             walk repeats per call which is fine at typical scale
+ *             (5–20 tracked instances, 5s response cache upstream).
+ *             If perf becomes an issue, swap to a per-request cwd→file
+ *             index built once and shared across all instances.
+ */
+export function hasTranscript(issueId: string): boolean {
+  const meta = readInstanceMeta(issueId)
+  if (!meta) return false
+  if (meta.backend === 'claude') {
+    return locateClaudeSessionFile(meta.worktreePath, meta.sessionId) !== null
+  }
+  if (meta.backend === 'codex') {
+    return locateCodexSessionFile(meta.worktreePath, meta.startedAt) !== null
+  }
+  return false
+}
+
 // ── Instance metadata reader ────────────────────────────────────────────────
 
 interface InstanceMeta {

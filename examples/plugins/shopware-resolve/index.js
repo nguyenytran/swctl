@@ -1759,10 +1759,17 @@ function renderResolvePage(el, ctx) {
             }
 
             const actions = []
-            // Transcript button — always available; modal handles the
-            // empty-state if no transcript file exists for this issue
-            // (e.g. resolve ran before v0.5.9 added persistence).
-            actions.push(`<button class="sr-btn" data-transcript="${escape(item.issueId)}" title="View per-step transcript and token usage">📊</button>`)
+            // Transcript button — render ONLY when a session log is
+            // actually reachable for this issue.  Server computes
+            // `hasTranscript` per instance in /api/instances by stat'ing
+            // the relevant session-log path (Claude: ~/.claude/projects/
+            // <encoded-cwd>/<sessionId>.jsonl; Codex: matching rollout in
+            // ~/.codex/sessions/).  Hiding the button on rows without a
+            // transcript avoids the "click → modal opens → 'No transcript
+            // yet'" paper cut.
+            if (item.hasTranscript) {
+              actions.push(`<button class="sr-btn" data-transcript="${escape(item.issueId)}" title="View per-step transcript and token usage">📊</button>`)
+            }
             actions.push(`<button class="sr-btn" data-goto="/dashboard/instance/${escape(item.issueId)}" style="text-decoration:none;">Detail</button>`)
             actions.push(`<button class="sr-btn" data-action="push" data-issue="${escape(item.issueId)}">Push</button>`)
             if (!hasPr) {
