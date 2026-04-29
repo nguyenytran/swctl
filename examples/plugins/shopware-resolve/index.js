@@ -1191,11 +1191,14 @@ function renderResolvePage(el, ctx) {
       <!-- Stepper + console (shown during resolve) -->
       <div class="sr-section" id="sr-resolve-panel" style="display:none;">
         <!-- Create-phase stepper.  Mirrors the 5 ### CREATE STEP N
-             markers `swctl create` emits (preflight → worktree → sync
-             → provision → frontend).  Visible during the create phase
+             markers swctl create emits (preflight, worktree, sync,
+             provision, frontend).  Visible during the create phase
              that precedes every resolve; fades to subdued once
              complete so the main 8-step resolve stepper below takes
-             visual priority. -->
+             visual priority.
+             NOTE: do not add backticks anywhere in this comment — it
+             lives inside a JS template literal, so any backtick would
+             terminate the literal and break the whole plugin parse. -->
         <div id="sr-create-stepper" class="sr-create-stepper">
           <div class="sr-create-step" data-create-step="1"><span class="sr-create-step-num">1</span><span class="sr-create-step-label">Pre-flight</span></div>
           <div class="sr-create-step" data-create-step="2"><span class="sr-create-step-num">2</span><span class="sr-create-step-label">Worktree</span></div>
