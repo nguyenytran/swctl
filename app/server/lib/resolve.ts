@@ -1213,11 +1213,35 @@ export function startResolveStream(
       })
     }
 
+    // Throttle the `tokens` SSE event so a chatty agent doesn't fire
+    // hundreds of UI updates per second.  Trigger when EITHER 50,000
+    // tokens have accumulated since last emit OR 2 seconds have
+    // elapsed — whichever comes first.  Final state is always emitted
+    // alongside `done` regardless of throttle.
+    let lastTokensEmitted = 0
+    let lastTokenEmitTs = Date.now()
+    const TOKEN_EMIT_THRESHOLD = 50_000
+    const TOKEN_EMIT_INTERVAL_MS = 2_000
+    const maybeEmitTokens = () => {
+      const delta = streamState.tokensTotal - lastTokensEmitted
+      const elapsed = Date.now() - lastTokenEmitTs
+      if (delta >= TOKEN_EMIT_THRESHOLD || (delta > 0 && elapsed >= TOKEN_EMIT_INTERVAL_MS)) {
+        sendEvent('tokens', {
+          total: streamState.tokensTotal,
+          budget: tokenBudget,
+          ts: Date.now(),
+        })
+        lastTokensEmitted = streamState.tokensTotal
+        lastTokenEmitTs = Date.now()
+      }
+    }
+
     const onData = (chunk: Buffer) => {
       for (const line of chunk.toString().split('\n')) {
         if (!line) continue
         observeStreamLine(streamState, line)
         sendEvent('log', { line, ts: Date.now() })
+        maybeEmitTokens()
 
         // Check budget AFTER observeStreamLine has updated tokensTotal.
         // First crossing wins — subsequent lines still flow through to
@@ -1268,6 +1292,15 @@ export function startResolveStream(
           CLAUDE_RESOLVE_COST: String(streamState.cost),
         })
         emit({ type: 'instance-changed' })
+        // Final tokens event — guarantees the UI renders the exact
+        // final number even when the run finishes between the throttle
+        // boundaries (e.g., very fast resolve where the throttle never
+        // fired, or a budget-exceeded abort partway between emits).
+        sendEvent('tokens', {
+          total: streamState.tokensTotal,
+          budget: tokenBudget,
+          ts: Date.now(),
+        }).catch(() => {})
         sendEvent('done', {
           exitCode,
           elapsed: Date.now() - startTime,

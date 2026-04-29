@@ -287,13 +287,51 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
     } catch {}
   })
 
+  // Live token-usage badge.  Updates from the server's throttled
+  // `tokens` events (every 50K tokens or 2s during a run, plus a
+  // final emit alongside `done`).  Color-codes by % budget used.
+  const tokensBadge = el.querySelector('#sr-tokens-badge')
+  let lastBudgetExceeded = false
+  es.addEventListener('tokens', (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      const total = Number(data.total) || 0
+      const budget = data.budget == null ? null : Number(data.budget)
+      lastBudgetExceeded = budget !== null && total > budget
+      if (!tokensBadge) return
+      tokensBadge.style.display = ''
+      const fmtTok = (n) => n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + 'M'
+                          : n >= 1_000 ? (n / 1_000).toFixed(0) + 'K'
+                          : String(n)
+      if (budget === null) {
+        tokensBadge.textContent = `🪙 ${fmtTok(total)} (no cap)`
+        tokensBadge.style.color = '#9ca3af'
+        tokensBadge.style.borderColor = '#374151'
+      } else {
+        const pct = Math.round(100 * total / budget)
+        let color = '#34d399', border = '#065f46'  // green <50%
+        if (pct >= 80) { color = '#f87171'; border = '#7f1d1d' }
+        else if (pct >= 50) { color = '#fbbf24'; border = '#b45309' }
+        tokensBadge.textContent = `🪙 ${fmtTok(total)} / ${fmtTok(budget)} (${pct}%)`
+        tokensBadge.style.color = color
+        tokensBadge.style.borderColor = border
+      }
+    } catch {}
+  })
+
   es.addEventListener('done', async (e) => {
     let exitCode = 0
     let lastCompletedStepFromServer = 0
+    let budgetExceeded = false
+    let tokensTotal = 0
+    let tokenBudget = null
     try {
       const data = JSON.parse(e.data)
       exitCode = data.exitCode ?? 0
       lastCompletedStepFromServer = data.lastCompletedStep ?? 0
+      budgetExceeded = data.budgetExceeded === true
+      tokensTotal = Number(data.tokensTotal) || 0
+      tokenBudget = data.tokenBudget == null ? null : Number(data.tokenBudget)
     } catch {}
     es.close()
 
@@ -366,6 +404,47 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
         const openPrBtn = resultEl.querySelector('.sr-result-actions a.sr-result-btn')
         if (prLink && openPrBtn) openPrBtn.href = prLink.href
       } catch {}
+
+    } else if (budgetExceeded) {
+      // Run hit the configured token budget and we SIGTERM'd the agent.
+      // Distinct card variant — this isn't a bug, it's a configured
+      // limit being respected.  Surfaces the tokens-vs-budget number
+      // so the user can decide whether to bump the cap and retry, or
+      // investigate why the run blew through.
+      updateStepper(currentStep, 'failed')
+      stepInfo.textContent = ''
+      appendLine(out, `\n─── Stopped at token budget (${tokensTotal.toLocaleString()} / ${(tokenBudget || 0).toLocaleString()}) ───`, 'err')
+      const fmtTok = (n) => n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + 'M' : (n / 1_000).toFixed(0) + 'K'
+      const overage = tokenBudget ? Math.round(100 * (tokensTotal - tokenBudget) / tokenBudget) : 0
+
+      resultEl.innerHTML = `
+        <div class="sr-result-card failure" style="border-color:#b45309;background:#78350f15;">
+          <div class="sr-result-icon">🪙</div>
+          <div class="sr-result-body">
+            <div class="sr-result-title" style="color:#fbbf24;">Stopped at token budget</div>
+            <div class="sr-result-meta">
+              <span>Issue #${issueId}</span>
+              <span>•</span>
+              <span style="color:#fbbf24;">${fmtTok(tokensTotal)} used</span>
+              <span>/</span>
+              <span style="color:#9ca3af;">${fmtTok(tokenBudget || 0)} cap</span>
+              ${overage > 0 ? `<span style="color:#f87171;">(+${overage}%)</span>` : ''}
+              <span>•</span>
+              <span style="color:#9ca3af;">Last completed: Step ${currentStep}</span>
+            </div>
+          </div>
+          <div class="sr-result-actions">
+            <button class="sr-result-btn" data-transcript="${issueId}" title="View per-step transcript and token usage">📊 Transcript</button>
+            <button class="sr-result-btn" data-goto="/dashboard/instance/${issueId}">View Detail</button>
+          </div>
+        </div>
+        <div style="margin-top:8px;font-size:11px;color:#9ca3af;line-height:1.5;">
+          <strong style="color:#fbbf24;">What happened:</strong>
+          The resolve agent crossed the configured per-run token cap.  It was sent SIGTERM and stopped at the line above.<br>
+          <strong style="color:#9ca3af;">Next steps:</strong>
+          edit <code>~/.swctl/config.json</code> → <code>features.resolveTokenBudget</code> to raise the limit, or open the 📊 transcript above to see which step burned through the budget (often a runaway tool-use loop).
+        </div>
+      `
 
     } else if (inCreatePhase) {
       // Failure happened DURING the create phase — the resolve agent
@@ -1216,7 +1295,16 @@ function renderResolvePage(el, ctx) {
           <div class="sr-step" data-step="7"><span class="sr-step-num">7</span><span class="sr-step-label">PR</span></div>
           <div class="sr-step" data-step="8"><span class="sr-step-num">8</span><span class="sr-step-label">Triage</span></div>
         </div>
-        <div id="sr-step-info" style="color:#9ca3af;font-size:12px;margin-bottom:8px;"></div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+          <div id="sr-step-info" style="color:#9ca3af;font-size:12px;flex:1;min-width:200px;"></div>
+          <!-- Live token badge.  Updates from the server's tokens SSE
+               event; hidden until the first event arrives.  Color shifts
+               from gray (no budget) → green (under 50%) → amber (50-80%)
+               → red (over 80%) as the running total approaches the cap.
+               Reminder: no backticks anywhere here — would terminate
+               the surrounding JS template literal. -->
+          <div id="sr-tokens-badge" style="display:none;font-size:11px;font-family:ui-monospace,monospace;padding:3px 8px;border-radius:10px;border:1px solid #374151;background:#111827;color:#9ca3af;white-space:nowrap;"></div>
+        </div>
         <div id="sr-result"></div>
         <div id="sr-console" class="sr-console"></div>
       </div>
