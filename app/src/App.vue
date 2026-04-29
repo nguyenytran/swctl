@@ -2,6 +2,7 @@
 import { onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import GitHubAuthButton from '@/components/GitHubAuthButton.vue'
+import ActiveOperationsBar from '@/components/ActiveOperationsBar.vue'
 import { useInstances } from '@/composables/useInstances'
 import { useProjects } from '@/composables/useProjects'
 import { useActiveProject } from '@/composables/useActiveProject'
@@ -81,6 +82,11 @@ function routePath(p: string): string {
         </div>
       </div>
       <div class="flex items-center gap-3">
+        <!-- Persistent active-operations indicator: visible on every
+             route so a long-running create the user kicked off from
+             /resolve stays visible while they navigate to /worktrees
+             or /dashboard.  Renders nothing when no ops are active. -->
+        <ActiveOperationsBar />
         <GitHubAuthButton />
         <span class="text-xs text-gray-500">worktree manager</span>
       </div>

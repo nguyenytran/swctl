@@ -1,10 +1,16 @@
 import { ref, onUnmounted } from 'vue'
 
 export interface ServerEvent {
-  type: 'stream-start' | 'stream-done' | 'instance-changed'
+  type: 'stream-start' | 'stream-progress' | 'stream-done' | 'instance-changed'
   streamId?: string
   source?: 'mcp' | 'ui'
   exitCode?: number
+  // stream-progress payload (mirrors server/lib/events.ts ServerEvent):
+  kind?: string
+  issueId?: string
+  step?: number
+  stepName?: string
+  total?: number
 }
 
 const connected = ref(false)
@@ -19,6 +25,10 @@ function connect() {
   eventSource = new EventSource('/api/events')
 
   eventSource.addEventListener('stream-start', (e) => {
+    lastEvent.value = JSON.parse(e.data)
+  })
+
+  eventSource.addEventListener('stream-progress', (e) => {
     lastEvent.value = JSON.parse(e.data)
   })
 
