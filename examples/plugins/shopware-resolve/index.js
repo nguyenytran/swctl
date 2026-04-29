@@ -160,6 +160,11 @@ async function retryAfterCreateFailure(issue, project, mode, out, stepInfo, upda
 }
 
 function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper, resultEl, onDone, updateCreateStepper) {
+  // Lazy permission request — first resolve in a fresh browser pops
+  // the OS prompt; subsequent runs are no-ops.  See notifyResolveDone
+  // for why and when notifications fire.
+  maybeRequestNotificationPermission()
+
   const params = new URLSearchParams()
   params.set('issue', issue)
   if (project) params.set('project', project)
@@ -169,6 +174,12 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
 
   const url = `/api/skill/resolve/stream?${params.toString()}`
   appendLine(out, `[client] opening stream: ${url}`)
+  // Capture start time so the done handler can report duration in
+  // the OS notification body.  The server's `elapsed` field arrives
+  // alongside `done`, but a client-side timer is robust against the
+  // server-side timing being slightly off (we want what the user
+  // experienced as wall time, not what the server measured).
+  const streamStartedAt = Date.now()
   const es = new EventSource(url)
   let currentStep = 1
   // No-op fallback so callers that haven't been updated yet still work.
@@ -563,6 +574,21 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
 
     // Scroll result card into view
     resultEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+
+    // OS notification when the user is on another tab.  Picks the
+    // right title + body for the three terminal states; silently
+    // no-ops when the user is focused on this tab or has denied
+    // permission.  See notifyResolveDone() for the full policy.
+    const notifyStatus = budgetExceeded
+      ? 'budget-exceeded'
+      : (exitCode === 0 ? 'done' : 'failed')
+    notifyResolveDone({
+      issueId,
+      status: notifyStatus,
+      durationMs: Date.now() - streamStartedAt,
+      stepsCompleted: stepsEnded.size,
+      tokensTotal,
+    })
 
     try {
       await fetch('/api/skill/resolve/finish', {
@@ -2429,6 +2455,77 @@ function escape(s) {
   return String(s).replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
   ))
+}
+
+// ─── Browser notifications on long-run completion ──────────────────────────
+//
+// Resolve runs take 5-25 minutes for Codex / 3-10 for Claude.  Users
+// reasonably want to walk away (other windows, lunch, another task) and
+// come back when the run finishes.  The result card already exists, but
+// the user doesn't see it unless they're focused on the resolve tab.
+//
+// Strategy:
+//   - Lazily request permission on the FIRST resolve start (one-time
+//     browser prompt); user grants or denies; choice sticks via the
+//     browser's permissions store.
+//   - On `done`, fire a notification ONLY when the tab is in the
+//     background (document.hidden = true).  No need to interrupt a
+//     user who's already looking at the result.
+//   - Notification body distinguishes the three terminal states:
+//     resolved / failed / budget-exceeded.  Click focuses the tab.
+//
+// All operations no-op gracefully when:
+//   - The Notification API isn't available (old browser, embedded view)
+//   - Permission was denied — we don't beg
+//   - The tab is in the foreground
+
+function maybeRequestNotificationPermission() {
+  if (typeof window === 'undefined' || !('Notification' in window)) return
+  if (Notification.permission === 'default') {
+    Notification.requestPermission().catch(() => {})
+  }
+}
+
+function notifyResolveDone(opts) {
+  if (typeof window === 'undefined' || !('Notification' in window)) return
+  if (Notification.permission !== 'granted') return
+  if (typeof document !== 'undefined' && !document.hidden) return  // user is focused; no need
+
+  const { issueId, status, durationMs, stepsCompleted, tokensTotal } = opts
+  const titleByStatus = {
+    'done':            '✅ Resolve complete',
+    'failed':          '❌ Resolve failed',
+    'budget-exceeded': '🪙 Token budget hit',
+  }
+  const title = titleByStatus[status] || 'Resolve finished'
+  const minutes = Math.round((durationMs || 0) / 60000)
+  const fmtTok = (n) => n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + 'M'
+                      : n >= 1_000 ? (n / 1_000).toFixed(0) + 'K'
+                      : String(n)
+  const parts = [`Issue #${issueId}`]
+  if (stepsCompleted != null) parts.push(`${stepsCompleted}/8 steps`)
+  if (minutes > 0) parts.push(`${minutes}m`)
+  if (tokensTotal) parts.push(`${fmtTok(tokensTotal)} tokens`)
+
+  try {
+    const n = new Notification(title, {
+      body: parts.join(' • '),
+      // tag dedupes — if the user re-runs the same issue in the
+      // background, only the latest notification stays.
+      tag: `swctl-resolve-${issueId}`,
+      requireInteraction: false,
+    })
+    n.onclick = () => {
+      window.focus()
+      n.close()
+    }
+    // Auto-dismiss after 15s — Chrome ignores this and keeps it until
+    // the user clicks, but Firefox honours it.  No harm either way.
+    setTimeout(() => { try { n.close() } catch {} }, 15000)
+  } catch {
+    // Browser may throw if the user is in a private window with
+    // restricted permissions, etc.  Silent best-effort.
+  }
 }
 
 // ─── Transcript modal ───────────────────────────────────────────────────────
