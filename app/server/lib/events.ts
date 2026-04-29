@@ -1,8 +1,14 @@
 export interface ServerEvent {
-  type: 'stream-start' | 'stream-done' | 'instance-changed'
+  type: 'stream-start' | 'stream-progress' | 'stream-done' | 'instance-changed'
   streamId?: string
   source?: 'mcp' | 'ui'
   exitCode?: number
+  // stream-progress payload (drives the UI's persistent active-ops card):
+  kind?: string         // 'create' | 'clean' | …
+  issueId?: string      // issue id, parsed from streamId
+  step?: number         // 0..total
+  stepName?: string
+  total?: number        // 5 for create; 0 for ops without step markers
 }
 
 type Listener = (event: ServerEvent) => void

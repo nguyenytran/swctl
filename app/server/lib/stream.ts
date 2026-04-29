@@ -9,6 +9,32 @@ const STATE_DIR = process.env.SWCTL_STATE_DIR || ''
 
 const activeStreams = new Map<string, ChildProcess>()
 
+/**
+ * Per-stream progress snapshot.  Updated as the underlying `swctl`
+ * subprocess emits `### CREATE STEP N START: <name>` markers; cleared
+ * when the stream ends.  Drives /api/operations and the global
+ * `stream-progress` events the UI listens to for the persistent
+ * "active operations" card.
+ *
+ * Step is 0 when the stream has started but no marker has fired yet
+ * (e.g., during arg parsing / early bash setup before pre-flight).
+ * Total is whatever the stream's natural step count is — currently 5
+ * for `create` (preflight → worktree → sync → provision → frontend);
+ * other commands (clean, refresh, switch) just stay at 0/0.
+ */
+interface StreamProgress {
+  streamId: string
+  /** Operation kind parsed from streamId prefix — 'create', 'clean', etc. */
+  kind: string
+  /** Issue id parsed from streamId suffix; '' for non-issue ops. */
+  issueId: string
+  step: number      // 0..total
+  stepName: string  // e.g. "Sync"
+  total: number     // 5 for create, 0 for non-stepped ops
+  startedAt: number
+}
+const activeProgress = new Map<string, StreamProgress>()
+
 export function isStreamActive(id: string): boolean {
   return activeStreams.has(id)
 }
@@ -18,7 +44,18 @@ export function cancelStream(streamId: string): boolean {
   if (!child) return false
   child.kill()
   activeStreams.delete(streamId)
+  activeProgress.delete(streamId)
   return true
+}
+
+/**
+ * Snapshot of every operation currently in flight, sorted by start
+ * time (most recent first).  Used by /api/operations on initial UI
+ * load — the live `stream-progress` events drive incremental updates
+ * after that.
+ */
+export function listActiveOperations(): StreamProgress[] {
+  return Array.from(activeProgress.values()).sort((a, b) => b.startedAt - a.startedAt)
 }
 
 export function streamSwctl(c: Context, args: string[], streamId: string, onAbort?: () => void, source?: 'mcp' | 'ui') {
@@ -52,9 +89,28 @@ export function streamSwctl(c: Context, args: string[], streamId: string, onAbor
   })
 
   activeStreams.set(streamId, child)
+  // Seed the per-stream progress snapshot.  step/stepName start empty
+  // and get filled in as the bash subprocess emits CREATE STEP markers.
+  // streamId is by convention "<kind>:<issueId>" — split for the UI.
+  const colonIdx = streamId.indexOf(':')
+  const kind = colonIdx > 0 ? streamId.slice(0, colonIdx) : streamId
+  const issueId = colonIdx > 0 ? streamId.slice(colonIdx + 1) : ''
+  const total = kind === 'create' ? 5 : 0  // only create is currently markered
+  activeProgress.set(streamId, {
+    streamId,
+    kind,
+    issueId,
+    step: 0,
+    stepName: '',
+    total,
+    startedAt: startTime,
+  })
   emit({ type: 'stream-start', streamId, source })
 
-  const cleanup = () => { activeStreams.delete(streamId) }
+  const cleanup = () => {
+    activeStreams.delete(streamId)
+    activeProgress.delete(streamId)
+  }
 
   return streamSSE(c, async (stream) => {
     const sendEvent = async (event: string, data: object) => {
@@ -63,9 +119,34 @@ export function streamSwctl(c: Context, args: string[], streamId: string, onAbor
       } catch {}
     }
 
+    // Regex matches `### CREATE STEP N START: <name>` lines emitted
+    // by `swctl create`.  We update the per-stream progress snapshot
+    // and broadcast a `stream-progress` event to /api/events listeners
+    // (for the UI's persistent active-operations card).
+    const CREATE_STEP_RE = /^###\s*CREATE\s+STEP\s+(\d)\s+START\s*:?\s*(.*)$/i
+
     const onData = (chunk: Buffer) => {
       for (const line of chunk.toString().split('\n')) {
-        if (line) sendEvent('log', { line, ts: Date.now() })
+        if (!line) continue
+        sendEvent('log', { line, ts: Date.now() })
+
+        const m = line.match(CREATE_STEP_RE)
+        if (m) {
+          const prog = activeProgress.get(streamId)
+          if (prog) {
+            prog.step = parseInt(m[1], 10)
+            prog.stepName = m[2].trim()
+            emit({
+              type: 'stream-progress',
+              streamId,
+              kind: prog.kind,
+              issueId: prog.issueId,
+              step: prog.step,
+              stepName: prog.stepName,
+              total: prog.total,
+            })
+          }
+        }
       }
     }
 
