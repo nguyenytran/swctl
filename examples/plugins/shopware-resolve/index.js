@@ -1288,6 +1288,22 @@ function renderResolvePage(el, ctx) {
               spellcheck="false" />
             <button id="sr-manual-run" class="sr-fetch-btn" style="flex-shrink:0;" disabled>Resolve</button>
           </div>
+          <!-- Free-text search above the picker.  Pure client-side
+               filter — runs against the issue title + number + labels
+               of rows already loaded.  For label-based GitHub-side
+               filtering, use the smart-input above (label:foo).  Cmd-K
+               (mac) / Ctrl-K (others) focuses this input from anywhere
+               on the page; Esc clears it and unhides all rows. -->
+          <div id="sr-search-wrap" style="display:none;margin-top:8px;align-items:center;gap:8px;">
+            <input
+              id="sr-issue-search"
+              type="search"
+              placeholder="Filter loaded issues — title, #number, label (⌘K)"
+              style="flex:1;background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:4px 8px;font-size:12px;"
+              autocomplete="off"
+              spellcheck="false" />
+            <span id="sr-search-count" style="color:#6b7280;font-size:11px;font-family:ui-monospace,monospace;white-space:nowrap;"></span>
+          </div>
           <div id="sr-issue-picker" class="sr-issue-picker" style="display:none;"></div>
           <div id="sr-selected-count" class="sr-selected-count" style="display:none;"></div>
         </div>
@@ -1350,6 +1366,9 @@ function renderResolvePage(el, ctx) {
   const smartInput = el.querySelector('#sr-smart-input')
   const smartAc = el.querySelector('#sr-smart-autocomplete')
   const pickerEl = el.querySelector('#sr-issue-picker')
+  const searchWrap = el.querySelector('#sr-search-wrap')
+  const searchInput = el.querySelector('#sr-issue-search')
+  const searchCount = el.querySelector('#sr-search-count')
   const countEl = el.querySelector('#sr-selected-count')
   const out = el.querySelector('#sr-console')
   const resolvePanel = el.querySelector('#sr-resolve-panel')
@@ -1358,6 +1377,70 @@ function renderResolvePage(el, ctx) {
 
   let currentStream = null
   let selectedIssues = new Set()
+
+  // ─── Client-side picker search ───────────────────────────────────────
+  // Free-text filter that runs against rows ALREADY LOADED in the
+  // picker.  Distinct from the smart-filter input above (which controls
+  // GitHub-side label filters and re-fetches).  Triggered by typing in
+  // sr-issue-search OR by Cmd-K / Ctrl-K from anywhere on the page.
+  // Esc clears.  Shows "X of Y matching" so the user knows whether the
+  // filter is hiding things vs. nothing matched.
+  function applyPickerSearch(query) {
+    if (!pickerEl || !searchCount) return
+    const q = (query || '').trim().toLowerCase()
+    const rows = pickerEl.querySelectorAll('.sr-issue-row')
+    let visible = 0
+    for (const row of rows) {
+      if (!q) {
+        row.style.display = ''
+        visible++
+        continue
+      }
+      // Match against title, number, repo, label names.  All-substring
+      // match — no fuzzy / regex.  Cheap, predictable, surprises noone.
+      const title = (row.querySelector('.sr-issue-title')?.textContent || '').toLowerCase()
+      const num   = (row.dataset.number || '').toLowerCase()
+      const labels = Array.from(row.querySelectorAll('.sr-issue-label'))
+        .map((n) => n.textContent.toLowerCase())
+        .join(' ')
+      const haystack = `${title} #${num} ${labels}`
+      const visible_ = haystack.includes(q)
+      row.style.display = visible_ ? '' : 'none'
+      if (visible_) visible++
+    }
+    if (q) {
+      searchCount.textContent = `${visible} of ${rows.length} matching`
+    } else {
+      searchCount.textContent = ''
+    }
+  }
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => applyPickerSearch(e.target.value))
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        searchInput.value = ''
+        applyPickerSearch('')
+        searchInput.blur()
+      }
+    })
+  }
+  // Cmd-K / Ctrl-K from anywhere — focus the search input.  Common
+  // convention; does not steal focus when the user is typing into a
+  // different input/textarea (browsers' built-in handling of the
+  // shortcut already respects the focus target).
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+      // Only steal focus when the picker is visible AND the user isn't
+      // already in another input.  Without the picker check we'd
+      // hijack Cmd-K on /worktrees and /config too — unrelated routes
+      // where this plugin's elements aren't visible.
+      if (!pickerEl || pickerEl.style.display === 'none') return
+      if (!searchInput) return
+      e.preventDefault()
+      searchInput.focus()
+      searchInput.select()
+    }
+  })
 
   // --- Smart filter: contenteditable with live token highlighting ---
   //
@@ -1739,6 +1822,14 @@ function renderResolvePage(el, ctx) {
       // NOT toggle the row's checkbox — user request).  Row body still
       // acts as the checkbox-toggle target so the usual "click the
       // title to select" ergonomic stays.
+      // Show the search input alongside results (hidden when there
+       // are no results / loading).  Reset any prior filter — if the
+       // user's search hides everything in the new result set, that's
+       // confusing.
+      if (searchWrap) searchWrap.style.display = 'flex'
+      if (searchInput) searchInput.value = ''
+      if (searchCount) searchCount.textContent = ''
+
       pickerEl.innerHTML = issues.map(i => {
         const issueUrl = i.url || (i.repo && i.number
           ? `https://github.com/${i.repo}/issues/${i.number}`
