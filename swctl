@@ -3475,6 +3475,14 @@ _run_preflight_checks() {
     local start=$SECONDS
     local failed=0
 
+    # `### CREATE STEP N START/END` markers wrap each major phase of
+    # cmd_create so consumers (resolve plugin, BatchCreateModal, etc.)
+    # can render a stepper UI without parsing free-form log lines.  The
+    # `CREATE STEP` prefix is intentionally distinct from resolve's
+    # `STEP` markers — the two regexes don't false-match each other,
+    # and during a resolve-driven create both progressions can render
+    # side-by-side.
+    printf '### CREATE STEP 1 START: Pre-flight\n'
     printf '[preflight] running checks…\n'
 
     # 1. Docker daemon responsive
@@ -3526,13 +3534,16 @@ _run_preflight_checks() {
 
     # 7. Disk space — each worktree needs ~3 GB (vendor + node_modules
     #    + DB clone + caches).  Warn at < 5 GB to leave headroom.
-    if [ -d "${SW_WORKTREE_ROOT:-/tmp}" ]; then
+    #    Falls back to /tmp when SW_WORKTREE_ROOT is unset (early-path
+    #    plugin-external case) so the check still runs.
+    local wt_root="${SW_WORKTREE_ROOT:-/tmp}"
+    if [ -d "$wt_root" ]; then
         local free_kb
-        free_kb="$(df -k "$SW_WORKTREE_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')"
+        free_kb="$(df -k "$wt_root" 2>/dev/null | awk 'NR==2 {print $4}')"
         if [ -n "$free_kb" ] && [ "$free_kb" -gt 5242880 ]; then
-            printf '[preflight] ✓ disk space (%d MB free in %s)\n' "$((free_kb / 1024))" "$SW_WORKTREE_ROOT"
+            printf '[preflight] ✓ disk space (%d MB free in %s)\n' "$((free_kb / 1024))" "$wt_root"
         else
-            printf '[preflight] ✗ disk space — only %s MB free in %s\n' "$((${free_kb:-0} / 1024))" "$SW_WORKTREE_ROOT" >&2
+            printf '[preflight] ✗ disk space — only %s MB free in %s\n' "$((${free_kb:-0} / 1024))" "$wt_root" >&2
             printf '            └─ Free up space; each worktree needs ~3 GB\n' >&2
             failed=1
         fi
@@ -3541,9 +3552,13 @@ _run_preflight_checks() {
     local elapsed=$((SECONDS - start))
     if [ "$failed" = "0" ]; then
         printf '[preflight] all checks passed (%ss)\n' "$elapsed"
+        printf '### CREATE STEP 1 END\n'
         return 0
     else
         printf '[preflight] FAILED — fix the above and retry (took %ss)\n' "$elapsed" >&2
+        # Step 1 END marker omitted on failure — consumers can detect
+        # "started, never ended" as the failure signal.  cmd_create
+        # exits via die() right after this returns 1.
         return 1
     fi
 }
@@ -3644,9 +3659,18 @@ cmd_create() {
     # case-branch below) so the preflight can flag worktree collisions
     # before any slow step starts.  Each case-branch sets these values
     # again later — that's idempotent (same inputs → same output).
+    #
+    # SW_WORKTREE_ROOT / SW_WORKTREE_PREFIX may be unset on first reach
+    # for some project-type paths (plugin-external loads the parent
+    # project's config later).  Under `set -u` an unset reference
+    # aborts the script — guard the WORKTREE_PATH computation behind
+    # an explicit non-empty check, and let the preflight's path-free
+    # subcheck silently skip when WORKTREE_PATH is still empty.
     if [ "${skip_preflight:-0}" = "0" ]; then
         ISSUE_ID="${ISSUE_ID:-$(sanitize_slug "$ISSUE")}"
-        WORKTREE_PATH="${WORKTREE_PATH:-${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}}"
+        if [ -n "${SW_WORKTREE_ROOT:-}" ] && [ -n "${SW_WORKTREE_PREFIX:-}" ]; then
+            WORKTREE_PATH="${WORKTREE_PATH:-${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}}"
+        fi
         if ! _run_preflight_checks; then
             die "preflight failed — fix the issues above (or pass --skip-preflight to bypass)"
         fi
@@ -4094,6 +4118,10 @@ cmd_create() {
             local step_start create_start
             create_start=$SECONDS
 
+            # Step 2: Worktree.  count_changes is folded in here — it's
+            # always <1s (just a git diff), bundling avoids a confusing
+            # micro-step in the UI.
+            printf '### CREATE STEP 2 START: Worktree\n'
             step_start=$SECONDS
             create_worktree
             check_branch_staleness
@@ -4103,6 +4131,7 @@ cmd_create() {
             DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
             count_changes "$DIFF_FILES"
             info "[timing] count_changes: $((SECONDS - step_start))s"
+            printf '### CREATE STEP 2 END\n'
 
             # Resolve dependency plugins (--deps flag) for platform worktrees
             local dep_plugins=""
@@ -4145,6 +4174,11 @@ cmd_create() {
                 PLUGIN_WORKTREE_PATHS="${dep_worktree_paths}"
             fi
 
+            # Step 3: Sync — copy vendor + node_modules from trunk into
+            # the new worktree's volumes.  In QA mode this can be 10-30s
+            # for the first cold create on a project (subsequent creates
+            # share the base volume so it's near-instant).
+            printf '### CREATE STEP 3 START: Sync\n'
             step_start=$SECONDS
             sync_worktree_from_trunk
             VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
@@ -4153,7 +4187,12 @@ cmd_create() {
 
             info "Mode: ${SWCTL_MODE} | Diff: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
             info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
+            printf '### CREATE STEP 3 END\n'
 
+            # Step 4: Provision — clone DB, start container, run
+            # migrations, DAL indexing, plugin activation.  Longest step
+            # by wall time (30-90s typical).
+            printf '### CREATE STEP 4 START: Provision\n'
             step_start=$SECONDS
             provision_database_and_app "$COMPOSE_PROJECT"
             info "[timing] provision: $((SECONDS - step_start))s"
@@ -4170,10 +4209,17 @@ cmd_create() {
                 done
                 IFS="$_old_ifs"
             fi
+            printf '### CREATE STEP 4 END\n'
 
+            # Step 5: Frontend build (admin + storefront).  Conditional —
+            # run_frontend_build_if_needed exits early when there are no
+            # admin/storefront changes, so this step can be near-instant
+            # for backend-only fixes or 60-120s for UI work.
+            printf '### CREATE STEP 5 START: Frontend build\n'
             step_start=$SECONDS
             run_frontend_build_if_needed "$COMPOSE_PROJECT" 1 "$plugin_has_extensions"
             info "[timing] frontend: $((SECONDS - step_start))s"
+            printf '### CREATE STEP 5 END\n'
 
             # Mark complete and remove EXIT trap
             STATUS="complete"
