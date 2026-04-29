@@ -1524,6 +1524,9 @@ function renderResolvePage(el, ctx) {
                step-by-step.  Lives at the section level (vs. per-row)
                because the user's picking TWO things from the same
                population. -->
+          <button id="sr-benchmark-btn" type="button" style="font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid #374151;background:#1f2937;color:#9ca3af;cursor:pointer;font-family:ui-sans-serif,sans-serif;" title="Claude vs Codex aggregate report">
+            🥊 Benchmark
+          </button>
           <button id="sr-compare-btn" type="button" style="font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid #374151;background:#1f2937;color:#9ca3af;cursor:pointer;font-family:ui-sans-serif,sans-serif;">
             ⇄ Compare runs
           </button>
@@ -2306,6 +2309,15 @@ function renderResolvePage(el, ctx) {
   if (compareBtn) {
     compareBtn.addEventListener('click', () => {
       openCompareRunsModal()
+    })
+  }
+
+  // Benchmark button — opens the aggregate Claude-vs-Codex report
+  // modal.  Read-only over resolve-runs.json; no orchestration.
+  const benchmarkBtn = el.querySelector('#sr-benchmark-btn')
+  if (benchmarkBtn) {
+    benchmarkBtn.addEventListener('click', () => {
+      openBenchmarkModal()
     })
   }
 
@@ -3302,6 +3314,207 @@ async function openCompareRunsModal(initialA, initialB) {
 
 if (typeof window !== 'undefined') {
   window.openCompareRunsModal = openCompareRunsModal
+}
+
+// ─── Backend benchmark modal ────────────────────────────────────────────────
+//
+// Read-only Claude vs Codex aggregate report.  Pulls /api/skill/resolve/
+// benchmark and renders:
+//
+//   1. Aggregate per-backend stats (attempts, success rate, avg tokens,
+//      avg duration, avg steps reached) with the "winner" cell
+//      highlighted on each metric.
+//   2. Head-to-head per issue — one row per issue where BOTH backends
+//      have ≥1 run, with a winner indicator (claude / codex / tie).
+//
+// Empty state when no run carries the backend field (pre-PR-#22 entries
+// in resolve-runs.json) — instructs the user to run a fresh resolve to
+// populate the data.
+
+async function openBenchmarkModal() {
+  document.querySelectorAll('.sr-tr-overlay').forEach((n) => n.remove())
+
+  const overlay = document.createElement('div')
+  overlay.className = 'sr-tr-overlay'
+  overlay.innerHTML = `
+    <div class="sr-tr-modal" style="width:min(900px, 100%);max-height:90vh;display:flex;flex-direction:column;" role="dialog" aria-label="Backend benchmark">
+      <div class="sr-tr-head">
+        <span class="sr-tr-title">🥊 Backend benchmark — Claude vs Codex</span>
+        <button class="sr-tr-close" aria-label="Close">✕</button>
+      </div>
+      <div id="sr-benchmark-body" style="flex:1;overflow:auto;padding:16px 18px;">
+        <div style="color:#9ca3af;font-size:13px;text-align:center;padding:32px 0;">Loading benchmark…</div>
+      </div>
+    </div>
+  `
+  document.body.appendChild(overlay)
+
+  const close = () => overlay.remove()
+  overlay.querySelector('.sr-tr-close').addEventListener('click', close)
+  overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close() })
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') {
+      close()
+      document.removeEventListener('keydown', onKey)
+    }
+  }
+  document.addEventListener('keydown', onKey)
+
+  const body = overlay.querySelector('#sr-benchmark-body')
+
+  let data
+  try {
+    const res = await fetch('/api/skill/resolve/benchmark')
+    data = await res.json()
+  } catch (err) {
+    body.innerHTML = `<div style="color:#f87171;font-size:13px;text-align:center;padding:32px 0;">Failed to load: ${escape(String(err && err.message || err))}</div>`
+    return
+  }
+
+  if (!data || data.totals.runsAnalysed === 0) {
+    body.innerHTML = `
+      <div style="color:#9ca3af;font-size:13px;text-align:center;padding:32px 0;line-height:1.6;">
+        <div style="font-size:32px;margin-bottom:12px;">🥊</div>
+        <strong style="color:#e5e7eb;">No benchmark data yet.</strong><br><br>
+        Run a resolve with backend = Claude on an issue, then run another with backend = Codex on the SAME issue.<br>
+        Pre-feature runs (recorded before backend tracking landed) don't count toward the benchmark.<br><br>
+        <span style="color:#6b7280;">When ≥ 1 issue has both, the head-to-head table appears here.</span>
+      </div>`
+    return
+  }
+
+  const fmtTok = (n) => {
+    if (n == null) return '—'
+    return n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + 'M'
+         : n >= 1_000 ? (n / 1_000).toFixed(1) + 'K'
+         : String(Math.round(n))
+  }
+  const fmtDur = (ms) => {
+    if (ms == null || ms <= 0) return '—'
+    const s = Math.round(ms / 1000)
+    if (s < 60) return s + 's'
+    const m = Math.floor(s / 60), rs = s % 60
+    return rs ? `${m}m ${rs}s` : `${m}m`
+  }
+  const fmtPct = (r) => r == null ? '—' : `${Math.round(r * 100)}%`
+  const winnerOf = (a, b, lowerWins = false) => {
+    if (a == null && b == null) return null
+    if (a == null) return 'b'
+    if (b == null) return 'a'
+    if (a === b) return null
+    return (lowerWins ? a < b : a > b) ? 'a' : 'b'
+  }
+  const cellClass = (winner, side) => {
+    if (winner === side) return 'background:#064e3b40;color:#34d399;font-weight:600;'
+    return 'color:#d1d5db;'
+  }
+
+  const cl = data.byBackend.claude
+  const cx = data.byBackend.codex
+
+  // For each metric, decide who wins (and on what direction).
+  const winSuccess = winnerOf(cl.successRate, cx.successRate)
+  const winSteps   = winnerOf(cl.avgStepsReached, cx.avgStepsReached)
+  const winTokens  = winnerOf(cl.avgTokens, cx.avgTokens, /*lowerWins*/ true)
+  const winSpeed   = winnerOf(cl.avgDurationMs, cx.avgDurationMs, /*lowerWins*/ true)
+
+  const aggregateTable = `
+    <h3 style="margin:0 0 12px 0;font-size:14px;color:#e5e7eb;">Aggregate (${data.totals.runsAnalysed} run${data.totals.runsAnalysed === 1 ? '' : 's'} across ${data.totals.issuesCovered} issue${data.totals.issuesCovered === 1 ? '' : 's'})</h3>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:12px;">
+      <thead>
+        <tr style="background:#111827;border-bottom:2px solid #1f2937;">
+          <th style="text-align:left;padding:8px 12px;color:#6b7280;font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:0.5px;">Metric</th>
+          <th style="text-align:right;padding:8px 12px;color:#fbbf24;font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:0.5px;">🟡 Claude</th>
+          <th style="text-align:right;padding:8px 12px;color:#c084fc;font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:0.5px;">🟣 Codex</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:1px solid #1f2937;">
+          <td style="padding:8px 12px;color:#9ca3af;">Attempts</td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;color:#d1d5db;">${cl.attempts}</td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;color:#d1d5db;">${cx.attempts}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #1f2937;">
+          <td style="padding:8px 12px;color:#9ca3af;">Success rate <span style="color:#6b7280;font-size:10px;">(higher better)</span></td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;${cellClass(winSuccess, 'a')}">${fmtPct(cl.successRate)}</td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;${cellClass(winSuccess, 'b')}">${fmtPct(cx.successRate)}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #1f2937;">
+          <td style="padding:8px 12px;color:#9ca3af;">Avg steps reached <span style="color:#6b7280;font-size:10px;">(/ 8, higher better)</span></td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;${cellClass(winSteps, 'a')}">${cl.avgStepsReached == null ? '—' : cl.avgStepsReached.toFixed(1)}</td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;${cellClass(winSteps, 'b')}">${cx.avgStepsReached == null ? '—' : cx.avgStepsReached.toFixed(1)}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #1f2937;">
+          <td style="padding:8px 12px;color:#9ca3af;">Avg tokens <span style="color:#6b7280;font-size:10px;">(lower better)</span></td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;${cellClass(winTokens, 'a')}">${fmtTok(cl.avgTokens)}</td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;${cellClass(winTokens, 'b')}">${fmtTok(cx.avgTokens)}</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 12px;color:#9ca3af;">Avg duration <span style="color:#6b7280;font-size:10px;">(lower better)</span></td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;${cellClass(winSpeed, 'a')}">${fmtDur(cl.avgDurationMs)}</td>
+          <td style="padding:8px 12px;text-align:right;font-family:ui-monospace,monospace;${cellClass(winSpeed, 'b')}">${fmtDur(cx.avgDurationMs)}</td>
+        </tr>
+      </tbody>
+    </table>
+  `
+
+  // Head-to-head table — only shown when at least one issue has both backends.
+  let h2hSection = ''
+  if (data.headToHead.length > 0) {
+    const winnerBadge = (w) => {
+      if (w === 'claude') return '<span style="color:#fbbf24;font-weight:600;">🟡 Claude</span>'
+      if (w === 'codex')  return '<span style="color:#c084fc;font-weight:600;">🟣 Codex</span>'
+      if (w === 'tie')    return '<span style="color:#6b7280;">Tie</span>'
+      return '<span style="color:#6b7280;">—</span>'
+    }
+    const rows = data.headToHead.map((h) => `
+      <tr style="border-bottom:1px solid #1f2937;">
+        <td style="padding:6px 12px;color:#60a5fa;font-family:ui-monospace,monospace;">#${escape(h.issueId)}</td>
+        <td style="padding:6px 12px;text-align:right;font-family:ui-monospace,monospace;font-size:11px;">
+          <span style="color:#9ca3af;">${h.claude.bestStatus}</span>
+          <span style="color:#6b7280;">·</span>
+          <span style="color:#d1d5db;">${h.claude.bestStep}/8</span>
+          ${h.claude.bestTokens != null ? `<span style="color:#6b7280;">·</span><span style="color:#60a5fa;">${escape(fmtTok(h.claude.bestTokens))}</span>` : ''}
+        </td>
+        <td style="padding:6px 12px;text-align:right;font-family:ui-monospace,monospace;font-size:11px;">
+          <span style="color:#9ca3af;">${h.codex.bestStatus}</span>
+          <span style="color:#6b7280;">·</span>
+          <span style="color:#d1d5db;">${h.codex.bestStep}/8</span>
+          ${h.codex.bestTokens != null ? `<span style="color:#6b7280;">·</span><span style="color:#60a5fa;">${escape(fmtTok(h.codex.bestTokens))}</span>` : ''}
+        </td>
+        <td style="padding:6px 12px;text-align:right;font-size:11px;">${winnerBadge(h.winner)}</td>
+      </tr>
+    `).join('')
+    h2hSection = `
+      <h3 style="margin:0 0 8px 0;font-size:14px;color:#e5e7eb;">Head-to-head — issues both backends ran</h3>
+      <div style="font-size:11px;color:#6b7280;margin-bottom:10px;line-height:1.5;">
+        Shows the BEST attempt per backend per issue (status &gt; step reached &gt; lowest tokens).
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead>
+          <tr style="background:#111827;border-bottom:2px solid #1f2937;">
+            <th style="text-align:left;padding:8px 12px;color:#6b7280;font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:0.5px;">Issue</th>
+            <th style="text-align:right;padding:8px 12px;color:#fbbf24;font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:0.5px;">🟡 Claude best</th>
+            <th style="text-align:right;padding:8px 12px;color:#c084fc;font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:0.5px;">🟣 Codex best</th>
+            <th style="text-align:right;padding:8px 12px;color:#6b7280;font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:0.5px;">Winner</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `
+  } else if (data.totals.runsAnalysed > 0) {
+    h2hSection = `
+      <div style="color:#6b7280;font-size:12px;padding:14px;background:#0a1020;border:1px dashed #1f2937;border-radius:4px;text-align:center;">
+        No head-to-head data yet — needs ≥ 1 issue with attempts from BOTH backends.
+      </div>
+    `
+  }
+
+  body.innerHTML = aggregateTable + h2hSection
+}
+
+if (typeof window !== 'undefined') {
+  window.openBenchmarkModal = openBenchmarkModal
 }
 
 // ─── Run-history modal ──────────────────────────────────────────────────────
