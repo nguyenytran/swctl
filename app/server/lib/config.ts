@@ -36,6 +36,30 @@ export interface UserConfig {
      * `isResolveEnabled()`.
      */
     resolveEnabled?: boolean
+    /**
+     * Per-resolve hard cap on total tokens consumed (input + cached +
+     * output + reasoning, summed across every model turn the agent
+     * makes during one run).  When the running total exceeds this
+     * value, the server kills the agent process, emits a
+     * `budget-exceeded` SSE event so the UI can render a clear
+     * "stopped at $N tokens" message, and persists the abort reason
+     * in metadata.
+     *
+     * Resolution order: env var SWCTL_RESOLVE_TOKEN_BUDGET → this
+     * config field → null (unlimited).  null is the back-compat
+     * default — existing configs keep working with no cap.
+     *
+     * Reasonable values:
+     *   - 5_000_000   tight, most simple bug fixes
+     *   - 20_000_000  default for users who want a safety net
+     *   - 100_000_000 very generous; mostly catches infinite loops
+     *
+     * Cached input is counted toward the budget — even though it's
+     * cheaper, it still represents work the model paid attention
+     * to and a runaway loop spiraling on cached context is just as
+     * bad as on fresh context.
+     */
+    resolveTokenBudget?: number
   }
   ai: {
     /**
@@ -412,4 +436,26 @@ export function isResolveEnabled(): boolean {
   } catch {
     return false
   }
+}
+
+/**
+ * Per-resolve total-token cap.  Returns:
+ *   - the parsed env var SWCTL_RESOLVE_TOKEN_BUDGET if set + numeric > 0
+ *   - .features.resolveTokenBudget if set + numeric > 0
+ *   - null otherwise (= unlimited; default for back-compat)
+ *
+ * Read dynamically per-stream so toggling via the UI / CLI takes
+ * effect on the next resolve without a server restart.
+ */
+export function getResolveTokenBudget(): number | null {
+  const fromEnv = process.env.SWCTL_RESOLVE_TOKEN_BUDGET
+  if (fromEnv) {
+    const n = Number(fromEnv)
+    if (Number.isFinite(n) && n > 0) return n
+  }
+  try {
+    const cfg = readUserConfig().features.resolveTokenBudget
+    if (typeof cfg === 'number' && Number.isFinite(cfg) && cfg > 0) return cfg
+  } catch {}
+  return null
 }

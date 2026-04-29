@@ -9,7 +9,7 @@ import { streamSpawn, spawnSwctl } from './stream.js'
 import { readAllInstances } from './metadata.js'
 import { readProjects } from './projects.js'
 import { emit } from './events.js'
-import { isResolveEnabled } from './config.js'
+import { isResolveEnabled, getResolveTokenBudget } from './config.js'
 import { detectScopeWithAI, type AiScopeDecision } from './ai-scope.js'
 
 const STATE_DIR = process.env.SWCTL_STATE_DIR || ''
@@ -788,12 +788,20 @@ function patchResolveMetadata(
  * Lightweight SSE-side stream parser.  Called on each log line we forward
  * to the browser.  Accumulates the last-completed step number and any
  * session id Claude reports (used as fallback when our preassigned id
- * is unknown).  Also tracks final cost from the terminal `result` event.
+ * is unknown).  Also tracks final cost from the terminal `result` event
+ * and a running total token count for the budget circuit breaker.
+ *
+ * `tokensTotal` sums input + cached + output + reasoning across every
+ * model turn the agent makes during the run.  Compared against the
+ * resolve token budget (config) on every increment so the caller can
+ * abort the agent early when a runaway loop or pathological context
+ * pattern would otherwise burn through tokens unbounded.
  */
 interface ResolveStreamState {
   sessionId: string
   lastCompletedStep: number
   cost: number
+  tokensTotal: number
 }
 
 function observeStreamLine(state: ResolveStreamState, raw: string): void {
@@ -821,6 +829,33 @@ function observeStreamLine(state: ResolveStreamState, raw: string): void {
         }
       }
     }
+    // Claude assistant events carry per-turn usage on `message.usage`.
+    // Sum all four token kinds into the running total used by the
+    // budget circuit breaker.  cache_creation_input_tokens is the
+    // FIRST time that prompt fragment is seen (full price); subsequent
+    // turns hitting the same cache use cache_read_input_tokens (~10%
+    // of input price).  We count both for the budget — see the
+    // resolveTokenBudget docs for why cached tokens still count.
+    if (ev.message.usage) {
+      const u = ev.message.usage
+      state.tokensTotal +=
+        (Number(u.input_tokens)                 || 0) +
+        (Number(u.cache_creation_input_tokens)  || 0) +
+        (Number(u.cache_read_input_tokens)      || 0) +
+        (Number(u.output_tokens)                || 0)
+    }
+  }
+
+  // Codex --json: token_count event with full + per-turn usage.
+  // We use last_token_usage (per-turn) since these events fire after
+  // each turn — total_token_usage would double-count if we summed it.
+  if (ev.type === 'token_count' && ev.info?.last_token_usage) {
+    const u = ev.info.last_token_usage
+    state.tokensTotal +=
+      (Number(u.input_tokens)            || 0) +
+      (Number(u.cached_input_tokens)     || 0) +
+      (Number(u.output_tokens)           || 0) +
+      (Number(u.reasoning_output_tokens) || 0)
   }
 
   // Codex JSONL: { type: "item.completed", item: { type: "agent_message", text } }
@@ -1162,13 +1197,50 @@ export function startResolveStream(
       sessionId,
       lastCompletedStep: 0,
       cost: 0,
+      tokensTotal: 0,
+    }
+
+    // Budget circuit breaker — read once per stream so a config edit
+    // mid-run doesn't change the rules under the agent's feet.  null =
+    // unlimited (back-compat default for users who haven't opted in).
+    const tokenBudget = getResolveTokenBudget()
+    let budgetExceeded = false
+
+    if (tokenBudget !== null) {
+      sendEvent('log', {
+        line: `[budget] token cap: ${tokenBudget.toLocaleString()} (input + cached + output + reasoning, summed across all turns)`,
+        ts: Date.now(),
+      })
     }
 
     const onData = (chunk: Buffer) => {
       for (const line of chunk.toString().split('\n')) {
-        if (line) {
-          observeStreamLine(streamState, line)
-          sendEvent('log', { line, ts: Date.now() })
+        if (!line) continue
+        observeStreamLine(streamState, line)
+        sendEvent('log', { line, ts: Date.now() })
+
+        // Check budget AFTER observeStreamLine has updated tokensTotal.
+        // First crossing wins — subsequent lines still flow through to
+        // the SSE log so the user sees the agent's last words, but we
+        // kick off the kill immediately on the first overage.  The
+        // close handler below picks up the budgetExceeded flag and
+        // tags the SSE done event + persisted metadata.
+        if (
+          tokenBudget !== null &&
+          !budgetExceeded &&
+          streamState.tokensTotal > tokenBudget
+        ) {
+          budgetExceeded = true
+          sendEvent('log', {
+            line: `[budget] EXCEEDED — total ${streamState.tokensTotal.toLocaleString()} tokens crossed cap of ${tokenBudget.toLocaleString()}; aborting agent`,
+            ts: Date.now(),
+          })
+          // SIGTERM lets the agent flush its last buffered output before
+          // exiting; if it ignores us the close handler still fires when
+          // the pipe closes.  We don't need SIGKILL urgency here — the
+          // tokens have already been spent, and a graceful tail of the
+          // logs is more useful than a clean kill.
+          try { child.kill('SIGTERM') } catch {}
         }
       }
     }
@@ -1183,9 +1255,15 @@ export function startResolveStream(
         const exitCode = code || 0
         // Persist final state so the UI can render a Resume card and
         // `swctl resolve resume <id>` picks up the same session.
+        // Status: 'budget-exceeded' is a third terminal state alongside
+        // 'done' / 'failed' — the UI uses it to render a distinct card
+        // (you weren't doing badly, you just hit a configured limit).
+        const status = budgetExceeded
+          ? 'budget-exceeded'
+          : (exitCode === 0 ? 'done' : 'failed')
         patchResolveMetadata(issueId, {
           CLAUDE_SESSION_ID: streamState.sessionId || sessionId,
-          CLAUDE_RESOLVE_STATUS: exitCode === 0 ? 'done' : 'failed',
+          CLAUDE_RESOLVE_STATUS: status,
           CLAUDE_RESOLVE_STEP: String(streamState.lastCompletedStep),
           CLAUDE_RESOLVE_COST: String(streamState.cost),
         })
@@ -1195,6 +1273,11 @@ export function startResolveStream(
           elapsed: Date.now() - startTime,
           sessionId: streamState.sessionId || sessionId,
           lastCompletedStep: streamState.lastCompletedStep,
+          // Surface the budget-exceeded reason on the wire so the UI
+          // can render a tailored card without re-deriving the state.
+          budgetExceeded,
+          tokensTotal: streamState.tokensTotal,
+          tokenBudget,
         }).then(resolve)
       })
       child.on('error', (err) => {
@@ -1298,6 +1381,7 @@ export function startResolveResumeStream(
       sessionId,
       lastCompletedStep: lastStep,
       cost: 0,
+      tokensTotal: 0,
     }
 
     const onData = (chunk: Buffer) => {
