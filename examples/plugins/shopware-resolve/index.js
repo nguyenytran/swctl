@@ -104,7 +104,7 @@ function startStream(issue, project, mode, out, onDone) {
   return es
 }
 
-function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper, resultEl, onDone) {
+function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper, resultEl, onDone, updateCreateStepper) {
   const params = new URLSearchParams()
   params.set('issue', issue)
   if (project) params.set('project', project)
@@ -116,6 +116,8 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
   appendLine(out, `[client] opening stream: ${url}`)
   const es = new EventSource(url)
   let currentStep = 1
+  // No-op fallback so callers that haven't been updated yet still work.
+  const updCreate = typeof updateCreateStepper === 'function' ? updateCreateStepper : () => {}
 
   const stepNames = {
     1: 'Verify the issue',
@@ -128,10 +130,19 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
     8: 'Decision-ready output',
   }
 
+  const createStepNames = {
+    1: 'Pre-flight',
+    2: 'Worktree',
+    3: 'Sync',
+    4: 'Provision',
+    5: 'Frontend',
+  }
+
   // Coverage tracking: record which steps actually started/ended so we can
   // surface gaps to the user after the run completes.
   const stepsStarted = new Set()
   const stepsEnded = new Set()
+  const createStepsEnded = new Set()
 
   es.addEventListener('log', (e) => {
     try {
@@ -139,12 +150,45 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
       const line = data.line || ''
       renderLine(out, line)
 
+      // CREATE STEP markers from `swctl create` — separate phase from
+      // the resolve workflow.  Match BEFORE the resolve regex so the
+      // `STEP` substring inside `CREATE STEP` doesn't false-match.
+      const createStartMatch = line.match(/###\s*CREATE\s+STEP\s+(\d)\s+START/i)
+      const createEndMatch = line.match(/###\s*CREATE\s+STEP\s+(\d)\s+END/i)
+      if (createStartMatch) {
+        const n = parseInt(createStartMatch[1])
+        if (n >= 1 && n <= 5) {
+          updCreate(n, 'active')
+          stepInfo.textContent = `Creating worktree — Step ${n}/5: ${createStepNames[n] || ''}`
+        }
+        return  // don't fall through to resolve regex (would never match anyway, but explicit)
+      } else if (createEndMatch) {
+        const n = parseInt(createEndMatch[1])
+        if (n >= 1 && n <= 5) {
+          createStepsEnded.add(n)
+          updCreate(n, 'done')
+          if (createStepsEnded.size === 5) {
+            // Whole create phase done — fade the create stepper so the
+            // resolve workflow stepper takes visual focus.
+            updCreate(0, 'complete')
+          }
+        }
+        return
+      }
+
       // Strict markers emitted by Claude under our instruction:
       //   ### STEP <N> START: <name>
       //   ### STEP <N> END
       const startMatch = line.match(/###\s*STEP\s+(\d)\s+START/i)
       const endMatch = line.match(/###\s*STEP\s+(\d)\s+END/i)
-      if (startMatch) {
+      // The `CREATE STEP` and `STEP` regexes both match `### CREATE
+      // STEP …` (the `STEP` regex matches the `STEP` substring of
+      // `CREATE STEP`).  CREATE-STEP lines were already handled +
+      // returned above, but if a line happens to contain BOTH (unlikely
+      // but defensive), the `isCreateLine` guard blocks the resolve
+      // path so it doesn't double-count.
+      const isCreateLine = /CREATE\s+STEP/i.test(line)
+      if (startMatch && !isCreateLine) {
         const n = parseInt(startMatch[1])
         if (n >= 1 && n <= 8) {
           stepsStarted.add(n)
@@ -154,13 +198,13 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
             stepInfo.textContent = `Step ${currentStep}: ${stepNames[currentStep] || ''}`
           }
         }
-      } else if (endMatch) {
+      } else if (endMatch && !isCreateLine) {
         const n = parseInt(endMatch[1])
         if (n >= 1 && n <= 8) {
           stepsEnded.add(n)
           updateStepper(n, 'done')
         }
-      } else {
+      } else if (!isCreateLine) {
         // Fallback: legacy loose matcher for older runs without markers.
         const legacy = line.match(/(?:^|\s)Step\s+(\d)\b/i)
         if (legacy) {
@@ -925,6 +969,27 @@ function renderResolvePage(el, ctx) {
       .sr-step.failed { background: #450a0a; color: #f87171; }
       @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
+      /* Create-phase stepper — sibling to .sr-stepper but visually
+         compact + neutral colours so it doesn't compete with the main
+         8-step resolve workflow stepper.  Displayed during the create
+         phase (before the agent spawns); fades to a subdued state once
+         all 5 steps complete and the resolve workflow takes over. */
+      .sr-create-stepper { display: flex; gap: 0; margin-bottom: 8px; background: #0b1220; border: 1px solid #1f2937; border-radius: 4px; overflow: hidden; transition: opacity 0.4s; }
+      .sr-create-stepper.complete { opacity: 0.5; }
+      .sr-create-step {
+        flex: 1; padding: 5px 6px; text-align: center; font-size: 10px;
+        border-right: 1px solid #1f2937; transition: all 0.3s;
+        color: #6b7280; background: #0b1220;
+      }
+      .sr-create-step:last-child { border-right: none; }
+      .sr-create-step-num { font-weight: 700; font-size: 11px; display: inline-block; margin-right: 4px; }
+      .sr-create-step-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.3px; }
+      .sr-create-step.done { background: #064e3b40; color: #34d399; }
+      .sr-create-step.done .sr-create-step-num::before { content: '✓ '; }
+      .sr-create-step.active { background: #1e3a5f60; color: #60a5fa; }
+      .sr-create-step.active .sr-create-step-num::after { content: ''; display: inline-block; width: 5px; height: 5px; background: #60a5fa; border-radius: 50%; margin-left: 3px; animation: pulse 1.5s infinite; }
+      .sr-create-step.failed { background: #450a0a60; color: #f87171; }
+
       /* Result card */
       .sr-result-card {
         border: 1px solid #1f2937; border-radius: 6px; padding: 16px; margin-bottom: 12px;
@@ -1009,6 +1074,19 @@ function renderResolvePage(el, ctx) {
 
       <!-- Stepper + console (shown during resolve) -->
       <div class="sr-section" id="sr-resolve-panel" style="display:none;">
+        <!-- Create-phase stepper.  Mirrors the 5 ### CREATE STEP N
+             markers `swctl create` emits (preflight → worktree → sync
+             → provision → frontend).  Visible during the create phase
+             that precedes every resolve; fades to subdued once
+             complete so the main 8-step resolve stepper below takes
+             visual priority. -->
+        <div id="sr-create-stepper" class="sr-create-stepper">
+          <div class="sr-create-step" data-create-step="1"><span class="sr-create-step-num">1</span><span class="sr-create-step-label">Pre-flight</span></div>
+          <div class="sr-create-step" data-create-step="2"><span class="sr-create-step-num">2</span><span class="sr-create-step-label">Worktree</span></div>
+          <div class="sr-create-step" data-create-step="3"><span class="sr-create-step-num">3</span><span class="sr-create-step-label">Sync</span></div>
+          <div class="sr-create-step" data-create-step="4"><span class="sr-create-step-num">4</span><span class="sr-create-step-label">Provision</span></div>
+          <div class="sr-create-step" data-create-step="5"><span class="sr-create-step-num">5</span><span class="sr-create-step-label">Frontend</span></div>
+        </div>
         <div id="sr-stepper" class="sr-stepper">
           <div class="sr-step" data-step="1"><span class="sr-step-num">1</span><span class="sr-step-label">Verify</span></div>
           <div class="sr-step" data-step="2"><span class="sr-step-num">2</span><span class="sr-step-label">Root cause</span></div>
@@ -1289,6 +1367,42 @@ function renderResolvePage(el, ctx) {
       } else if (n === step) {
         s.classList.add('active')
       }
+    })
+  }
+
+  // Sibling of updateStepper for the 5-step create-phase stepper.
+  // Same semantics: <step= n active; <n done; failed marks just n.
+  // Caller passes status='complete' to add the "fade subdued" class
+  // once all 5 ### CREATE STEP N END markers have fired.
+  const createStepperEl = el.querySelector('#sr-create-stepper')
+  function updateCreateStepper(step, status) {
+    if (!createStepperEl) return
+    if (status === 'complete') {
+      createStepperEl.classList.add('complete')
+      createStepperEl.querySelectorAll('.sr-create-step').forEach(s => {
+        s.classList.remove('active', 'failed')
+        s.classList.add('done')
+      })
+      return
+    }
+    createStepperEl.classList.remove('complete')
+    createStepperEl.querySelectorAll('.sr-create-step').forEach(s => {
+      const n = parseInt(s.dataset.createStep)
+      s.classList.remove('done', 'active', 'failed')
+      if (status === 'failed' && n === step) {
+        s.classList.add('failed')
+      } else if (n < step) {
+        s.classList.add('done')
+      } else if (n === step) {
+        s.classList.add('active')
+      }
+    })
+  }
+  function resetCreateStepper() {
+    if (!createStepperEl) return
+    createStepperEl.classList.remove('complete')
+    createStepperEl.querySelectorAll('.sr-create-step').forEach(s => {
+      s.classList.remove('done', 'active', 'failed')
     })
   }
 
@@ -1620,7 +1734,14 @@ function renderResolvePage(el, ctx) {
 
     resolvePanel.style.display = ''
     out.textContent = ''
-    updateStepper(1, 'active')
+    // Two steppers visible: the create-phase one (5 steps, lights up
+    // first as `swctl create` runs) and the resolve-workflow one (8
+    // steps, lights up after the agent spawns).  Reset both on every
+    // new run; the create stepper goes through 1→5 first, then the
+    // resolve stepper handles 1→8.
+    resetCreateStepper()
+    updateCreateStepper(1, 'active')
+    updateStepper(0, '')  // clear any stale state from a previous run
     stepInfo.textContent = `Resolving ${issues.length} issue${issues.length !== 1 ? 's' : ''} (max ${CONCURRENCY} at a time)…`
     btn.disabled = true
     btn.textContent = 'Running...'
@@ -1672,6 +1793,7 @@ function renderResolvePage(el, ctx) {
               startNext()
             }
           },
+          updateCreateStepper,  // wires the 5-step create-phase stepper to ### CREATE STEP markers
         )
       }
     }
