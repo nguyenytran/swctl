@@ -3421,6 +3421,133 @@ create_dep_plugin_worktree() {
     ok "Dependency plugin nested: custom/plugins/${dep_name} (detached at $dep_default_branch)"
 }
 
+# --- Pre-flight checks for `swctl create` -----------------------------------
+#
+# Failures observed during create historically split into two camps:
+#   1. Infra missing/broken — docker not running, swctl init never run,
+#      mariadb container stopped, alpine image not cached.  All of these
+#      surface 30-90 seconds INTO a create when slow steps that depended
+#      on them fail with cryptic errors.  By the time the user sees the
+#      failure, vendor has been copied (10-30s wasted) or the worktree
+#      has been git-checkout'd (4-10s + cleanup work needed).
+#   2. State collisions — half-failed prior creates, orphan branches,
+#      stale instance dirs.  cmd_clean now sweeps most of these but the
+#      user has to know to run it; the preflight makes the diagnosis.
+#
+# The preflight runs both check sets at the top of cmd_create, before
+# any slow operation.  Each individual check is bounded to <500ms.
+# Cumulative target: < 2s.  Failures don't auto-remediate — they print
+# the remediation hint and exit non-zero, so the user sees ALL problems
+# at once and can decide whether to fix each manually or run a wholesale
+# `swctl init`.
+#
+# Skip with --skip-preflight (CI use case where the env is known good).
+
+# Run a single preflight check.  Args:
+#   $1  short label printed to the user
+#   $2  shell expression evaluated under `eval` — exit 0 = pass
+#   $3  optional one-line remediation hint, shown on failure
+# Returns 0 on pass, 1 on fail.
+_preflight_one() {
+    local label="$1"
+    local cmd="$2"
+    local hint="${3:-}"
+    if eval "$cmd" >/dev/null 2>&1; then
+        printf '[preflight] ✓ %s\n' "$label"
+        return 0
+    else
+        printf '[preflight] ✗ %s\n' "$label" >&2
+        [ -n "$hint" ] && printf '            └─ %s\n' "$hint" >&2
+        return 1
+    fi
+}
+
+# Run the full preflight suite.  Caller has already populated
+# PROJECT_ROOT, SW_TRAEFIK_NETWORK, SW_WORKTREE_ROOT, ISSUE_ID, and
+# WORKTREE_PATH.  Returns 0 on full pass, 1 on any failure.
+#
+# Independent failures are AGGREGATED: every check runs even after one
+# fails, so the user sees a complete diagnostic in one pass.  Without
+# this, fixing a broken docker would only surface the next problem on
+# the retry — chaining through 5 checks across 5 retries is the kind
+# of friction this is meant to eliminate.
+_run_preflight_checks() {
+    local start=$SECONDS
+    local failed=0
+
+    printf '[preflight] running checks…\n'
+
+    # 1. Docker daemon responsive
+    _preflight_one "docker daemon" \
+        'docker info' \
+        'Start Docker Desktop / OrbStack and retry' || failed=1
+
+    # 2. Compose templates accessible — installed by Homebrew tap into
+    #    pkgshare, or read from the project root in dev installs.
+    local tpl_dir="${SWCTL_TEMPLATE_DIR:-$PROJECT_ROOT}"
+    _preflight_one "compose templates accessible" \
+        "[ -d '$tpl_dir' ] && { [ -f '$tpl_dir/docker-compose.swctl.yml' ] || [ -f '$tpl_dir/docker-compose.swctl.orbstack.yml' ]; }" \
+        "Set SWCTL_TEMPLATE_DIR to a directory containing docker-compose.swctl*.yml" || failed=1
+
+    # 3. swctl Docker network (created by `swctl init`).  Without it,
+    #    the per-instance Caddy container has nothing to attach to.
+    local net="${SW_TRAEFIK_NETWORK:-swctl-proxy}"
+    _preflight_one "docker network ($net)" \
+        "docker network inspect '$net'" \
+        "Run 'swctl init' to create the shared network + supporting containers" || failed=1
+
+    # 4. Shared mariadb container running — source for per-instance DB
+    #    clones.  `swctl init` starts it; if it crashed or was manually
+    #    stopped, every clone-based provision will hang.
+    local db_container="${SW_INFRA_DB_CONTAINER:-swctl-mariadb}"
+    _preflight_one "shared mariadb running ($db_container)" \
+        "docker ps --filter 'name=^${db_container}\$' --format '{{.Names}}' | grep -q ." \
+        "Run 'swctl init' to start the shared mariadb (or 'docker start ${db_container}')" || failed=1
+
+    # 5. Alpine image cached.  populate_volume() spawns alpine to copy
+    #    files; a cold pull from a docker config that uses a credential
+    #    helper missing inside the container fails opaquely.  Pre-flight
+    #    catches it before the populate step trips on it.
+    _preflight_one "alpine image cached" \
+        'docker image inspect alpine:latest || docker image inspect alpine' \
+        'Run: docker pull alpine:latest' || failed=1
+
+    # 6. Worktree path doesn't already collide.  We don't try to
+    #    distinguish "ours" from "stale" — flagging the collision and
+    #    pointing at swctl clean is enough.  Only checked when the
+    #    caller has already set WORKTREE_PATH (post-resolve_project_context).
+    if [ -n "${WORKTREE_PATH:-}" ] && [ -n "${ISSUE_ID:-}" ]; then
+        local wt_check
+        wt_check="[ ! -e '$WORKTREE_PATH' ] || git -C '$PROJECT_ROOT' worktree list --porcelain 2>/dev/null | grep -Fxq 'worktree $WORKTREE_PATH'"
+        _preflight_one "worktree path free ($WORKTREE_PATH)" \
+            "$wt_check" \
+            "Run: swctl clean $ISSUE_ID  (also sweeps orphan branches/dirs)" || failed=1
+    fi
+
+    # 7. Disk space — each worktree needs ~3 GB (vendor + node_modules
+    #    + DB clone + caches).  Warn at < 5 GB to leave headroom.
+    if [ -d "${SW_WORKTREE_ROOT:-/tmp}" ]; then
+        local free_kb
+        free_kb="$(df -k "$SW_WORKTREE_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')"
+        if [ -n "$free_kb" ] && [ "$free_kb" -gt 5242880 ]; then
+            printf '[preflight] ✓ disk space (%d MB free in %s)\n' "$((free_kb / 1024))" "$SW_WORKTREE_ROOT"
+        else
+            printf '[preflight] ✗ disk space — only %s MB free in %s\n' "$((${free_kb:-0} / 1024))" "$SW_WORKTREE_ROOT" >&2
+            printf '            └─ Free up space; each worktree needs ~3 GB\n' >&2
+            failed=1
+        fi
+    fi
+
+    local elapsed=$((SECONDS - start))
+    if [ "$failed" = "0" ]; then
+        printf '[preflight] all checks passed (%ss)\n' "$elapsed"
+        return 0
+    else
+        printf '[preflight] FAILED — fix the above and retry (took %ss)\n' "$elapsed" >&2
+        return 1
+    fi
+}
+
 cmd_create() {
     SWCTL_MODE="${SWCTL_MODE:-dev}"
     local selected_project=""
@@ -3428,6 +3555,7 @@ cmd_create() {
     local selected_deps=""
     local adopt_worktree_path=""
     local no_provision=0
+    local skip_preflight=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --qa)      SWCTL_MODE="qa"; shift ;;
@@ -3437,6 +3565,7 @@ cmd_create() {
             --deps)    selected_deps="$2"; shift 2 ;;
             --adopt-worktree) adopt_worktree_path="$2"; shift 2 ;;
             --no-provision) no_provision=1; shift ;;
+            --skip-preflight) skip_preflight=1; shift ;;
             *)         break ;;
         esac
     done
@@ -3508,6 +3637,19 @@ cmd_create() {
         _dup_domain="$(grep '^DOMAIN=' "$_dup_file" | cut -d= -f2)"
         _dup_project="$(grep '^PROJECT=' "$_dup_file" | cut -d= -f2)"
         die "A worktree already exists for issue '${ISSUE}' (project: ${_dup_project:-unknown}, domain: ${_dup_domain:-unknown}). Use 'swctl clean ${_dup_id:-$ISSUE}' first, or 'swctl refresh ${_dup_id:-$ISSUE}' to update it."
+    fi
+
+    # --- Pre-flight checks ---
+    # ISSUE_ID + WORKTREE_PATH are computed here (vs. inside each
+    # case-branch below) so the preflight can flag worktree collisions
+    # before any slow step starts.  Each case-branch sets these values
+    # again later — that's idempotent (same inputs → same output).
+    if [ "${skip_preflight:-0}" = "0" ]; then
+        ISSUE_ID="${ISSUE_ID:-$(sanitize_slug "$ISSUE")}"
+        WORKTREE_PATH="${WORKTREE_PATH:-${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}}"
+        if ! _run_preflight_checks; then
+            die "preflight failed — fix the issues above (or pass --skip-preflight to bypass)"
+        fi
     fi
 
     case "$PROJECT_TYPE" in
