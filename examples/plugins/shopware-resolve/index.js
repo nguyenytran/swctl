@@ -1337,7 +1337,18 @@ function renderResolvePage(el, ctx) {
 
       <!-- Issues & PRs table -->
       <div class="sr-section">
-        <h3 class="sr-section-title">Issues &amp; PRs <span id="sr-table-loading" class="sr-loading"></span></h3>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+          <h3 class="sr-section-title" style="margin:0;flex:1;">Issues &amp; PRs <span id="sr-table-loading" class="sr-loading"></span></h3>
+          <!-- Side-by-side comparison of two transcripts.  Most natural
+               use case: same issue resolved by Claude vs Codex,
+               looking at how the two AIs approached the problem
+               step-by-step.  Lives at the section level (vs. per-row)
+               because the user's picking TWO things from the same
+               population. -->
+          <button id="sr-compare-btn" type="button" style="font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid #374151;background:#1f2937;color:#9ca3af;cursor:pointer;font-family:ui-sans-serif,sans-serif;">
+            ⇄ Compare runs
+          </button>
+        </div>
         <div id="sr-table-container"></div>
       </div>
     </div>
@@ -2033,6 +2044,16 @@ function renderResolvePage(el, ctx) {
 
     startNext()
   })
+
+  // Compare-runs button — opens a 2-column transcript comparison
+  // modal.  Defers the actual modal creation to openCompareRunsModal
+  // (top-level, mirrors openTranscriptModal's shape).
+  const compareBtn = el.querySelector('#sr-compare-btn')
+  if (compareBtn) {
+    compareBtn.addEventListener('click', () => {
+      openCompareRunsModal()
+    })
+  }
 
   // Wire issues table
   const tableContainer = el.querySelector('#sr-table-container')
@@ -2768,6 +2789,189 @@ function renderStepTokenPanel(tokens) {
 // for an issue that doesn't currently have a result-card on screen.
 if (typeof window !== 'undefined') {
   window.openTranscriptModal = openTranscriptModal
+}
+
+// ─── Compare-runs modal ─────────────────────────────────────────────────────
+//
+// Two-column transcript comparison.  Most natural use case: same kind
+// of issue resolved by Claude vs Codex (e.g. #6345 Claude vs #6689
+// Codex), looking at how the two AIs approached the problem.
+//
+// Each column is a self-contained transcript view (totals strip + per-step
+// accordion) backed by /api/skill/resolve/transcript?issueId=<id>.  The
+// two columns are independent — clicking step N in column A doesn't
+// auto-expand step N in column B.  Aligning interactions adds complexity
+// for marginal gain; users can scroll-link by hand.
+//
+// Issue picker: a <select> at the top of each column populated from
+// /api/instances filtered to hasTranscript=true.  Default: A = first
+// Claude run with transcript, B = first Codex run.
+
+async function openCompareRunsModal(initialA, initialB) {
+  document.querySelectorAll('.sr-tr-overlay').forEach((n) => n.remove())
+
+  // Fetch the candidate set up-front: instances that have transcripts.
+  let candidates = []
+  try {
+    const res = await fetch('/api/instances')
+    const all = await res.json()
+    candidates = (Array.isArray(all) ? all : [])
+      .filter((i) => i.hasTranscript === true && i.issueId)
+      .map((i) => ({
+        issueId: i.issueId,
+        backend: i.resolveBackend || 'unknown',
+        branch: i.branch || '',
+      }))
+  } catch {}
+
+  // Defaults: prefer one Claude + one Codex (the demo case) when
+  // both exist; otherwise pick the first two available; otherwise
+  // either of {A, B} stays empty and the user picks via the dropdown.
+  const claude = candidates.find((c) => c.backend === 'claude')
+  const codex  = candidates.find((c) => c.backend === 'codex')
+  const idA = initialA
+    || (claude ? claude.issueId : null)
+    || (candidates[0]?.issueId)
+  const idB = initialB
+    || (codex ? codex.issueId : null)
+    || (candidates.find((c) => c.issueId !== idA)?.issueId)
+    || (candidates[1]?.issueId)
+    || idA  // fall through; modal renders empty state for the second column
+
+  // Build modal scaffold up front; populate column content after.
+  const overlay = document.createElement('div')
+  overlay.className = 'sr-tr-overlay'
+  // Wider modal — 1400px max — to fit two columns.  At narrower
+  // viewports the columns stack vertically (flex-wrap on the body).
+  const optionFor = (sel, c) => {
+    const flag = c.backend === 'claude' ? '🟡' : c.backend === 'codex' ? '🟣' : '⚪'
+    return `<option value="${escape(c.issueId)}" ${sel === c.issueId ? 'selected' : ''}>${flag} #${escape(c.issueId)} · ${escape(c.backend)}</option>`
+  }
+  const columnHeader = (label, currentId) => `
+    <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid #1f2937;background:#111827;">
+      <span style="font:600 12px ui-sans-serif,sans-serif;color:#9ca3af;text-transform:uppercase;letter-spacing:0.5px;">${escape(label)}</span>
+      <select data-compare-col="${escape(label)}" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 8px;font-size:12px;flex:1;">
+        ${candidates.length === 0 ? '<option value="">(no transcripts available)</option>' : candidates.map((c) => optionFor(currentId, c)).join('')}
+      </select>
+    </div>`
+
+  overlay.innerHTML = `
+    <div class="sr-tr-modal" style="width:min(1400px, 100%);max-height:90vh;display:flex;flex-direction:column;" role="dialog" aria-label="Compare runs">
+      <div class="sr-tr-head">
+        <span class="sr-tr-title">⇄ Compare runs</span>
+        <button class="sr-tr-close" aria-label="Close">✕</button>
+      </div>
+      <div style="flex:1;display:flex;flex-wrap:wrap;overflow:hidden;">
+        <div data-compare-side="A" style="flex:1 1 480px;min-width:0;display:flex;flex-direction:column;border-right:1px solid #1f2937;">
+          ${columnHeader('Run A', idA)}
+          <div data-compare-content="A" style="flex:1;overflow:auto;"></div>
+        </div>
+        <div data-compare-side="B" style="flex:1 1 480px;min-width:0;display:flex;flex-direction:column;">
+          ${columnHeader('Run B', idB)}
+          <div data-compare-content="B" style="flex:1;overflow:auto;"></div>
+        </div>
+      </div>
+    </div>
+  `
+  document.body.appendChild(overlay)
+
+  const close = () => overlay.remove()
+  overlay.querySelector('.sr-tr-close').addEventListener('click', close)
+  overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close() })
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') {
+      close()
+      document.removeEventListener('keydown', onKey)
+    }
+  }
+  document.addEventListener('keydown', onKey)
+
+  // Render one column's content.  Reuses the per-step accordion shape
+  // from openTranscriptModal but in a more compact density (no top
+  // totals strip — that lives in each step's expanded body anyway).
+  async function renderColumn(side, issueId) {
+    const target = overlay.querySelector(`[data-compare-content="${side}"]`)
+    if (!target) return
+    if (!issueId) {
+      target.innerHTML = '<div style="padding:32px 18px;color:#9ca3af;font-size:13px;text-align:center;">Pick a run to compare.</div>'
+      return
+    }
+    target.innerHTML = '<div style="padding:32px 18px;color:#9ca3af;font-size:13px;text-align:center;">Loading transcript…</div>'
+    let data
+    try {
+      const res = await fetch(`/api/skill/resolve/transcript?issueId=${encodeURIComponent(issueId)}`)
+      data = await res.json()
+    } catch (err) {
+      target.innerHTML = `<div style="padding:32px 18px;color:#f87171;font-size:13px;text-align:center;">Failed to load: ${escape(String(err && err.message || err))}</div>`
+      return
+    }
+    if (!data || !Array.isArray(data.steps) || data.steps.length === 0) {
+      target.innerHTML = `<div style="padding:32px 18px;color:#9ca3af;font-size:13px;text-align:center;">No transcript yet.</div>`
+      return
+    }
+    // Compact totals strip at the top of each column.
+    const t = data.totals.tokens
+    const fmtTokens = (n) => n > 0 ? n.toLocaleString() : '—'
+    const fmtDuration = (ms) => {
+      if (!ms || ms < 0) return '—'
+      const s = Math.round(ms / 1000)
+      if (s < 60) return s + 's'
+      const m = Math.floor(s / 60), rs = s % 60
+      if (m < 60) return rs ? `${m}m ${rs}s` : `${m}m`
+      const h = Math.floor(m / 60), rm = m % 60
+      return rm ? `${h}h ${rm}m` : `${h}h`
+    }
+    const totalsHtml = `
+      <div style="padding:10px 14px;border-bottom:1px solid #1f2937;background:#0a1020;font:11px ui-monospace,monospace;color:#9ca3af;display:flex;flex-wrap:wrap;gap:4px 16px;">
+        <span><span style="color:#60a5fa;">${escape(fmtTokens(t.input))}</span> in</span>
+        ${t.cachedInput > 0 ? `<span><span style="color:#6b7280;">${escape(fmtTokens(t.cachedInput))}</span> cached</span>` : ''}
+        <span><span style="color:#34d399;">${escape(fmtTokens(t.output))}</span> out</span>
+        ${t.reasoning > 0 ? `<span><span style="color:#c084fc;">${escape(fmtTokens(t.reasoning))}</span> reasoning</span>` : ''}
+        <span style="margin-left:auto;color:#6b7280;">${escape(fmtDuration(data.totals.durationMs))} · ${data.totals.lineCount} lines</span>
+      </div>`
+
+    target.innerHTML = totalsHtml + data.steps.map((step) => {
+      const totalTokens = step.tokens.input + step.tokens.cachedInput + step.tokens.output + step.tokens.reasoning
+      const stepName = step.step === 0 ? 'Preamble' : step.name ? `Step ${step.step}: ${step.name}` : `Step ${step.step}`
+      return `
+        <div class="sr-tr-step">
+          <button class="sr-tr-step-head" type="button" style="grid-template-columns: 14px minmax(0, 1fr) auto auto auto;">
+            <span class="sr-tr-step-caret">▸</span>
+            <span class="sr-tr-step-name">${escape(stepName)}</span>
+            <span class="sr-tr-step-meta">${escape(String(step.lines.length))}L</span>
+            <span class="sr-tr-step-meta">${escape(fmtDuration(step.durationMs))}</span>
+            <span class="sr-tr-step-tok-total">Σ ${escape(fmtTokens(totalTokens))}</span>
+          </button>
+          <div class="sr-tr-step-body" style="display:none;">
+            ${step.lines.map((row) => `<pre class="sr-tr-line">${escape(row.line)}</pre>`).join('')}
+          </div>
+        </div>`
+    }).join('')
+
+    // Wire the per-step accordion toggles for THIS column.
+    target.querySelectorAll('.sr-tr-step').forEach((stepEl) => {
+      const head = stepEl.querySelector('.sr-tr-step-head')
+      const bodyEl = stepEl.querySelector('.sr-tr-step-body')
+      const caret = stepEl.querySelector('.sr-tr-step-caret')
+      head.addEventListener('click', () => {
+        const showing = bodyEl.style.display !== 'none'
+        bodyEl.style.display = showing ? 'none' : ''
+        caret.textContent = showing ? '▸' : '▾'
+      })
+    })
+  }
+
+  // Wire dropdown change handlers and render initial content.
+  const selA = overlay.querySelector('[data-compare-col="Run A"]')
+  const selB = overlay.querySelector('[data-compare-col="Run B"]')
+  if (selA) selA.addEventListener('change', (ev) => renderColumn('A', ev.target.value))
+  if (selB) selB.addEventListener('change', (ev) => renderColumn('B', ev.target.value))
+  renderColumn('A', idA)
+  renderColumn('B', idB)
+}
+
+if (typeof window !== 'undefined') {
+  window.openCompareRunsModal = openCompareRunsModal
 }
 
 // ─── Run-history modal ──────────────────────────────────────────────────────
