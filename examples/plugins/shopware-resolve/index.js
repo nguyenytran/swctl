@@ -104,6 +104,61 @@ function startStream(issue, project, mode, out, onDone) {
   return es
 }
 
+/**
+ * Retry path for "create failed before the resolve agent could spawn":
+ * clean the half-built worktree, then re-trigger the whole resolve flow
+ * from scratch.  The bash side already has a "STATUS=failed → resume"
+ * code path inside cmd_create, but partial creates leave fragmented
+ * state that's simpler to wipe than to continue from — DB might be
+ * half-cloned, container might be down, vendor copy might be partial.
+ * One Retry button that does the safe thing is clearer UX than a
+ * granular menu.
+ *
+ * Called by the create-failure card's onclick.  Returns a promise so
+ * the caller can re-enable the button on error.
+ */
+async function retryAfterCreateFailure(issue, project, mode, out, stepInfo, updateStepper, resultEl, onDone, updateCreateStepper, issueId) {
+  appendLine(out, `\n─── Retry: cleaning failed instance ${issueId} ───`, 'log')
+
+  // Stream the clean output into the same console so the user sees
+  // what's being torn down.  When the clean stream finishes (success
+  // or failure), we re-run the resolve.
+  await new Promise((resolve, reject) => {
+    const cleanUrl = `/api/stream/clean?issueId=${encodeURIComponent(issueId)}&force=1`
+    const ces = new EventSource(cleanUrl)
+    ces.addEventListener('log', (e) => {
+      try {
+        const data = JSON.parse(e.data)
+        if (data.line) appendLine(out, data.line, 'log')
+      } catch {}
+    })
+    ces.addEventListener('done', (e) => {
+      let exitCode = 0
+      try { exitCode = (JSON.parse(e.data) || {}).exitCode ?? 0 } catch {}
+      ces.close()
+      if (exitCode === 0) {
+        resolve()
+      } else {
+        // Even on clean failure we proceed to retry — clean's idempotent
+        // and a stuck-in-half-state instance is what we're trying to
+        // unstick.  Worst case the next swctl create surfaces the same
+        // error again.
+        appendLine(out, `[clean] exited with code ${exitCode} — proceeding to retry anyway`, 'err')
+        resolve()
+      }
+    })
+    ces.addEventListener('error', () => {
+      ces.close()
+      reject(new Error('clean stream errored'))
+    })
+  })
+
+  appendLine(out, '\n─── Clean done; re-running resolve ───\n', 'log')
+  // Same args as the original run.  startStreamWithSteps will go
+  // through create + resolve again from scratch.
+  startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper, resultEl, onDone, updateCreateStepper)
+}
+
 function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper, resultEl, onDone, updateCreateStepper) {
   const params = new URLSearchParams()
   params.set('issue', issue)
@@ -118,6 +173,15 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
   let currentStep = 1
   // No-op fallback so callers that haven't been updated yet still work.
   const updCreate = typeof updateCreateStepper === 'function' ? updateCreateStepper : () => {}
+
+  // Phase tracking — distinguishes "create failed" from "resolve failed"
+  // so the failure card can render the right buttons (Retry vs Resume).
+  // We're in create phase until the first resolve `### STEP N` marker
+  // arrives.  lastCreateStep + lastCreateStepName feed the failure-card
+  // title when the failure is during create.
+  let inCreatePhase = true
+  let lastCreateStep = 0
+  let lastCreateStepName = ''
 
   const stepNames = {
     1: 'Verify the issue',
@@ -158,8 +222,10 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
       if (createStartMatch) {
         const n = parseInt(createStartMatch[1])
         if (n >= 1 && n <= 5) {
+          lastCreateStep = n
+          lastCreateStepName = createStepNames[n] || ''
           updCreate(n, 'active')
-          stepInfo.textContent = `Creating worktree — Step ${n}/5: ${createStepNames[n] || ''}`
+          stepInfo.textContent = `Creating worktree — Step ${n}/5: ${lastCreateStepName}`
         }
         return  // don't fall through to resolve regex (would never match anyway, but explicit)
       } else if (createEndMatch) {
@@ -171,6 +237,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
             // Whole create phase done — fade the create stepper so the
             // resolve workflow stepper takes visual focus.
             updCreate(0, 'complete')
+            inCreatePhase = false  // failures from here on are resolve failures
           }
         }
         return
@@ -192,6 +259,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
         const n = parseInt(startMatch[1])
         if (n >= 1 && n <= 8) {
           stepsStarted.add(n)
+          inCreatePhase = false  // we're past create, into the resolve workflow
           if (n >= currentStep) {
             currentStep = n
             updateStepper(currentStep, 'active')
@@ -299,6 +367,54 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
         if (prLink && openPrBtn) openPrBtn.href = prLink.href
       } catch {}
 
+    } else if (inCreatePhase) {
+      // Failure happened DURING the create phase — the resolve agent
+      // never started.  Show a create-failure card with a "Retry"
+      // button that cleans the half-built worktree and re-runs the
+      // whole resolve from scratch.  Resume isn't applicable here:
+      // partial creates leave fragmented state (broken DB clone,
+      // half-checked-out worktree, unstarted container) that's
+      // simpler to wipe than to surgically continue.
+      updCreate(lastCreateStep || 1, 'failed')
+      stepInfo.textContent = ''
+      appendLine(out, `\n─── Create failed (exit ${exitCode}) ───`, 'err')
+      const stepLabel = lastCreateStep
+        ? `Step ${lastCreateStep}/5: ${lastCreateStepName}`
+        : 'Pre-flight or earlier'
+
+      resultEl.innerHTML = `
+        <div class="sr-result-card failure">
+          <div class="sr-result-icon">❌</div>
+          <div class="sr-result-body">
+            <div class="sr-result-title" style="color:#f87171;">Create failed at ${escape(stepLabel)}</div>
+            <div class="sr-result-meta">
+              <span>Issue #${issueId} • exit code ${exitCode}</span>
+            </div>
+          </div>
+          <div class="sr-result-actions">
+            <button class="sr-result-btn sr-result-btn-primary" data-retry-create="${issueId}" title="Clean the half-built worktree and re-run the whole resolve from scratch">🔄 Clean + Retry</button>
+            <button class="sr-result-btn" data-goto="/dashboard/instance/${issueId}">View Detail</button>
+          </div>
+        </div>
+      `
+
+      const retryBtn = resultEl.querySelector('[data-retry-create]')
+      if (retryBtn) {
+        retryBtn.addEventListener('click', (ev) => {
+          ev.preventDefault()
+          retryBtn.disabled = true
+          retryBtn.textContent = 'Cleaning…'
+          retryAfterCreateFailure(
+            issue, project, mode,
+            out, stepInfo, updateStepper, resultEl, onDone, updateCreateStepper,
+            issueId,
+          ).catch((err) => {
+            appendLine(out, `[retry] failed: ${err && err.message || err}`, 'err')
+            retryBtn.disabled = false
+            retryBtn.textContent = '🔄 Clean + Retry'
+          })
+        })
+      }
     } else {
       updateStepper(currentStep, 'failed')
       stepInfo.textContent = ''
