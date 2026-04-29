@@ -336,6 +336,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
     let budgetExceeded = false
     let tokensTotal = 0
     let tokenBudget = null
+    let failurePatterns = []
     try {
       const data = JSON.parse(e.data)
       exitCode = data.exitCode ?? 0
@@ -343,6 +344,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
       budgetExceeded = data.budgetExceeded === true
       tokensTotal = Number(data.tokensTotal) || 0
       tokenBudget = data.tokenBudget == null ? null : Number(data.tokenBudget)
+      failurePatterns = Array.isArray(data.failurePatterns) ? data.failurePatterns : []
     } catch {}
     es.close()
 
@@ -486,6 +488,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
             <button class="sr-result-btn" data-goto="/dashboard/instance/${issueId}">View Detail</button>
           </div>
         </div>
+        ${renderFailurePatternsPanel(failurePatterns)}
       `
 
       const retryBtn = resultEl.querySelector('[data-retry-create]')
@@ -535,6 +538,7 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
             <button class="sr-result-btn" data-goto="/dashboard/instance/${issueId}">View Detail</button>
           </div>
         </div>
+        ${renderFailurePatternsPanel(failurePatterns)}
       `
 
       // Wire the Resume button to stream into the same console
@@ -1003,6 +1007,50 @@ function renderBlock(pre, row, block, eventType) {
 }
 
 // ---------- Route: /resolve (issues table + create form + console) ----------
+
+/**
+ * Render the failure-pattern hint panel.  Empty string when no
+ * patterns matched (caller can append unconditionally).  Each
+ * matched pattern gets a yellow-tinged card with title + evidence
+ * line (the log line that triggered the match) + remediation hint.
+ *
+ * Hint text supports inline backticks for code spans and bare URLs;
+ * everything else is escaped.  Linkification is regex-based, applied
+ * after escape so a malicious hint can't smuggle HTML.
+ */
+function renderFailurePatternsPanel(patterns) {
+  if (!patterns || patterns.length === 0) return ''
+  const linkify = (s) => s.replace(
+    /(https?:\/\/[^\s<>'"]+)/g,
+    '<a href="$1" target="_blank" style="color:#60a5fa;text-decoration:underline;">$1</a>'
+  )
+  const codeify = (s) => s.replace(
+    /`([^`]+)`/g,
+    '<code style="background:#1f2937;color:#fbbf24;padding:1px 4px;border-radius:3px;font-size:0.95em;">$1</code>'
+  )
+  const cards = patterns.map((p) => `
+    <div style="background:#78350f15;border:1px solid #b4530960;border-radius:4px;padding:10px 12px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <span style="font-size:14px;">💡</span>
+        <span style="font:600 12px ui-sans-serif,sans-serif;color:#fbbf24;">${escape(p.title || '')}</span>
+        <span style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;margin-left:auto;">${escape(p.category || '')}</span>
+      </div>
+      ${p.evidence ? `
+        <div style="font:11px ui-monospace,monospace;color:#9ca3af;background:#0a1020;padding:4px 8px;border-radius:3px;margin-bottom:6px;overflow-x:auto;white-space:pre;">${escape(p.evidence)}</div>
+      ` : ''}
+      <div style="font-size:12px;color:#d1d5db;line-height:1.55;white-space:pre-wrap;">${linkify(codeify(escape(p.hint || '')))}</div>
+    </div>
+  `).join('')
+
+  return `
+    <div style="margin-top:10px;display:flex;flex-direction:column;gap:8px;">
+      <div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;">
+        💡 Possible cause${patterns.length === 1 ? '' : 's'} (${patterns.length} match${patterns.length === 1 ? '' : 'es'})
+      </div>
+      ${cards}
+    </div>
+  `
+}
 
 function renderResolvePage(el, ctx) {
   const activeProject = ctx.activeProject.value || ''

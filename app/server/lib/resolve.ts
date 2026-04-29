@@ -11,6 +11,7 @@ import { readProjects } from './projects.js'
 import { emit } from './events.js'
 import { isResolveEnabled, getResolveTokenBudget } from './config.js'
 import { detectScopeWithAI, type AiScopeDecision } from './ai-scope.js'
+import { matchFailurePatterns } from './failure-patterns.js'
 
 const STATE_DIR = process.env.SWCTL_STATE_DIR || ''
 const RUNS_FILE = STATE_DIR ? path.join(STATE_DIR, 'resolve-runs.json') : ''
@@ -1342,6 +1343,15 @@ export function startResolveStream(
     const tokenBudget = getResolveTokenBudget()
     let budgetExceeded = false
 
+    // Tail buffer of recent log lines, capped at ~64KB.  Used for
+    // failure-pattern matching on close — we don't want to scan the
+    // full multi-MB run buffer (which could stretch on for huge runs)
+    // since most pattern matches live in the last few hundred lines
+    // before exit.  Buffer is rolling: when we'd exceed the cap, drop
+    // the oldest 25% so amortised growth stays cheap.
+    const TAIL_CAP = 64 * 1024
+    let tail = ''
+
     if (tokenBudget !== null) {
       sendEvent('log', {
         line: `[budget] token cap: ${tokenBudget.toLocaleString()} (input + cached + output + reasoning, summed across all turns)`,
@@ -1373,7 +1383,16 @@ export function startResolveStream(
     }
 
     const onData = (chunk: Buffer) => {
-      for (const line of chunk.toString().split('\n')) {
+      const chunkText = chunk.toString()
+      // Append to the tail buffer; trim from the front when we'd
+      // exceed the cap.  Trimming 25% at a time keeps the operation
+      // amortised O(1) — direct trim-each-iter would be O(n²) on
+      // long streams.
+      tail += chunkText
+      if (tail.length > TAIL_CAP) {
+        tail = tail.slice(tail.length - Math.floor(TAIL_CAP * 0.75))
+      }
+      for (const line of chunkText.split('\n')) {
         if (!line) continue
         observeStreamLine(streamState, line)
         sendEvent('log', { line, ts: Date.now() })
@@ -1446,6 +1465,13 @@ export function startResolveStream(
           budget: tokenBudget,
           ts: Date.now(),
         }).catch(() => {})
+        // Run the failure-pattern matcher only on non-zero exits and
+        // budget-exceeded aborts — successful runs don't need
+        // diagnostics.  Cheap (~9 regexes against a 64KB tail).
+        const failurePatterns = (exitCode !== 0 || budgetExceeded)
+          ? matchFailurePatterns(tail)
+          : []
+
         sendEvent('done', {
           exitCode,
           elapsed: Date.now() - startTime,
@@ -1456,6 +1482,8 @@ export function startResolveStream(
           budgetExceeded,
           tokensTotal: streamState.tokensTotal,
           tokenBudget,
+          // Matched failure-pattern hints (empty array when run succeeded).
+          failurePatterns,
         }).then(resolve)
       })
       child.on('error', (err) => {
