@@ -1335,6 +1335,25 @@ function renderResolvePage(el, ctx) {
         <div id="sr-console" class="sr-console"></div>
       </div>
 
+      <!-- Cost / token dashboard widget — aggregates resolve-runs.json
+           into per-backend + status totals.  Window picker (24h / 7d /
+           30d / all) re-fetches on change.  Pre-feature runs (without
+           backend / tokensTotal recorded) bucket into "other" + 0
+           tokens; populates with real data as new runs land. -->
+      <div class="sr-section">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap;">
+          <h3 class="sr-section-title" style="margin:0;">Cost &amp; Usage</h3>
+          <select id="sr-cost-window" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 6px;font-size:11px;">
+            <option value="24h">last 24h</option>
+            <option value="7d">last 7 days</option>
+            <option value="30d">last 30 days</option>
+            <option value="all" selected>all time</option>
+          </select>
+          <span id="sr-cost-loading" class="sr-loading"></span>
+        </div>
+        <div id="sr-cost-summary" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;"></div>
+      </div>
+
       <!-- Issues & PRs table -->
       <div class="sr-section">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
@@ -2279,8 +2298,84 @@ function renderResolvePage(el, ctx) {
   paintTable()
   const refreshTimer = setInterval(paintTable, 15000)
 
+  // ─── Cost & Usage dashboard widget ──────────────────────────────
+  // Fetches the aggregated summary, paints 4 stat cells (runs / tokens
+  // / cost / time) plus a per-backend split.  Re-fetches when the user
+  // changes the time window.  Quiet failure on network errors — the
+  // dashboard isn't critical-path.
+  const costWindowEl = el.querySelector('#sr-cost-window')
+  const costSummaryEl = el.querySelector('#sr-cost-summary')
+  const costLoadingEl = el.querySelector('#sr-cost-loading')
+
+  const fmtTok = (n) => n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + 'M'
+                       : n >= 1_000 ? (n / 1_000).toFixed(1) + 'K'
+                       : String(n)
+  const fmtDur = (ms) => {
+    const s = Math.round((ms || 0) / 1000)
+    if (s < 60) return `${s}s`
+    const m = Math.floor(s / 60), rs = s % 60
+    if (m < 60) return rs ? `${m}m ${rs}s` : `${m}m`
+    const h = Math.floor(m / 60), rm = m % 60
+    return rm ? `${h}h ${rm}m` : `${h}h`
+  }
+  const fmtCost = (usd) => usd > 0 ? `$${Number(usd).toFixed(2)}` : '—'
+
+  async function paintCostSummary() {
+    if (!costWindowEl || !costSummaryEl) return
+    costLoadingEl.textContent = '(loading...)'
+    let data
+    try {
+      const res = await fetch(`/api/skill/resolve/cost-summary?window=${encodeURIComponent(costWindowEl.value)}`)
+      data = await res.json()
+    } catch {
+      costSummaryEl.innerHTML = '<div style="color:#f87171;font-size:12px;">Failed to load cost summary.</div>'
+      costLoadingEl.textContent = ''
+      return
+    }
+    costLoadingEl.textContent = ''
+
+    const cell = (label, value, sub, color) => `
+      <div style="background:#111827;border:1px solid #1f2937;border-radius:4px;padding:10px 12px;">
+        <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;">${escape(label)}</div>
+        <div style="font:600 18px ui-monospace,monospace;color:${color || '#e5e7eb'};margin-top:2px;">${escape(String(value))}</div>
+        ${sub ? `<div style="font-size:11px;color:#6b7280;margin-top:2px;">${sub}</div>` : ''}
+      </div>`
+
+    const t = data.totals || {}
+    const claude = data.byBackend?.claude || { runs: 0, tokens: 0, costUsd: 0, durationMs: 0 }
+    const codex  = data.byBackend?.codex  || { runs: 0, tokens: 0, costUsd: 0, durationMs: 0 }
+    const other  = data.byBackend?.other  || { runs: 0, tokens: 0, costUsd: 0, durationMs: 0 }
+    const status = data.byStatus || {}
+    const successPct = t.runs ? Math.round(100 * (status.done || 0) / t.runs) : 0
+
+    costSummaryEl.innerHTML =
+      cell('Total runs',     t.runs || 0,
+           `Claude ${claude.runs} · Codex ${codex.runs}${other.runs ? ` · other ${other.runs}` : ''}`)
+      + cell('Tokens',       fmtTok(t.tokens || 0),
+             `Claude ${fmtTok(claude.tokens)} · Codex ${fmtTok(codex.tokens)}`,
+             '#60a5fa')
+      + cell('Spend',        fmtCost(t.costUsd || 0),
+             claude.costUsd > 0 ? `Claude ${fmtCost(claude.costUsd)}` : 'Codex doesn\'t report USD',
+             '#fbbf24')
+      + cell('Wall time',    fmtDur(t.durationMs || 0),
+             null,
+             '#9ca3af')
+      + cell('Success rate', t.runs ? `${successPct}%` : '—',
+             `${status.done || 0} done · ${status.failed || 0} failed${status['budget-exceeded'] ? ` · ${status['budget-exceeded']} budget-exceeded` : ''}${status.running ? ` · ${status.running} running` : ''}`,
+             successPct >= 80 ? '#34d399' : successPct >= 50 ? '#fbbf24' : '#f87171')
+  }
+  if (costWindowEl) {
+    costWindowEl.addEventListener('change', paintCostSummary)
+  }
+  paintCostSummary()
+  // Refresh every 30s — lower cadence than the table since aggregates
+  // change less often.  Same window selector value so user's filter
+  // sticks across refreshes.
+  const costRefreshTimer = setInterval(paintCostSummary, 30000)
+
   return () => {
     clearInterval(refreshTimer)
+    clearInterval(costRefreshTimer)
     if (currentStream) try { currentStream.close() } catch {}
   }
 }

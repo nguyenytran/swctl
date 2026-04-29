@@ -27,7 +27,7 @@ import {
   resolveUsername,
 } from './lib/github.js'
 import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
-import { startResolveStream, startResolveResumeStream, listResolveRuns, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
+import { startResolveStream, startResolveResumeStream, listResolveRuns, listResolveCostSummary, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
 import { parseTranscript, hasTranscript, getResolveBackend } from './lib/transcript.js'
 import {
   readUserConfig,
@@ -1535,6 +1535,19 @@ app.get('/api/skill/resolve/stream', (c) => {
 
 app.get('/api/skill/resolve/runs', (c) => {
   return c.json(listResolveRuns())
+})
+
+/**
+ * Per-backend + total cost/token aggregate for the dashboard widget.
+ * Default window 'all' to match expectations on first load; UI passes
+ * `?window=24h|7d|30d|all` for filtering.  Unknown values fall back
+ * to 'all'.
+ */
+app.get('/api/skill/resolve/cost-summary', (c) => {
+  const raw = c.req.query('window') || 'all'
+  const window: 'all' | '24h' | '7d' | '30d' =
+    raw === '24h' || raw === '7d' || raw === '30d' ? raw : 'all'
+  return c.json(listResolveCostSummary(window))
 })
 
 /**

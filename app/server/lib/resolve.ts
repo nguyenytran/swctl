@@ -153,6 +153,114 @@ async function mutateRuns(fn: (runs: ResolveRun[]) => ResolveRun[]): Promise<voi
   return next
 }
 
+/**
+ * Per-backend + total aggregates over `resolve-runs.json`.  Cheap —
+ * just walks the in-memory runs array and bucketises.  Used by the
+ * resolve plugin's cost-dashboard widget at the top of the page.
+ *
+ * Window: 'all' | '24h' | '7d' | '30d'.  Filter is applied on
+ * startedAt; runs missing startedAt fall into 'all' but are excluded
+ * from time-bounded windows (no way to date-bucket them).
+ *
+ * Tokens: only runs recorded AFTER PR #22 carry tokensTotal; older
+ * entries contribute 0.  Cost: only Claude runs surface USD via the
+ * env file (Codex doesn't), so we read CLAUDE_RESOLVE_COST per-issue
+ * from instance env files for matching done runs.  Best-effort —
+ * missing files / parse errors silently treated as 0.
+ */
+export interface CostSummary {
+  window: 'all' | '24h' | '7d' | '30d'
+  totals: {
+    runs: number
+    tokens: number
+    costUsd: number
+    durationMs: number
+  }
+  byBackend: {
+    claude: { runs: number; tokens: number; costUsd: number; durationMs: number }
+    codex:  { runs: number; tokens: number; costUsd: number; durationMs: number }
+    other:  { runs: number; tokens: number; costUsd: number; durationMs: number }  // pre-feature runs without backend recorded
+  }
+  byStatus: {
+    done: number
+    failed: number
+    'budget-exceeded': number
+    running: number
+  }
+}
+
+export function listResolveCostSummary(window: CostSummary['window'] = 'all'): CostSummary {
+  const runs = listResolveRuns()
+  const cutoff = (() => {
+    const now = Date.now()
+    switch (window) {
+      case '24h': return now - 24 * 60 * 60 * 1000
+      case '7d':  return now - 7 * 24 * 60 * 60 * 1000
+      case '30d': return now - 30 * 24 * 60 * 60 * 1000
+      default:    return 0
+    }
+  })()
+
+  const empty = () => ({ runs: 0, tokens: 0, costUsd: 0, durationMs: 0 })
+  const summary: CostSummary = {
+    window,
+    totals: empty(),
+    byBackend: { claude: empty(), codex: empty(), other: empty() },
+    byStatus: { done: 0, failed: 0, 'budget-exceeded': 0, running: 0 },
+  }
+
+  for (const r of runs) {
+    const startMs = r.startedAt ? Date.parse(r.startedAt) : NaN
+    if (cutoff > 0 && (!Number.isFinite(startMs) || startMs < cutoff)) continue
+
+    const finishMs = r.finishedAt ? Date.parse(r.finishedAt) : NaN
+    const dur = Number.isFinite(startMs) && Number.isFinite(finishMs) ? finishMs - startMs : 0
+    const tokens = Number(r.tokensTotal) || 0
+
+    // Cost is read from the env file (CLAUDE_RESOLVE_COST set by the
+    // resolve stream's close handler when the agent emitted a final
+    // `result` event with total_cost_usd).  Codex doesn't surface a
+    // cost; we only attribute USD to Claude runs.
+    let costUsd = 0
+    if (r.backend === 'claude' && r.status === 'done') {
+      const issueId = (r.issue || '').match(/(?:\/issues\/|#)(\d+)$/)?.[1]
+                   || (r.issue || '').match(/^(\d+)$/)?.[1]
+      if (issueId) {
+        const f = findInstanceEnvFile(issueId)
+        if (f) {
+          try {
+            const raw = fs.readFileSync(f, 'utf-8')
+            const m = raw.match(/^CLAUDE_RESOLVE_COST=['"]?([^'"\n]*)['"]?\s*$/m)
+            const v = m ? Number(m[1]) : NaN
+            if (Number.isFinite(v) && v > 0) costUsd = v
+          } catch {}
+        }
+      }
+    }
+
+    const bucket: keyof CostSummary['byBackend'] =
+      r.backend === 'claude' ? 'claude' :
+      r.backend === 'codex'  ? 'codex'  :
+      'other'
+
+    summary.byBackend[bucket].runs++
+    summary.byBackend[bucket].tokens     += tokens
+    summary.byBackend[bucket].costUsd    += costUsd
+    summary.byBackend[bucket].durationMs += dur
+
+    summary.totals.runs++
+    summary.totals.tokens     += tokens
+    summary.totals.costUsd    += costUsd
+    summary.totals.durationMs += dur
+
+    if (r.status && r.status in summary.byStatus) {
+      summary.byStatus[r.status as keyof CostSummary['byStatus']]++
+    }
+  }
+
+  return summary
+}
+
 export function listResolveRuns(): ResolveRun[] {
   return readRuns()
 }
