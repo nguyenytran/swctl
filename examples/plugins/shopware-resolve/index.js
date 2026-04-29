@@ -181,6 +181,38 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
   // experienced as wall time, not what the server measured).
   const streamStartedAt = Date.now()
   const es = new EventSource(url)
+
+  // Wire the manual-stop button.  The button is in the static markup
+  // (id=sr-stop-btn) and starts hidden; we show it now and tear it
+  // down on done/error.  `wasManuallyCancelled` is the local flag the
+  // done handler reads to render the "you stopped this" card variant
+  // instead of the generic failure card.
+  let wasManuallyCancelled = false
+  const stopBtn = document.getElementById('sr-stop-btn')
+  const onStopClick = async () => {
+    if (!confirm('Stop this resolve run?  The agent process will be terminated; partial progress + transcript are preserved.')) return
+    stopBtn.disabled = true
+    stopBtn.textContent = 'Stopping…'
+    wasManuallyCancelled = true
+    appendLine(out, '\n─── Manual stop requested ───', 'log')
+    try {
+      // Encode the streamId — for resolve streams it's `resolve:<full-issue-url-or-number>`.
+      const streamId = `resolve:${issue}`
+      await fetch(`/api/stream/cancel?id=${encodeURIComponent(streamId)}`, { method: 'POST' })
+    } catch (err) {
+      appendLine(out, `[stop] cancel request failed: ${err && err.message || err}`, 'err')
+    }
+    // The agent gets SIGTERM and the done handler fires shortly.
+    // No need to close `es` here — the close on the server side
+    // ends the SSE stream which fires our `done` listener, which
+    // does the cleanup.
+  }
+  if (stopBtn) {
+    stopBtn.disabled = false
+    stopBtn.textContent = '🛑 Stop'
+    stopBtn.style.display = ''
+    stopBtn.addEventListener('click', onStopClick)
+  }
   let currentStep = 1
   // No-op fallback so callers that haven't been updated yet still work.
   const updCreate = typeof updateCreateStepper === 'function' ? updateCreateStepper : () => {}
@@ -348,6 +380,12 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
     } catch {}
     es.close()
 
+    // Tear down the stop button — stream is closed; nothing to stop.
+    if (stopBtn) {
+      stopBtn.removeEventListener('click', onStopClick)
+      stopBtn.style.display = 'none'
+    }
+
     // Extract issue ID from URL or number
     const issueMatch = issue.match(/\/issues\/(\d+)/) || issue.match(/^(\d+)$/)
     const issueId = issueMatch ? issueMatch[1] : issue
@@ -417,6 +455,57 @@ function startStreamWithSteps(issue, project, mode, out, stepInfo, updateStepper
         const openPrBtn = resultEl.querySelector('.sr-result-actions a.sr-result-btn')
         if (prLink && openPrBtn) openPrBtn.href = prLink.href
       } catch {}
+
+    } else if (wasManuallyCancelled) {
+      // User clicked the Stop button.  Distinct from generic failure
+      // (no underlying bug) and from budget-exceeded (user chose vs.
+      // limit hit).  Failure-pattern matching is suppressed — there's
+      // no "fix" for "you stopped this".  Resume from last completed
+      // step is offered when the run got past Step 1.
+      updateStepper(currentStep, 'failed')
+      stepInfo.textContent = ''
+      appendLine(out, `\n─── Stopped manually (last completed: Step ${lastCompletedStepFromServer}/8) ───`, 'log')
+
+      const lastCompleted = Math.max(
+        lastCompletedStepFromServer || 0,
+        stepsEnded.size > 0 ? Math.max(...stepsEnded) : 0,
+      )
+      const nextStep = Math.min(lastCompleted + 1, 8)
+      const canResume = lastCompleted > 0 && nextStep <= 8
+
+      resultEl.innerHTML = `
+        <div class="sr-result-card failure" style="border-color:#374151;background:#11182750;">
+          <div class="sr-result-icon">🛑</div>
+          <div class="sr-result-body">
+            <div class="sr-result-title" style="color:#9ca3af;">Stopped manually</div>
+            <div class="sr-result-meta">
+              <span>Issue #${issueId}</span>
+              ${lastCompleted > 0 ? `<span>•</span><span style="color:#9ca3af;">Last completed: Step ${lastCompleted}/8</span>` : ''}
+              ${tokensTotal > 0 ? `<span>•</span><span style="color:#60a5fa;">${(tokensTotal/1_000_000).toFixed(1)}M tokens</span>` : ''}
+            </div>
+          </div>
+          <div class="sr-result-actions">
+            <button class="sr-result-btn" data-transcript="${issueId}" title="View per-step transcript and token usage">📊 Transcript</button>
+            ${canResume ? `<button class="sr-result-btn sr-result-btn-primary" data-resume="${issueId}" data-next-step="${nextStep}" title="Re-launch with --resume and pick up from Step ${nextStep}">↻ Resume from Step ${nextStep}</button>` : ''}
+            <button class="sr-result-btn" data-goto="/dashboard/instance/${issueId}">View Detail</button>
+          </div>
+        </div>
+      `
+
+      // Wire the resume button identically to the generic failure-card path.
+      const resumeBtn = resultEl.querySelector('[data-resume]')
+      if (resumeBtn) {
+        resumeBtn.addEventListener('click', (ev) => {
+          ev.preventDefault()
+          resumeBtn.disabled = true
+          resumeBtn.textContent = 'Resuming…'
+          appendLine(out, `\n─── Resuming from Step ${nextStep} ───`, 'log')
+          startResumeStream(issueId, out, stepInfo, updateStepper, resultEl, () => {
+            resumeBtn.disabled = false
+            resumeBtn.textContent = `↻ Resume from Step ${nextStep}`
+          })
+        })
+      }
 
     } else if (budgetExceeded) {
       // Run hit the configured token budget and we SIGTERM'd the agent.
@@ -1371,6 +1460,13 @@ function renderResolvePage(el, ctx) {
         </div>
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
           <div id="sr-step-info" style="color:#9ca3af;font-size:12px;flex:1;min-width:200px;"></div>
+          <!-- Manual stop button.  Only visible while a resolve stream
+               is open; hidden when stream closes (done or error).
+               Click sends a POST to /api/stream/cancel with the
+               resolve stream id, which SIGTERMs the agent process.
+               The done handler sees the resulting exitCode and
+               renders a "stopped manually" card variant. -->
+          <button id="sr-stop-btn" type="button" style="display:none;font-size:11px;padding:3px 10px;border-radius:4px;border:1px solid #7f1d1d;background:#450a0a40;color:#f87171;cursor:pointer;font-family:ui-sans-serif,sans-serif;">🛑 Stop</button>
           <!-- Live token badge.  Updates from the server's tokens SSE
                event; hidden until the first event arrives.  Color shifts
                from gray (no budget) → green (under 50%) → amber (50-80%)
