@@ -2054,7 +2054,29 @@ function renderResolvePage(el, ctx) {
 
     // Fetch PR info in one batched call (grouped by repo on the server).
     const prs = await fetchPrsBatch(resolveInstances.map(i => i.issueId))
-    const items = resolveInstances.map(inst => ({ ...inst, pr: prs[inst.issueId] || null }))
+    // Fetch all resolve-runs.json entries once and group by issue id;
+    // attaches an `attempts` array to every item.  Used by the per-row
+    // "📜 N" history button to render the modal without re-fetching.
+    let runsByIssue = {}
+    try {
+      const runs = await fetchRuns()
+      for (const run of runs) {
+        const m = (run.issue || '').match(/(?:\/issues\/|#)(\d+)$/) || (run.issue || '').match(/^(\d+)$/)
+        if (!m) continue
+        const id = m[1]
+        if (!runsByIssue[id]) runsByIssue[id] = []
+        runsByIssue[id].push(run)
+      }
+      // Most recent first within each issue's list.
+      for (const id of Object.keys(runsByIssue)) {
+        runsByIssue[id].sort((a, b) => (b.startedAt || '').localeCompare(a.startedAt || ''))
+      }
+    } catch {}
+    const items = resolveInstances.map(inst => ({
+      ...inst,
+      pr: prs[inst.issueId] || null,
+      attempts: runsByIssue[inst.issueId] || [],
+    }))
     tableLoading.textContent = ''
 
     tableContainer.innerHTML = `
@@ -2118,6 +2140,15 @@ function renderResolvePage(el, ctx) {
             if (item.hasTranscript) {
               actions.push(`<button class="sr-btn" data-transcript="${escape(item.issueId)}" title="View per-step transcript and token usage">📊</button>`)
             }
+            // Run-history button — only render when there's something
+            // to show (>= 1 recorded attempt).  Shows the count so users
+            // can see at a glance whether this issue has a back-story
+            // (#6689 had 6 attempts in the wild).  Click → modal with
+            // per-attempt timestamp / backend / status / step / duration
+            // / tokens.
+            if (item.attempts && item.attempts.length > 0) {
+              actions.push(`<button class="sr-btn" data-history="${escape(item.issueId)}" title="View all resolve attempts for this issue">📜 ${item.attempts.length}</button>`)
+            }
             actions.push(`<button class="sr-btn" data-goto="/dashboard/instance/${escape(item.issueId)}" style="text-decoration:none;">Detail</button>`)
             actions.push(`<button class="sr-btn" data-action="push" data-issue="${escape(item.issueId)}">Push</button>`)
             if (!hasPr) {
@@ -2159,6 +2190,17 @@ function renderResolvePage(el, ctx) {
       btn.addEventListener('click', (ev) => {
         ev.preventDefault()
         openTranscriptModal(btn.getAttribute('data-transcript'))
+      })
+    })
+
+    // Wire history buttons — open the per-issue attempt log modal.
+    // Pulls attempts from the closure's runsByIssue map (already
+    // computed above) so the click is instant — no fetch.
+    tableContainer.querySelectorAll('[data-history]').forEach(btn => {
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        const id = btn.getAttribute('data-history')
+        openRunHistoryModal(id, runsByIssue[id] || [])
       })
     })
 
@@ -2629,6 +2671,125 @@ function renderStepTokenPanel(tokens) {
 // for an issue that doesn't currently have a result-card on screen.
 if (typeof window !== 'undefined') {
   window.openTranscriptModal = openTranscriptModal
+}
+
+// ─── Run-history modal ──────────────────────────────────────────────────────
+//
+// Opens a centered overlay listing every recorded resolve attempt for
+// one issue (from resolve-runs.json, already fetched + grouped in the
+// table-paint code path).  Issue #6689 in our test corpus had 6
+// attempts; only the most recent was visible in the table before this.
+//
+// Each attempt row shows: timestamp + relative-time, backend (Claude /
+// Codex), status pill (done / failed / budget-exceeded / running),
+// step reached (X/8), duration, total tokens (when recorded).
+//
+// Reuses the .sr-tr-* class family from the transcript modal so the
+// two modals look like siblings.
+
+function openRunHistoryModal(issueId, attempts) {
+  document.querySelectorAll('.sr-tr-overlay').forEach((n) => n.remove())
+
+  const overlay = document.createElement('div')
+  overlay.className = 'sr-tr-overlay'
+
+  const fmtRelative = (iso) => {
+    if (!iso) return '—'
+    const t = Date.parse(iso)
+    if (!Number.isFinite(t)) return '—'
+    const sec = Math.round((Date.now() - t) / 1000)
+    if (sec < 60) return `${sec}s ago`
+    if (sec < 3600) return `${Math.round(sec / 60)}m ago`
+    if (sec < 86400) return `${Math.round(sec / 3600)}h ago`
+    return `${Math.round(sec / 86400)}d ago`
+  }
+  const fmtDur = (a, b) => {
+    const sa = Date.parse(a || '')
+    const sb = Date.parse(b || '')
+    if (!Number.isFinite(sa) || !Number.isFinite(sb)) return '—'
+    const s = Math.max(0, Math.round((sb - sa) / 1000))
+    if (s < 60) return `${s}s`
+    const m = Math.floor(s / 60), rs = s % 60
+    return rs ? `${m}m ${rs}s` : `${m}m`
+  }
+  const fmtTok = (n) => {
+    if (n == null || !Number.isFinite(Number(n))) return '—'
+    const v = Number(n)
+    return v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + 'M'
+         : v >= 1_000 ? (v / 1_000).toFixed(0) + 'K'
+         : String(v)
+  }
+  const statusBadge = (s) => {
+    const colors = {
+      'done':            'background:#064e3b40;color:#34d399;border:1px solid #065f4660;',
+      'failed':          'background:#450a0a40;color:#f87171;border:1px solid #7f1d1d60;',
+      'budget-exceeded': 'background:#78350f40;color:#fbbf24;border:1px solid #b4530960;',
+      'running':         'background:#1e3a5f40;color:#60a5fa;border:1px solid #1e40af60;',
+    }
+    return `<span style="${colors[s] || 'background:#1f2937;color:#9ca3af;'}padding:1px 6px;border-radius:3px;font-size:10px;">${escape(s || 'unknown')}</span>`
+  }
+  const backendBadge = (b) => {
+    if (b === 'claude') return '<span style="color:#fbbf24;font-size:11px;">Claude</span>'
+    if (b === 'codex')  return '<span style="color:#c084fc;font-size:11px;">Codex</span>'
+    return '<span style="color:#6b7280;font-size:11px;">—</span>'
+  }
+
+  const rows = attempts.map((a) => `
+    <tr style="border-bottom:1px solid #1f2937;">
+      <td style="padding:8px 12px;font-size:11px;color:#9ca3af;font-family:ui-monospace,monospace;white-space:nowrap;">${escape((a.startedAt || '').slice(0, 19).replace('T', ' '))}<br><span style="color:#6b7280;">${escape(fmtRelative(a.startedAt))}</span></td>
+      <td style="padding:8px 12px;">${backendBadge(a.backend)}</td>
+      <td style="padding:8px 12px;">${statusBadge(a.status)}</td>
+      <td style="padding:8px 12px;font-size:11px;color:#d1d5db;font-family:ui-monospace,monospace;">${a.lastCompletedStep != null ? `${a.lastCompletedStep}/8` : '—'}</td>
+      <td style="padding:8px 12px;font-size:11px;color:#d1d5db;font-family:ui-monospace,monospace;">${escape(fmtDur(a.startedAt, a.finishedAt))}</td>
+      <td style="padding:8px 12px;font-size:11px;color:#60a5fa;font-family:ui-monospace,monospace;">${escape(fmtTok(a.tokensTotal))}</td>
+      <td style="padding:8px 12px;font-size:10px;color:#6b7280;">${a.exitCode != null ? `exit ${a.exitCode}` : ''}</td>
+    </tr>
+  `).join('')
+
+  overlay.innerHTML = `
+    <div class="sr-tr-modal" role="dialog" aria-label="Run history for #${escape(issueId)}">
+      <div class="sr-tr-head">
+        <span class="sr-tr-title">Run history — Issue #${escape(issueId)}</span>
+        <span style="color:#6b7280;font-size:11px;margin-left:8px;">${attempts.length} attempt${attempts.length === 1 ? '' : 's'}</span>
+        <button class="sr-tr-close" aria-label="Close">✕</button>
+      </div>
+      ${attempts.length === 0
+        ? '<div class="sr-tr-empty">No recorded attempts.</div>'
+        : `<div style="overflow:auto;flex:1;">
+            <table style="width:100%;border-collapse:collapse;">
+              <thead>
+                <tr style="background:#111827;">
+                  <th style="text-align:left;padding:8px 12px;font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;">Started</th>
+                  <th style="text-align:left;padding:8px 12px;font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;">AI</th>
+                  <th style="text-align:left;padding:8px 12px;font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;">Status</th>
+                  <th style="text-align:left;padding:8px 12px;font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;">Steps</th>
+                  <th style="text-align:left;padding:8px 12px;font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;">Duration</th>
+                  <th style="text-align:left;padding:8px 12px;font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;">Tokens</th>
+                  <th style="text-align:left;padding:8px 12px;font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;">Exit</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>`
+      }
+    </div>
+  `
+  document.body.appendChild(overlay)
+
+  const close = () => overlay.remove()
+  overlay.querySelector('.sr-tr-close').addEventListener('click', close)
+  overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close() })
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') {
+      close()
+      document.removeEventListener('keydown', onKey)
+    }
+  }
+  document.addEventListener('keydown', onKey)
+}
+
+if (typeof window !== 'undefined') {
+  window.openRunHistoryModal = openRunHistoryModal
 }
 
 export default plugin

@@ -97,9 +97,20 @@ export interface ResolveRun {
   issue: string
   project?: string
   mode?: string
+  /** Which AI backend ran this attempt — `claude` | `codex` | undefined for
+   *  pre-feature runs.  Surfaced in the per-issue history panel so the
+   *  user can see "was that the Claude attempt that failed at step 4 or
+   *  the Codex one that hit the budget cap?" at a glance. */
+  backend?: 'claude' | 'codex'
+  /** Last `### STEP N END` marker the agent emitted before finishing.
+   *  0-8.  Lets the history panel show "got to Step 5" for failed runs. */
+  lastCompletedStep?: number
+  /** Total tokens consumed (input + cached + output + reasoning).
+   *  Optional — pre-feature runs don't have it. */
+  tokensTotal?: number
   startedAt: string
   finishedAt?: string
-  status: 'running' | 'done' | 'failed'
+  status: 'running' | 'done' | 'failed' | 'budget-exceeded'
   exitCode?: number
 }
 
@@ -153,15 +164,32 @@ function recordStart(run: Omit<ResolveRun, 'startedAt' | 'status'>): void {
   })
 }
 
-function recordFinish(issue: string, exitCode: number): void {
+/**
+ * Patch the most-recent running entry for an issue with terminal-state
+ * info.  Called from the resolve stream's close handler — gets the
+ * full picture (status, step, tokens) that recordStart didn't have.
+ *
+ * Looks up by (issue, status='running'); idempotent if called twice
+ * (the second call won't find a running entry to patch).
+ */
+function recordFinish(
+  issue: string,
+  exitCode: number,
+  extra?: { lastCompletedStep?: number; tokensTotal?: number; budgetExceeded?: boolean },
+): void {
   void mutateRuns(runs => {
     const idx = runs.findIndex(r => r.issue === issue && r.status === 'running')
     if (idx >= 0) {
+      const status: ResolveRun['status'] = extra?.budgetExceeded
+        ? 'budget-exceeded'
+        : (exitCode === 0 ? 'done' : 'failed')
       runs[idx] = {
         ...runs[idx],
-        status: exitCode === 0 ? 'done' : 'failed',
+        status,
         exitCode,
         finishedAt: new Date().toISOString(),
+        ...(extra?.lastCompletedStep !== undefined && { lastCompletedStep: extra.lastCompletedStep }),
+        ...(extra?.tokensTotal !== undefined && { tokensTotal: extra.tokensTotal }),
       }
     }
     return runs
@@ -910,7 +938,7 @@ export function startResolveStream(
   // not known until the worktree create finishes.  See `buildResolvePrompt`
   // for the per-backend rationale.
 
-  recordStart({ issue, project, mode })
+  recordStart({ issue, project, mode, backend })
 
   const streamId = `resolve:${issue}`
 
@@ -1290,6 +1318,15 @@ export function startResolveStream(
           CLAUDE_RESOLVE_STATUS: status,
           CLAUDE_RESOLVE_STEP: String(streamState.lastCompletedStep),
           CLAUDE_RESOLVE_COST: String(streamState.cost),
+        })
+        // Patch the resolve-runs.json entry inline so the per-issue
+        // history panel shows full data (status + step reached + token
+        // total) without depending on the plugin's later /finish call.
+        // The plugin's POST is now best-effort backward compat.
+        recordFinish(issue, exitCode, {
+          lastCompletedStep: streamState.lastCompletedStep,
+          tokensTotal: streamState.tokensTotal,
+          budgetExceeded,
         })
         emit({ type: 'instance-changed' })
         // Final tokens event — guarantees the UI renders the exact
