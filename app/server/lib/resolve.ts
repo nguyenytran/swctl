@@ -266,6 +266,168 @@ export function listResolveRuns(): ResolveRun[] {
   return readRuns()
 }
 
+/**
+ * Backend benchmark — analyses recorded runs to compare Claude vs
+ * Codex on the same workload.  Read-only over `resolve-runs.json`;
+ * no orchestration.  The user produces the data manually (resolve
+ * issue X with both backends, possibly across N issues); this just
+ * pivots it into a Claude-vs-Codex view with winners highlighted.
+ *
+ * Why not orchestrate a full benchmark spawn?  Running both backends
+ * on N issues is a 2N × 5-25min commitment; orchestration also
+ * needs to handle worktree collisions (Claude and Codex on the same
+ * issue can't share a worktree) and would 2x cost without warning.
+ * Read-side analysis is honest about the data the user has and
+ * doesn't promise something the UI can't responsibly trigger.
+ */
+
+export interface BackendStats {
+  attempts: number
+  successes: number     // status='done'
+  failures: number      // status='failed'
+  budgetExceeded: number
+  cancelled: number
+  /** 0..1; null when attempts=0. */
+  successRate: number | null
+  /** Mean tokens across runs that recorded tokensTotal; null when none did. */
+  avgTokens: number | null
+  /** Mean duration ms across runs that finished. */
+  avgDurationMs: number | null
+  /** Mean of lastCompletedStep across runs that recorded it. */
+  avgStepsReached: number | null
+}
+
+export interface IssueHeadToHead {
+  issueId: string
+  claude: { attempts: number; bestStatus: string; bestStep: number; bestTokens: number | null }
+  codex:  { attempts: number; bestStatus: string; bestStep: number; bestTokens: number | null }
+  /** 'claude' | 'codex' | 'tie' — derived from (success > step > fewer-tokens). */
+  winner: 'claude' | 'codex' | 'tie' | null
+}
+
+export interface BenchmarkReport {
+  byBackend: { claude: BackendStats; codex: BackendStats }
+  headToHead: IssueHeadToHead[]   // only issues both backends ran
+  totals: { runsAnalysed: number; issuesCovered: number }
+}
+
+function emptyStats(): BackendStats {
+  return {
+    attempts: 0, successes: 0, failures: 0, budgetExceeded: 0, cancelled: 0,
+    successRate: null, avgTokens: null, avgDurationMs: null, avgStepsReached: null,
+  }
+}
+
+function avg(xs: number[]): number | null {
+  if (xs.length === 0) return null
+  return xs.reduce((a, b) => a + b, 0) / xs.length
+}
+
+/** Extract issue id from a `ResolveRun.issue` field (URL or bare number). */
+function issueIdOf(run: ResolveRun): string | null {
+  const m = (run.issue || '').match(/(?:\/issues\/|#)(\d+)$/)
+            || (run.issue || '').match(/^(\d+)$/)
+  return m ? m[1] : null
+}
+
+export function buildBenchmarkReport(): BenchmarkReport {
+  const runs = readRuns()
+  const byBackend = { claude: emptyStats(), codex: emptyStats() }
+
+  // Per-(issueId, backend) bucket of runs for the head-to-head section.
+  // Map<issueId, { claude: ResolveRun[], codex: ResolveRun[] }>.
+  const perIssue = new Map<string, { claude: ResolveRun[]; codex: ResolveRun[] }>()
+
+  // Token + duration + step accumulators for the avg computation —
+  // only include runs where the field was actually recorded (otherwise
+  // pre-feature runs would drag the average down to 0).
+  const tokensByBackend: Record<'claude' | 'codex', number[]> = { claude: [], codex: [] }
+  const durByBackend:    Record<'claude' | 'codex', number[]> = { claude: [], codex: [] }
+  const stepsByBackend:  Record<'claude' | 'codex', number[]> = { claude: [], codex: [] }
+
+  for (const r of runs) {
+    if (r.backend !== 'claude' && r.backend !== 'codex') continue  // only known backends in this analysis
+    const stats = byBackend[r.backend]
+    stats.attempts++
+    if (r.status === 'done') stats.successes++
+    else if (r.status === 'failed') stats.failures++
+    else if (r.status === 'budget-exceeded') stats.budgetExceeded++
+    // 'running' / unknown statuses ignored (incomplete data)
+
+    if (typeof r.tokensTotal === 'number' && r.tokensTotal > 0) tokensByBackend[r.backend].push(r.tokensTotal)
+    if (r.startedAt && r.finishedAt) {
+      const dur = Date.parse(r.finishedAt) - Date.parse(r.startedAt)
+      if (Number.isFinite(dur) && dur > 0) durByBackend[r.backend].push(dur)
+    }
+    if (typeof r.lastCompletedStep === 'number') stepsByBackend[r.backend].push(r.lastCompletedStep)
+
+    const id = issueIdOf(r)
+    if (id) {
+      if (!perIssue.has(id)) perIssue.set(id, { claude: [], codex: [] })
+      perIssue.get(id)![r.backend].push(r)
+    }
+  }
+
+  for (const b of ['claude', 'codex'] as const) {
+    const s = byBackend[b]
+    s.successRate = s.attempts > 0 ? s.successes / s.attempts : null
+    s.avgTokens = avg(tokensByBackend[b])
+    s.avgDurationMs = avg(durByBackend[b])
+    s.avgStepsReached = avg(stepsByBackend[b])
+  }
+
+  // Head-to-head: only issues where BOTH backends have at least one run.
+  // For each side, compute the BEST attempt: prefer status='done', then
+  // highest lastCompletedStep, then lowest tokensTotal.  Winner: whoever
+  // reached a better outcome.
+  const headToHead: IssueHeadToHead[] = []
+  for (const [issueId, both] of perIssue.entries()) {
+    if (both.claude.length === 0 || both.codex.length === 0) continue
+    const best = (runs: ResolveRun[]) => {
+      const sorted = [...runs].sort((a, b) => {
+        // status priority: done(3) > budget-exceeded(2) > failed(1) > running(0)
+        const sp = (s: string) => s === 'done' ? 3 : s === 'budget-exceeded' ? 2 : s === 'failed' ? 1 : 0
+        const ds = sp(b.status) - sp(a.status)
+        if (ds !== 0) return ds
+        return (b.lastCompletedStep || 0) - (a.lastCompletedStep || 0)
+      })
+      const top = sorted[0]
+      return {
+        attempts: runs.length,
+        bestStatus: top.status,
+        bestStep: top.lastCompletedStep || 0,
+        bestTokens: typeof top.tokensTotal === 'number' && top.tokensTotal > 0 ? top.tokensTotal : null,
+      }
+    }
+    const cl = best(both.claude)
+    const cx = best(both.codex)
+    let winner: IssueHeadToHead['winner'] = 'tie'
+    if (cl.bestStatus === 'done' && cx.bestStatus !== 'done') winner = 'claude'
+    else if (cx.bestStatus === 'done' && cl.bestStatus !== 'done') winner = 'codex'
+    else if (cl.bestStep !== cx.bestStep) winner = cl.bestStep > cx.bestStep ? 'claude' : 'codex'
+    else if (cl.bestTokens !== null && cx.bestTokens !== null && cl.bestTokens !== cx.bestTokens) {
+      // both succeeded; lower tokens wins
+      winner = cl.bestTokens < cx.bestTokens ? 'claude' : 'codex'
+    }
+    headToHead.push({ issueId, claude: cl, codex: cx, winner })
+  }
+  // Most interesting issues first: ones where backends disagreed.
+  headToHead.sort((a, b) => {
+    if (a.winner === 'tie' && b.winner !== 'tie') return 1
+    if (b.winner === 'tie' && a.winner !== 'tie') return -1
+    return a.issueId.localeCompare(b.issueId)
+  })
+
+  return {
+    byBackend,
+    headToHead,
+    totals: {
+      runsAnalysed: byBackend.claude.attempts + byBackend.codex.attempts,
+      issuesCovered: perIssue.size,
+    },
+  }
+}
+
 function recordStart(run: Omit<ResolveRun, 'startedAt' | 'status'>): void {
   void mutateRuns(runs => {
     runs.unshift({ ...run, startedAt: new Date().toISOString(), status: 'running' })

@@ -27,7 +27,7 @@ import {
   resolveUsername,
 } from './lib/github.js'
 import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
-import { startResolveStream, startResolveResumeStream, listResolveRuns, listResolveCostSummary, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
+import { startResolveStream, startResolveResumeStream, listResolveRuns, listResolveCostSummary, buildBenchmarkReport, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
 import { parseTranscript, hasTranscript, getResolveBackend } from './lib/transcript.js'
 import {
   readUserConfig,
@@ -1548,6 +1548,19 @@ app.get('/api/skill/resolve/cost-summary', (c) => {
   const window: 'all' | '24h' | '7d' | '30d' =
     raw === '24h' || raw === '7d' || raw === '30d' ? raw : 'all'
   return c.json(listResolveCostSummary(window))
+})
+
+/**
+ * Backend benchmark — read-only Claude vs Codex analysis pivoted from
+ * resolve-runs.json.  Surfaces aggregate stats per backend + head-to-
+ * head per issue (only issues where BOTH backends have ≥1 run).
+ *
+ * Used by the "🥊 Benchmark" modal in the resolve plugin.  No
+ * caching — the runs file is small and the response is small;
+ * stale data here is more confusing than the microsecond saved.
+ */
+app.get('/api/skill/resolve/benchmark', (c) => {
+  return c.json(buildBenchmarkReport())
 })
 
 /**
