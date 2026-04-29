@@ -13,7 +13,7 @@ import { computeCleanupState, computeCleanupStateBatch } from './lib/worktree-st
 import { getContainerStatuses } from './lib/docker.js'
 import { readProjects, readProjectConfig, addProjectEntry, removeProjectEntry } from './lib/projects.js'
 import { listWorkflows } from './lib/workflows.js'
-import { streamSwctl, spawnSwctl, isStreamActive, cancelStream, streamCommand } from './lib/stream.js'
+import { streamSwctl, spawnSwctl, isStreamActive, cancelStream, streamCommand, listActiveOperations } from './lib/stream.js'
 import { subscribe } from './lib/events.js'
 import { cacheGet, installCacheInvalidators } from './lib/cache.js'
 import { listBranches, listGitWorktrees, discoverToolWorktrees, discoverPluginWorktrees } from './lib/git.js'
@@ -97,6 +97,20 @@ app.get('/api/events', (c) => {
       stream.onAbort(resolve)
     })
   })
+})
+
+/**
+ * Snapshot of active long-running operations (creates, cleans, etc.).
+ * The UI fetches this on mount to populate its persistent
+ * "active operations" card; subsequent updates ride the existing
+ * /api/events stream as `stream-start`, `stream-progress`, `stream-done`.
+ *
+ * Not cached — the list is small (typically 0-3 entries) and stale
+ * data here would mean the UI shows phantom in-flight ops.  Real-time
+ * accuracy beats the microsecond saved by a 5s cache.
+ */
+app.get('/api/operations', (c) => {
+  return c.json({ operations: listActiveOperations() })
 })
 
 app.get('/api/instances', cacheGet({ ttlMs: 5_000, tag: 'instances' }), async (c) => {
