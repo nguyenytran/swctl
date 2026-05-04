@@ -356,6 +356,24 @@ print('WORKFLOW_ENV_FILE=\"{}\"'.format(data.get('env_file', '.env.local')))
     export WORKFLOW_CONSOLE
 }
 
+# Workflow-hook aliases.  Defined at TOP-LEVEL (not inside another
+# function) so every code path that invokes run_workflow_hook — create,
+# refresh, switch, doctor, manual `swctl exec` — has them available.
+#
+# Why aliases at all?  Workflow hooks live OUTSIDE swctl (in
+# workflows/<name>/hooks/) and may be authored by other teams; calling
+# `_swctl_foo` makes the swctl-vs-workflow boundary explicit.  Without
+# the prefix, a workflow author might assume any function name they see
+# in a co-worker's hook is fair game, then break when swctl renames it.
+#
+# Forward-declared so the underlying implementations (defined later in
+# this file) get resolved at call time, not source time.  Bash is fine
+# with this — the function bodies aren't evaluated until invocation.
+_swctl_update_sales_channel_domain() { update_sales_channel_domain "$@"; }
+_swctl_ensure_install_lock()         { ensure_install_lock "$@"; }
+_swctl_bootstrap_dependencies()      { bootstrap_dependencies "$@"; }
+_swctl_install_admin_deps_if_needed(){ install_admin_deps_if_needed "$@"; }
+
 run_workflow_hook() {
     local hook_name="$1"
     shift
@@ -2923,11 +2941,11 @@ provision_database_and_app() {
              install_admin_deps_if_needed ensure_jwt_keys fix_volume_ownership \
              _composer_update_missing \
              info warn ok die sanitize_db_identifier detect_package_install_command 2>/dev/null || true
-    # Aliases for hooks
-    _swctl_update_sales_channel_domain() { update_sales_channel_domain "$@"; }
-    _swctl_ensure_install_lock() { ensure_install_lock "$@"; }
-    _swctl_bootstrap_dependencies() { bootstrap_dependencies "$@"; }
-    _swctl_install_admin_deps_if_needed() { install_admin_deps_if_needed "$@"; }
+    # NB: _swctl_* hook aliases are now defined at top-level (next to
+    # run_workflow_hook) so EVERY code path that invokes a hook has
+    # them available — not just provision/post-provision.  The old
+    # in-function definitions caused 'command not found' errors when
+    # `swctl switch` (qa→dev) called the build hook directly.
 
     # Delegate to workflow hooks (provision → post-provision)
     run_workflow_hook "provision"
