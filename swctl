@@ -4914,12 +4914,75 @@ cmd_refresh() {
     info "URL: ${APP_URL}"
 }
 
+# Resolve the (main_repo, target_worktree) pair that `swctl checkout`
+# should operate on for the currently-loaded instance metadata.
+#
+# - For PROJECT_TYPE=plugin-external: the issue branch lives in the PLUGIN
+#   repo, NOT trunk.  So the user-facing "main repo" is the plugin repo
+#   (resolved from the plugin worktree's git common-dir), and the worktree
+#   we detach is the nested plugin worktree under the trunk worktree.
+#   Only the FIRST entry of PLUGIN_WORKTREE_PATHS is used — multi-plugin
+#   instances pick the primary; user can `--return` and switch by hand
+#   if they need to operate on a secondary plugin.
+# - For everything else (platform / plugin-embedded): operate on
+#   PROJECT_ROOT and WORKTREE_PATH directly, matching pre-existing behavior.
+#
+# Output is written to global vars _CHECKOUT_RESOLVED_MAIN_REPO and
+# _CHECKOUT_RESOLVED_TARGET_WORKTREE so that `die` (which calls `exit`)
+# correctly aborts the *caller* rather than just a `$()` subshell.
+_resolve_checkout_target() {
+    _CHECKOUT_RESOLVED_MAIN_REPO=""
+    _CHECKOUT_RESOLVED_TARGET_WORKTREE=""
+
+    if [ "${PROJECT_TYPE:-platform}" = "plugin-external" ]; then
+        [ -n "${PLUGIN_WORKTREE_PATHS:-}" ] \
+            || die "Plugin instance '${ISSUE_ID:-?}' has no PLUGIN_WORKTREE_PATHS — cannot checkout."
+        # First entry only; PLUGIN_WORKTREE_PATHS is comma-separated.
+        local target_worktree="${PLUGIN_WORKTREE_PATHS%%,*}"
+        [ -d "$target_worktree" ] \
+            || die "Plugin worktree not found: $target_worktree"
+
+        local plugin_git_common_dir
+        plugin_git_common_dir="$(git -C "$target_worktree" rev-parse --git-common-dir 2>/dev/null)" \
+            || die "Failed to resolve plugin git directory at $target_worktree"
+        # --git-common-dir returns either an absolute path or relative to the
+        # worktree CWD; resolve via cd from the worktree to handle both forms.
+        local main_repo
+        main_repo="$(cd "$target_worktree" && cd "$(dirname "$plugin_git_common_dir")" && pwd -P)"
+        { [ -d "$main_repo/.git" ] || [ -f "$main_repo/.git" ]; } \
+            || die "Plugin main repo missing .git at $main_repo"
+
+        _CHECKOUT_RESOLVED_MAIN_REPO="$main_repo"
+        _CHECKOUT_RESOLVED_TARGET_WORKTREE="$target_worktree"
+    else
+        local main_repo="${PROJECT_ROOT:-}"
+        local target_worktree="${WORKTREE_PATH:-}"
+        [ -d "$main_repo" ] || die "Project root not found: $main_repo"
+        [ -d "$target_worktree" ] || die "Worktree not found: $target_worktree"
+        _CHECKOUT_RESOLVED_MAIN_REPO="$main_repo"
+        _CHECKOUT_RESOLVED_TARGET_WORKTREE="$target_worktree"
+    fi
+}
+
 cmd_checkout() {
-    local issue_input="${1:-}"
+    local issue_input=""
+    local keep_mode=0
     local state_file="$SWCTL_STATE_DIR/checkout.state"
 
-    # --- Return mode: restore main repo to base branch, re-attach worktree ---
-    if [ "$issue_input" = "--return" ] || [ "$issue_input" = "-r" ]; then
+    # Parse args (--return / -r / --keep-mode are positional-independent)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --return|-r) issue_input="--return"; shift ;;
+            --keep-mode) keep_mode=1; shift ;;
+            -*) die "Unknown flag: $1" ;;
+            *)  [ -z "$issue_input" ] || die "Unexpected argument: $1"
+                issue_input="$1"; shift ;;
+        esac
+    done
+
+    # --- Return mode: restore main repo to base branch, re-attach worktree,
+    # and restore the worktree's pre-checkout SWCTL_MODE if we changed it. ---
+    if [ "$issue_input" = "--return" ]; then
         [ -f "$state_file" ] || die "No active checkout to return from."
         # shellcheck disable=SC1090
         . "$state_file"
@@ -4931,23 +4994,44 @@ cmd_checkout() {
         load_instance_metadata "$meta_file"
         load_project_config ${CONFIG_PATH:+"$CONFIG_PATH"}
 
+        # Prefer the paths captured at checkout time — they're the source of
+        # truth for which repo/worktree the entry path mutated.  Fall back to
+        # re-resolving from current metadata for older state files written
+        # before this field existed.
+        local main_repo="${CHECKOUT_MAIN_REPO:-}"
+        local target_worktree="${CHECKOUT_TARGET_WORKTREE:-}"
+        if [ -z "$main_repo" ] || [ -z "$target_worktree" ]; then
+            _resolve_checkout_target
+            main_repo="$_CHECKOUT_RESOLVED_MAIN_REPO"
+            target_worktree="$_CHECKOUT_RESOLVED_TARGET_WORKTREE"
+        fi
+
         info "Returning main repo to '${CHECKOUT_PREVIOUS_BRANCH}' and re-attaching worktree."
 
         # Return main repo to previous branch
-        git -C "$PROJECT_ROOT" checkout "$CHECKOUT_PREVIOUS_BRANCH" \
-            || die "Failed to checkout '$CHECKOUT_PREVIOUS_BRANCH' in main repo."
+        git -C "$main_repo" checkout "$CHECKOUT_PREVIOUS_BRANCH" \
+            || die "Failed to checkout '$CHECKOUT_PREVIOUS_BRANCH' in $main_repo."
 
         # Re-attach worktree to its branch
-        git -C "$WORKTREE_PATH" checkout "$BRANCH" \
-            || die "Failed to re-attach worktree to branch '$BRANCH'."
+        git -C "$target_worktree" checkout "$BRANCH" \
+            || die "Failed to re-attach worktree '$target_worktree' to branch '$BRANCH'."
+
+        # Restore the worktree's pre-checkout mode if it was switched on entry.
+        # CHECKOUT_PREVIOUS_MODE is "" when --keep-mode was used (no switch needed).
+        if [ -n "${CHECKOUT_PREVIOUS_MODE:-}" ] \
+           && [ "${CHECKOUT_PREVIOUS_MODE}" != "${SWCTL_MODE:-dev}" ]; then
+            info "Restoring worktree '$ISSUE_ID' to ${CHECKOUT_PREVIOUS_MODE} mode."
+            cmd_switch "$ISSUE_ID" "--${CHECKOUT_PREVIOUS_MODE}" \
+                || warn "Mode restore to ${CHECKOUT_PREVIOUS_MODE} failed; worktree left in ${SWCTL_MODE:-dev}."
+        fi
 
         rm -f "$state_file"
-        ok "Returned main repo to '$CHECKOUT_PREVIOUS_BRANCH'. Worktree '$ISSUE_ID' re-attached to '$BRANCH'."
+        ok "Returned main repo to '$CHECKOUT_PREVIOUS_BRANCH'. Worktree re-attached to '$BRANCH'."
         return
     fi
 
     # --- Checkout mode: detach worktree, checkout branch in main repo ---
-    [ -n "$issue_input" ] || die "Usage: swctl checkout <issue>  or  swctl checkout --return"
+    [ -n "$issue_input" ] || die "Usage: swctl checkout <issue> [--keep-mode]  or  swctl checkout --return"
 
     # Warn if there's already an active checkout
     if [ -f "$state_file" ]; then
@@ -4967,29 +5051,71 @@ cmd_checkout() {
     [ -n "${BRANCH:-}" ] || die "Instance '$issue_input' has no branch set."
     [ -n "${WORKTREE_PATH:-}" ] || die "Instance '$issue_input' has no worktree path."
 
+    # Resolve the right repo + worktree for this instance type.  Uses
+    # globals (not stdout) so `die` aborts the caller, not a subshell.
+    _resolve_checkout_target
+    local main_repo="$_CHECKOUT_RESOLVED_MAIN_REPO"
+    local target_worktree="$_CHECKOUT_RESOLVED_TARGET_WORKTREE"
+
+    # Capture the worktree's current mode BEFORE we mutate anything.  Used
+    # by --return to restore.  Empty string = nothing to restore.
+    local previous_mode="${SWCTL_MODE:-dev}"
+    local mode_to_restore=""
+
     # Save current main repo branch
     local current_branch
-    current_branch="$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null)" || true
-    [ -n "$current_branch" ] || current_branch="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
-    [ -n "$current_branch" ] || die "Could not determine current branch of main repo."
+    current_branch="$(git -C "$main_repo" branch --show-current 2>/dev/null)" || true
+    [ -n "$current_branch" ] || current_branch="$(git -C "$main_repo" rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
+    [ -n "$current_branch" ] || die "Could not determine current branch of $main_repo."
 
-    info "Checking out branch '$BRANCH' (from worktree '$ISSUE_ID') into main repo."
+    # Sanity: if main_repo's HEAD is already on BRANCH we'd just be detaching
+    # the worktree for nothing.  Refuse early with a clear message.
+    if [ "$current_branch" = "$BRANCH" ]; then
+        die "Main repo $main_repo is already on '$BRANCH'. Run 'swctl checkout --return' first if you want to re-checkout."
+    fi
+
+    info "Checking out branch '$BRANCH' from worktree '$target_worktree' into $main_repo."
 
     # 1. Detach worktree HEAD (releases the branch)
-    git -C "$WORKTREE_PATH" checkout --detach HEAD 2>/dev/null \
-        || die "Failed to detach worktree HEAD."
-    ok "Detached worktree '$ISSUE_ID' from branch '$BRANCH'."
+    git -C "$target_worktree" checkout --detach HEAD 2>/dev/null \
+        || die "Failed to detach worktree HEAD at $target_worktree."
+    ok "Detached worktree from branch '$BRANCH'."
 
     # 2. Checkout branch in main repo
-    git -C "$PROJECT_ROOT" checkout "$BRANCH" \
-        || { git -C "$WORKTREE_PATH" checkout "$BRANCH" 2>/dev/null || true; die "Failed to checkout '$BRANCH' in main repo."; }
-    ok "Main repo now on branch '$BRANCH'."
+    git -C "$main_repo" checkout "$BRANCH" \
+        || { git -C "$target_worktree" checkout "$BRANCH" 2>/dev/null || true; die "Failed to checkout '$BRANCH' in $main_repo."; }
+    ok "Main repo $main_repo now on branch '$BRANCH'."
 
-    # 3. Save state for --return
+    # 3. Auto-switch worktree to QA mode (unless --keep-mode).  Rationale:
+    # during checkout, edits go into the main repo, not the worktree, so
+    # the worktree's runtime is "watch-only".  QA mode skips the heavy dev
+    # tooling (vendor copy, console ops, frontend rebuilds) — perfect for
+    # a lean idle backend.  --return restores whatever mode was active
+    # before checkout.
+    if [ "$keep_mode" -eq 1 ]; then
+        info "Keeping worktree '$ISSUE_ID' in ${previous_mode} mode (--keep-mode)."
+    elif [ "$previous_mode" = "qa" ]; then
+        info "Worktree '$ISSUE_ID' already in qa mode."
+    else
+        info "Switching worktree '$ISSUE_ID' to qa mode for the duration of this checkout."
+        if cmd_switch "$ISSUE_ID" --qa; then
+            mode_to_restore="$previous_mode"
+        else
+            warn "Auto-switch to qa failed; worktree left in ${previous_mode} mode."
+        fi
+    fi
+
+    # 4. Save state for --return.  The MAIN_REPO and TARGET_WORKTREE paths
+    # are persisted so --return doesn't have to re-derive them from
+    # potentially-mutated metadata, and so we operate on the *exact* paths
+    # we mutated on entry — even if the metadata schema changes later.
     mkdir -p "$SWCTL_STATE_DIR"
     {
         printf 'CHECKOUT_ACTIVE_ISSUE=%q\n' "$ISSUE_ID"
         printf 'CHECKOUT_PREVIOUS_BRANCH=%q\n' "$current_branch"
+        printf 'CHECKOUT_PREVIOUS_MODE=%q\n' "$mode_to_restore"
+        printf 'CHECKOUT_MAIN_REPO=%q\n' "$main_repo"
+        printf 'CHECKOUT_TARGET_WORKTREE=%q\n' "$target_worktree"
     } > "$state_file"
 
     info "To return: swctl checkout --return"
@@ -6870,7 +6996,8 @@ Commands:
   logs        Show or follow container logs for a worktree.
   restart     Restart the app container for a worktree without full recreate.
   refresh     Pull latest changes, detect what changed, rebuild only the delta.
-  checkout    Detach worktree and checkout its branch in main repo. --return to undo.
+  checkout    Detach worktree and checkout its branch in main repo (auto-switches the
+              worktree to qa mode; pass --keep-mode to preserve dev). --return to undo.
   open        Open the worktree URL in the default browser.
   code        Open worktree in an editor: --phpstorm (default), --claude, --codex, --code, --cursor.
   switch      Switch a worktree between QA and Dev mode (rebuilds only what's needed).
