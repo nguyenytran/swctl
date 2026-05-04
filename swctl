@@ -3424,6 +3424,33 @@ for dep in data.get('dependencies', []):
 " "$deps_file" 2>/dev/null
 }
 
+read_platform_plugin_deps() {
+    # Read $PROJECT_ROOT/.swctl.deps.yaml and print the list of plugin
+    # names declared under `plugins:`.  Used by `swctl create` (platform
+    # case) so a platform issue can declare which plugins it needs to
+    # have side-by-side for testing — e.g. a fix in shopware/core that
+    # only manifests when SwagCommercial is active.
+    #
+    # Schema (at platform repo root, e.g. /Users/ytran/Shopware/trunk/):
+    #   plugins:
+    #     - SwagCommercial
+    #     - SwagPlatformSecurity
+    #
+    # Empty when the file is absent or no `plugins:` key is set.  The
+    # caller iterates the names and calls create_dep_plugin_worktree for
+    # each — same code path as the existing `--deps` CLI flag.
+    local project_root="$1"
+    local deps_file="$project_root/.swctl.deps.yaml"
+    [ -f "$deps_file" ] || return 0
+    python3 -c "
+import yaml, sys
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+for plugin in data.get('plugins', []) or []:
+    print(plugin)
+" "$deps_file" 2>/dev/null
+}
+
 read_plugin_platform_ref() {
     # Print the plugin's preferred platform git ref (branch / tag / SHA), or
     # nothing if no override is declared.  Schema in .swctl.deps.yaml:
@@ -4242,22 +4269,34 @@ cmd_create() {
             info "[timing] count_changes: $((SECONDS - step_start))s"
             printf '### CREATE STEP 2 END\n'
 
-            # Resolve dependency plugins (--deps flag) for platform worktrees
+            # Resolve dependency plugins for platform worktrees.
+            #   1) `--deps Foo,Bar` CLI flag wins (existing behavior).
+            #   2) Otherwise fall back to <PROJECT_ROOT>/.swctl.deps.yaml,
+            #      `plugins:` key — auto-spin-up plugins listed there.
+            # Use case for (2): some platform issues only manifest with a
+            # specific plugin active (e.g. a core hook that SwagCommercial
+            # exercises).  The yaml lets the project default that set
+            # without burdening every `swctl create` with a flag.
             local dep_plugins=""
             local dep_worktree_paths=""
+            local deps=""
+            local _deps_source=""
             if [ -n "${selected_deps:-}" ]; then
-                local deps
                 deps="$(echo "$selected_deps" | tr ',' '\n')"
-                if [ -n "$deps" ]; then
-                    info "Plugin dependencies declared: $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
-                    while IFS= read -r dep_name; do
-                        [ -n "$dep_name" ] || continue
-                        if create_dep_plugin_worktree "$dep_name"; then
-                            dep_plugins="${dep_plugins:+${dep_plugins},}${dep_name}"
-                            dep_worktree_paths="${dep_worktree_paths:+${dep_worktree_paths},}${WORKTREE_PATH}/custom/plugins/${dep_name}"
-                        fi
-                    done <<< "$deps"
-                fi
+                _deps_source="--deps flag"
+            else
+                deps="$(read_platform_plugin_deps "$PROJECT_ROOT")"
+                [ -n "$deps" ] && _deps_source=".swctl.deps.yaml"
+            fi
+            if [ -n "$deps" ]; then
+                info "Plugin dependencies (${_deps_source}): $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
+                while IFS= read -r dep_name; do
+                    [ -n "$dep_name" ] || continue
+                    if create_dep_plugin_worktree "$dep_name"; then
+                        dep_plugins="${dep_plugins:+${dep_plugins},}${dep_name}"
+                        dep_worktree_paths="${dep_worktree_paths:+${dep_worktree_paths},}${WORKTREE_PATH}/custom/plugins/${dep_name}"
+                    fi
+                done <<< "$deps"
             fi
 
             # Check dependency plugins for admin/storefront extensions
