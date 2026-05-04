@@ -5111,12 +5111,43 @@ cmd_switch() {
     #   couldn't find env file: /tmp/swctl/<project>.compose.env
     # before any work happens.
     mkdir -p "$SWCTL_TMP_DIR" 2>/dev/null || true
-    if [ ! -f "${COMPOSE_ENV_FILE:-/dev/null}" ]; then
-        info "Regenerating compose env file (wiped from $SWCTL_TMP_DIR)."
-        write_compose_env_file
-    fi
-    if [ -n "${COMPOSE_VOLUME_OVERRIDE:-}" ] && [ ! -f "$COMPOSE_VOLUME_OVERRIDE" ]; then
-        write_compose_volume_override
+    if [ ! -f "${COMPOSE_ENV_FILE:-/dev/null}" ] || [ ! -f "${COMPOSE_VOLUME_OVERRIDE:-/dev/null}" ]; then
+        # Recompute derived variables that aren't stored in metadata —
+        # write_compose_env_file references many of these directly and
+        # bombs on `unbound variable` (set -u) for any that are empty.
+        # Same recomputation as cmd_refresh's resume path.
+        WORKTREE_ID="${WORKTREE_ID:-$ISSUE_ID}"
+        if [ -z "${COMPOSE_PROJECT:-}" ]; then
+            COMPOSE_PROJECT="$(sanitize_slug "${SW_PROJECT_SLUG}-${ISSUE_ID}")"
+        fi
+        if [ -z "${TRAEFIK_ROUTER:-}" ]; then
+            TRAEFIK_ROUTER="$(sanitize_router_id "${SW_PROJECT_SLUG}_${ISSUE_ID}")"
+            TRAEFIK_SERVICE="$TRAEFIK_ROUTER"
+        fi
+        if [ -z "${WORKTREE_PATH:-}" ]; then
+            WORKTREE_PATH="${SW_WORKTREE_ROOT}/${SW_WORKTREE_PREFIX}-${ISSUE_ID}"
+        fi
+        if [ -z "${DOMAIN:-}" ]; then
+            if [ "$SW_RUNTIME" = "orbstack" ]; then
+                DOMAIN="${SW_SERVICE_NAME}.${COMPOSE_PROJECT}.orb.local"
+            else
+                DOMAIN="${SW_PROJECT_SLUG}-${ISSUE_ID}.${SW_DOMAIN_SUFFIX}"
+            fi
+            APP_URL="http://${DOMAIN}"
+        fi
+        # Volume names — write_compose_env_file emits these too.
+        VENDOR_VOLUME="${VENDOR_VOLUME:-$(resolve_vendor_volume "$ISSUE_ID")}"
+        NODE_MODULES_VOLUME="${NODE_MODULES_VOLUME:-$(resolve_node_modules_volume "$ISSUE_ID")}"
+        ADMIN_NM_VOLUME="${ADMIN_NM_VOLUME:-$(resolve_admin_nm_volume "$ISSUE_ID")}"
+        STOREFRONT_NM_VOLUME="${STOREFRONT_NM_VOLUME:-$(resolve_storefront_nm_volume "$ISSUE_ID")}"
+
+        if [ ! -f "${COMPOSE_ENV_FILE:-/dev/null}" ]; then
+            info "Regenerating compose env file (wiped from $SWCTL_TMP_DIR)."
+            write_compose_env_file
+        fi
+        if [ ! -f "${COMPOSE_VOLUME_OVERRIDE:-/dev/null}" ]; then
+            write_compose_volume_override
+        fi
     fi
 
     local current_mode="${SWCTL_MODE:-dev}"
