@@ -2107,37 +2107,44 @@ EOF
 
 write_compose_env_file() {
     COMPOSE_ENV_FILE="$SWCTL_TMP_DIR/${COMPOSE_PROJECT}.compose.env"
+    # NOTE: every var below uses `${VAR:-}` form on purpose.  Under
+    # `set -euo pipefail`, an unbound var inside a heredoc aborts `cat`
+    # mid-write, leaving a 0-byte env file — which then makes `compose up`
+    # blow up with cryptic "empty section between colons" volume errors
+    # because nothing populates ${SW_WORKTREE_PATH} etc.  Falling through
+    # with an empty value is strictly better: compose emits a warning the
+    # user can read and act on, rather than a silent partial-write.
     cat >"$COMPOSE_ENV_FILE" <<EOF
-SW_PHP_IMAGE=${SW_PHP_IMAGE}
-SW_WORKTREE_PATH=${WORKTREE_PATH}
-SW_WORKTREE_ID=${WORKTREE_ID}
-SW_PROJECT=${SW_PROJECT}
-SW_ISSUE=${ISSUE_ID}
-SW_PROJECT_SLUG=${SW_PROJECT_SLUG}
-SW_APP_DOMAIN=${DOMAIN}
-SW_APP_URL=${APP_URL}
-SW_APP_HTTP_PORT=${SW_APP_HTTP_PORT}
-SW_TRAEFIK_NETWORK=${SW_TRAEFIK_NETWORK}
-SW_TRAEFIK_ROUTER=${TRAEFIK_ROUTER}
-SW_TRAEFIK_SERVICE=${TRAEFIK_SERVICE}
-SW_DB_HOST=${SW_DB_HOST}
-SW_DB_PORT=${SW_DB_PORT}
-SW_DB_NAME=${DB_NAME}
-SW_DB_ROOT_USER=${SW_DB_ROOT_USER}
-SW_DB_ROOT_PASSWORD=${SW_DB_ROOT_PASSWORD}
-SW_REDIS_URL=${SW_REDIS_URL}
-SW_MAILER_DSN=${SW_MAILER_DSN}
+SW_PHP_IMAGE=${SW_PHP_IMAGE:-}
+SW_WORKTREE_PATH=${WORKTREE_PATH:-}
+SW_WORKTREE_ID=${WORKTREE_ID:-}
+SW_PROJECT=${SW_PROJECT:-}
+SW_ISSUE=${ISSUE_ID:-}
+SW_PROJECT_SLUG=${SW_PROJECT_SLUG:-}
+SW_APP_DOMAIN=${DOMAIN:-}
+SW_APP_URL=${APP_URL:-}
+SW_APP_HTTP_PORT=${SW_APP_HTTP_PORT:-}
+SW_TRAEFIK_NETWORK=${SW_TRAEFIK_NETWORK:-}
+SW_TRAEFIK_ROUTER=${TRAEFIK_ROUTER:-}
+SW_TRAEFIK_SERVICE=${TRAEFIK_SERVICE:-}
+SW_DB_HOST=${SW_DB_HOST:-}
+SW_DB_PORT=${SW_DB_PORT:-}
+SW_DB_NAME=${DB_NAME:-}
+SW_DB_ROOT_USER=${SW_DB_ROOT_USER:-}
+SW_DB_ROOT_PASSWORD=${SW_DB_ROOT_PASSWORD:-}
+SW_REDIS_URL=${SW_REDIS_URL:-}
+SW_MAILER_DSN=${SW_MAILER_DSN:-}
 SW_OPENSEARCH_URL=${SW_OPENSEARCH_URL:-}
 SW_PROJECT_NETWORK=${SW_PROJECT_NETWORK:-trunk_default}
-SW_PROJECT_ROOT=${PROJECT_ROOT}
-SW_VENDOR_VOLUME=${VENDOR_VOLUME}
-SW_NODE_MODULES_VOLUME=${NODE_MODULES_VOLUME}
-SW_ADMIN_NM_VOLUME=${ADMIN_NM_VOLUME}
-SW_STOREFRONT_NM_VOLUME=${STOREFRONT_NM_VOLUME}
-SW_UID=${SW_UID}
-SW_GID=${SW_GID}
-SW_DOCKER_PLATFORM=${SW_DOCKER_PLATFORM}
-SW_COMPOSER_ROOT_VERSION=${SW_COMPOSER_ROOT_VERSION}
+SW_PROJECT_ROOT=${PROJECT_ROOT:-}
+SW_VENDOR_VOLUME=${VENDOR_VOLUME:-}
+SW_NODE_MODULES_VOLUME=${NODE_MODULES_VOLUME:-}
+SW_ADMIN_NM_VOLUME=${ADMIN_NM_VOLUME:-}
+SW_STOREFRONT_NM_VOLUME=${STOREFRONT_NM_VOLUME:-}
+SW_UID=${SW_UID:-}
+SW_GID=${SW_GID:-}
+SW_DOCKER_PLATFORM=${SW_DOCKER_PLATFORM:-}
+SW_COMPOSER_ROOT_VERSION=${SW_COMPOSER_ROOT_VERSION:-}
 SW_APP_ENV=dev
 EOF
 }
@@ -5110,8 +5117,15 @@ cmd_switch() {
     # `swctl switch` after a reboot fails with
     #   couldn't find env file: /tmp/swctl/<project>.compose.env
     # before any work happens.
+    #
+    # ALSO: treat 0-byte files as missing.  An earlier `set -u` heredoc
+    # crash in write_compose_env_file could leave the env file at 0 bytes;
+    # `[ -f file ]` is true but compose can't read anything from it, so
+    # `${SW_WORKTREE_PATH}` substitutes to "" and we get
+    #   invalid spec: :/var/www/html:cached: empty section between colons
+    # The size check forces a clean rewrite over the failed stub.
     mkdir -p "$SWCTL_TMP_DIR" 2>/dev/null || true
-    if [ ! -f "${COMPOSE_ENV_FILE:-/dev/null}" ] || [ ! -f "${COMPOSE_VOLUME_OVERRIDE:-/dev/null}" ]; then
+    if [ ! -s "${COMPOSE_ENV_FILE:-/dev/null}" ] || [ ! -s "${COMPOSE_VOLUME_OVERRIDE:-/dev/null}" ]; then
         # Recompute derived variables that aren't stored in metadata —
         # write_compose_env_file references many of these directly and
         # bombs on `unbound variable` (set -u) for any that are empty.
@@ -5141,11 +5155,11 @@ cmd_switch() {
         ADMIN_NM_VOLUME="${ADMIN_NM_VOLUME:-$(resolve_admin_nm_volume "$ISSUE_ID")}"
         STOREFRONT_NM_VOLUME="${STOREFRONT_NM_VOLUME:-$(resolve_storefront_nm_volume "$ISSUE_ID")}"
 
-        if [ ! -f "${COMPOSE_ENV_FILE:-/dev/null}" ]; then
-            info "Regenerating compose env file (wiped from $SWCTL_TMP_DIR)."
+        if [ ! -s "${COMPOSE_ENV_FILE:-/dev/null}" ]; then
+            info "Regenerating compose env file (wiped or empty in $SWCTL_TMP_DIR)."
             write_compose_env_file
         fi
-        if [ ! -f "${COMPOSE_VOLUME_OVERRIDE:-/dev/null}" ]; then
+        if [ ! -s "${COMPOSE_VOLUME_OVERRIDE:-/dev/null}" ]; then
             write_compose_volume_override
         fi
     fi
