@@ -56,6 +56,11 @@ EOF
         case "$*" in
             *"branch --show-current"*) printf 'main\n'; return 0 ;;
             *"rev-parse --abbrev-ref HEAD"*) printf 'main\n'; return 0 ;;
+            *"rev-parse --git-common-dir"*)
+                # Tests that exercise the plugin-external path set
+                # FAKE_GIT_COMMON_DIR; default to a realistic-looking value.
+                printf '%s\n' "${FAKE_GIT_COMMON_DIR:-$SW_TMP/plugin-repo/.git}"
+                return 0 ;;
             *"checkout --detach HEAD"*) return 0 ;;
             *"checkout "*) return 0 ;;
             *) return 0 ;;
@@ -225,4 +230,151 @@ EOF
     run cmd_checkout --bogus 9999
     [ "$status" -ne 0 ]
     [[ "$output" == *"Unknown flag"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Plugin-external: operate on the PLUGIN repo + plugin worktree, not trunk.
+#
+# The pre-existing bug this guards: cmd_checkout used to do
+#   git -C "$PROJECT_ROOT" checkout "$BRANCH"
+# unconditionally — but for plugin-external instances, $BRANCH lives in
+# the plugin repo, NOT trunk.  The resulting "pathspec did not match any
+# file(s) known to git" error stranded the worktree in detached HEAD with
+# no way back via swctl.  Now cmd_checkout resolves the plugin's main
+# repo via `git rev-parse --git-common-dir` from the plugin worktree.
+# ---------------------------------------------------------------------------
+
+# Helper to set up a plugin-external instance.  The plugin worktree is a
+# nested directory inside the trunk worktree; its "main repo" is at
+# $SW_TMP/plugin-repo (faked via FAKE_GIT_COMMON_DIR).
+#
+# IMPORTANT: cmd_checkout's resolver runs `pwd -P` on the resolved main
+# repo path, which on macOS canonicalizes /var → /private/var.  We do the
+# same here for EXPECTED_PLUGIN_MAIN so equality holds across platforms.
+_setup_plugin_external() {
+    local plugin_worktree="$WORKTREE_PATH/custom/plugins/SwagFoo"
+    local plugin_main="$SW_TMP/plugin-repo"
+    mkdir -p "$plugin_worktree" "$plugin_main/.git"
+
+    # Rewrite the metadata to advertise plugin-external + paths
+    cat > "$SWCTL_REGISTRY_DIR/trunk/9999.env" <<EOF
+ISSUE_ID=9999
+PROJECT_ROOT=$PROJECT_ROOT
+WORKTREE_PATH=$WORKTREE_PATH
+BRANCH=fix/9999-thing
+COMPOSE_PROJECT=trunk-9999
+CONFIG_PATH=$PROJECT_ROOT/.swctl.conf
+SWCTL_MODE=dev
+PROJECT_TYPE=plugin-external
+PLUGIN_NAME=SwagFoo
+PLUGIN_WORKTREE_PATHS=$plugin_worktree
+EOF
+
+    # The git stub returns this path for `rev-parse --git-common-dir`.
+    # cmd_checkout takes dirname → $plugin_main → that's the "main repo".
+    export FAKE_GIT_COMMON_DIR="$plugin_main/.git"
+    # Canonicalize to match `pwd -P` output (macOS /var → /private/var).
+    EXPECTED_PLUGIN_MAIN="$(cd "$plugin_main" && pwd -P)"
+    EXPECTED_PLUGIN_WORKTREE="$plugin_worktree"
+    export EXPECTED_PLUGIN_MAIN EXPECTED_PLUGIN_WORKTREE
+}
+
+@test "checkout (plugin-external): persists plugin main repo + plugin worktree paths" {
+    _setup_plugin_external
+
+    run cmd_checkout 9999
+    [ "$status" -eq 0 ]
+
+    state="$SWCTL_STATE_DIR/checkout.state"
+    [ -f "$state" ]
+
+    # The state file must point at the PLUGIN repo, not trunk.
+    grep -q "^CHECKOUT_MAIN_REPO=" "$state"
+    grep -q "^CHECKOUT_TARGET_WORKTREE=" "$state"
+
+    # shellcheck disable=SC1090
+    . "$state"
+    [ "$CHECKOUT_MAIN_REPO" = "$EXPECTED_PLUGIN_MAIN" ]
+    [ "$CHECKOUT_TARGET_WORKTREE" = "$EXPECTED_PLUGIN_WORKTREE" ]
+}
+
+@test "checkout (plugin-external): detach + checkout target the plugin paths, not trunk" {
+    _setup_plugin_external
+
+    run cmd_checkout 9999
+    [ "$status" -eq 0 ]
+
+    # The detach must hit the PLUGIN worktree.
+    grep -qF "git -C $EXPECTED_PLUGIN_WORKTREE checkout --detach HEAD" "$SW_TMP/git.log"
+
+    # The branch checkout must target the PLUGIN repo, not $PROJECT_ROOT.
+    grep -qF "git -C $EXPECTED_PLUGIN_MAIN checkout fix/9999-thing" "$SW_TMP/git.log"
+
+    # Trunk's main repo (PROJECT_ROOT) must NOT be touched for the branch
+    # checkout — only for the `branch --show-current` lookup.  This was
+    # the original bug: trunk got the checkout call and bailed.
+    ! grep -qF "git -C $PROJECT_ROOT checkout fix/9999-thing" "$SW_TMP/git.log"
+}
+
+@test "checkout --return (plugin-external): restores via persisted paths" {
+    _setup_plugin_external
+
+    # Simulate a prior `cmd_checkout 9999` by pre-writing state with
+    # both the new persisted paths and the previous branch.
+    cat > "$SWCTL_STATE_DIR/checkout.state" <<EOF
+CHECKOUT_ACTIVE_ISSUE=9999
+CHECKOUT_PREVIOUS_BRANCH=main
+CHECKOUT_PREVIOUS_MODE=''
+CHECKOUT_MAIN_REPO=$EXPECTED_PLUGIN_MAIN
+CHECKOUT_TARGET_WORKTREE=$EXPECTED_PLUGIN_WORKTREE
+EOF
+
+    run cmd_checkout --return
+    [ "$status" -eq 0 ]
+
+    # --return must restore the PLUGIN repo's branch, not trunk's.
+    grep -qF "git -C $EXPECTED_PLUGIN_MAIN checkout main" "$SW_TMP/git.log"
+    # And re-attach the PLUGIN worktree, not trunk's.
+    grep -qF "git -C $EXPECTED_PLUGIN_WORKTREE checkout fix/9999-thing" "$SW_TMP/git.log"
+
+    [ ! -f "$SWCTL_STATE_DIR/checkout.state" ]
+}
+
+@test "checkout (plugin-external): rejects when PLUGIN_WORKTREE_PATHS empty" {
+    cat > "$SWCTL_REGISTRY_DIR/trunk/9999.env" <<EOF
+ISSUE_ID=9999
+PROJECT_ROOT=$PROJECT_ROOT
+WORKTREE_PATH=$WORKTREE_PATH
+BRANCH=fix/9999-thing
+COMPOSE_PROJECT=trunk-9999
+CONFIG_PATH=$PROJECT_ROOT/.swctl.conf
+SWCTL_MODE=dev
+PROJECT_TYPE=plugin-external
+PLUGIN_NAME=SwagFoo
+PLUGIN_WORKTREE_PATHS=
+EOF
+
+    run cmd_checkout 9999
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"PLUGIN_WORKTREE_PATHS"* ]]
+}
+
+@test "checkout: refuses when main repo is already on the target branch" {
+    # Override git stub to report the current branch is the issue branch.
+    git() {
+        printf 'git %s\n' "$*" >> "$SW_TMP/git.log"
+        case "$*" in
+            *"branch --show-current"*) printf 'fix/9999-thing\n'; return 0 ;;
+            *"rev-parse --abbrev-ref HEAD"*) printf 'fix/9999-thing\n'; return 0 ;;
+            *"rev-parse --git-common-dir"*) printf '%s\n' "$SW_TMP/plugin-repo/.git"; return 0 ;;
+            *) return 0 ;;
+        esac
+    }
+    export -f git
+
+    run cmd_checkout 9999
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"already on"* ]]
+    # No state file should be left behind.
+    [ ! -f "$SWCTL_STATE_DIR/checkout.state" ]
 }
