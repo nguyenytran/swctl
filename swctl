@@ -651,6 +651,11 @@ write_metadata() {
         printf 'PLUGIN_WORKTREE_PATHS=%q\n' "${PLUGIN_WORKTREE_PATHS:-}"
         printf 'PLATFORM_WORKTREE_PATH=%q\n' "${PLATFORM_WORKTREE_PATH:-}"
         printf 'PLATFORM_ISSUE_ID=%q\n' "${PLATFORM_ISSUE_ID:-}"
+        # PLATFORM_REF: optional pin for the trunk worktree's base commit
+        # (set when a plugin issue depends on a non-default platform branch).
+        # Empty for the common case where the worktree is at trunk's tip.
+        # Read by cmd_refresh to update against the right ref.
+        printf 'PLATFORM_REF=%q\n' "${PLATFORM_REF:-}"
         printf 'STATUS=%q\n' "${STATUS:-complete}"
         printf 'FAILED_AT=%q\n' "${FAILED_AT:-}"
         printf 'CREATED_AT=%q\n' "$(timestamp_utc)"
@@ -3402,6 +3407,11 @@ list_available_plugins() {
 
 read_plugin_deps() {
     # Read .swctl.deps.yaml from a plugin directory and print dependency names.
+    # Schema:
+    #   dependencies:        # list of plugin names (strings)
+    #     - SwagOtherPlugin
+    #   platform:            # optional, see read_plugin_platform_ref()
+    #     ref: <branch|tag|sha>
     local plugin_dir="$1"
     local deps_file="$plugin_dir/.swctl.deps.yaml"
     [ -f "$deps_file" ] || return 0
@@ -3411,6 +3421,29 @@ with open(sys.argv[1]) as f:
     data = yaml.safe_load(f)
 for dep in data.get('dependencies', []):
     print(dep)
+" "$deps_file" 2>/dev/null
+}
+
+read_plugin_platform_ref() {
+    # Print the plugin's preferred platform git ref (branch / tag / SHA), or
+    # nothing if no override is declared.  Schema in .swctl.deps.yaml:
+    #
+    #   platform:
+    #     ref: feat/12477-core-hook
+    #
+    # Returns the ref verbatim — caller is responsible for verifying it
+    # exists in PROJECT_ROOT before using it as a worktree base.
+    local plugin_dir="$1"
+    local deps_file="$plugin_dir/.swctl.deps.yaml"
+    [ -f "$deps_file" ] || return 0
+    python3 -c "
+import yaml, sys
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+plat = data.get('platform') or {}
+ref = plat.get('ref')
+if ref:
+    print(ref)
 " "$deps_file" 2>/dev/null
 }
 
@@ -3593,6 +3626,7 @@ cmd_create() {
     local selected_project=""
     local selected_plugin=""
     local selected_deps=""
+    local selected_platform_ref=""
     local adopt_worktree_path=""
     local no_provision=0
     local skip_preflight=0
@@ -3603,6 +3637,13 @@ cmd_create() {
             --project) selected_project="$2"; shift 2 ;;
             --plugin)  selected_plugin="$2"; shift 2 ;;
             --deps)    selected_deps="$2"; shift 2 ;;
+            # --platform-ref pins the trunk worktree to a specific git ref
+            # (branch / tag / SHA) instead of the default BASE_REF.  Used
+            # when a plugin issue depends on platform-side changes that
+            # haven't merged yet — e.g. a coordinated fix split across
+            # the plugin repo and shopware/shopware.  Wins over any
+            # `platform.ref:` declared in .swctl.deps.yaml.
+            --platform-ref) selected_platform_ref="$2"; shift 2 ;;
             --adopt-worktree) adopt_worktree_path="$2"; shift 2 ;;
             --no-provision) no_provision=1; shift ;;
             --skip-preflight) skip_preflight=1; shift ;;
@@ -3718,6 +3759,49 @@ cmd_create() {
             WORKTREE_ID="$ISSUE_ID"
             BASE_REF="$(git_base_ref)"
 
+            # PLATFORM_REF: optional pin for the trunk worktree's commit.
+            # CLI flag wins over the plugin's `.swctl.deps.yaml`.  When set,
+            # the trunk worktree is created at that ref instead of BASE_REF
+            # — used when a plugin issue depends on platform-side changes
+            # that haven't merged to trunk yet.  Validation happens just
+            # before `git worktree add` so we can fail fast with a helpful
+            # message rather than letting git's error surface.
+            PLATFORM_REF=""
+            if [ -n "${selected_platform_ref:-}" ]; then
+                PLATFORM_REF="$selected_platform_ref"
+                info "Platform ref override (CLI): $PLATFORM_REF"
+            else
+                local _yaml_platform_ref
+                _yaml_platform_ref="$(read_plugin_platform_ref "$PLUGIN_REPO_PATH")"
+                if [ -n "$_yaml_platform_ref" ]; then
+                    PLATFORM_REF="$_yaml_platform_ref"
+                    info "Platform ref (from $PLUGIN_NAME/.swctl.deps.yaml): $PLATFORM_REF"
+                fi
+            fi
+
+            # Resolve the actual ref to use for the trunk worktree.  When no
+            # platform override is in play, fall back to BASE_REF (existing
+            # behavior).  When override is set, accept it in any of: a local
+            # branch, an `origin/<branch>` remote ref, or a SHA prefix.
+            local TRUNK_WORKTREE_REF="$BASE_REF"
+            if [ -n "$PLATFORM_REF" ]; then
+                if git -C "$PROJECT_ROOT" rev-parse --verify "$PLATFORM_REF" >/dev/null 2>&1; then
+                    TRUNK_WORKTREE_REF="$PLATFORM_REF"
+                elif git -C "$PROJECT_ROOT" rev-parse --verify "origin/$PLATFORM_REF" >/dev/null 2>&1; then
+                    TRUNK_WORKTREE_REF="origin/$PLATFORM_REF"
+                else
+                    # Fetch and retry — the ref may be on the remote but
+                    # not yet locally cached.
+                    git -C "$PROJECT_ROOT" fetch origin "$PLATFORM_REF" 2>/dev/null || true
+                    if git -C "$PROJECT_ROOT" rev-parse --verify "origin/$PLATFORM_REF" >/dev/null 2>&1; then
+                        TRUNK_WORKTREE_REF="origin/$PLATFORM_REF"
+                    else
+                        die "Platform ref '$PLATFORM_REF' not found in $PROJECT_ROOT (tried local, origin/, and fetch)."
+                    fi
+                fi
+                ok "Platform pinned to: $TRUNK_WORKTREE_REF"
+            fi
+
             # Use trunk's naming — this IS a trunk worktree
             COMPOSE_PROJECT="$(sanitize_slug "${SW_PROJECT_SLUG}-${ISSUE_ID}")"
 
@@ -3758,8 +3842,8 @@ cmd_create() {
                     git -C "$PROJECT_ROOT" worktree remove --force "$WORKTREE_PATH" 2>/dev/null || rm -rf "$WORKTREE_PATH" 2>/dev/null || true
                 fi
                 git -C "$PROJECT_ROOT" worktree prune 2>/dev/null || true
-                git -C "$PROJECT_ROOT" worktree add --detach "$WORKTREE_PATH" "$BASE_REF"
-                ok "Created trunk worktree (detached at $BASE_REF)."
+                git -C "$PROJECT_ROOT" worktree add --detach "$WORKTREE_PATH" "$TRUNK_WORKTREE_REF"
+                ok "Created trunk worktree (detached at $TRUNK_WORKTREE_REF)."
             fi
             sync_lock_files
 
