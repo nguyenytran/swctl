@@ -74,12 +74,32 @@ exit 0
 ' || {
     _build_rc=$?
     if [ "$_build_rc" -eq 2 ]; then
-        # Admin build failed: propagate up to cmd_create so it aborts the
-        # create with STATUS=failed instead of shipping a broken admin.
-        # `return` rather than `exit` because this hook is SOURCED by
-        # run_workflow_hook; `exit` would kill the whole swctl process.
-        err "Admin npm build failed — aborting create."
-        return 2 2>/dev/null || exit 2
+        # Admin build failed.  Decide whether this is fatal:
+        # - Vanilla create with no dep plugins (LINKED_PLUGINS empty) → fatal.
+        #   The user's primary work touched admin code and the rebuild
+        #   couldn't produce fresh bundles, so shipping would mean a stale
+        #   admin UI.  Abort and let the user re-run after fixing.
+        # - Plugin-external or platform-with-deps create (LINKED_PLUGINS set)
+        #   → warn-but-continue.  The most common cause is that one of the
+        #   nested plugins (typically a SwagCommercial sub-app) lacks a
+        #   local node_modules with its own `vite` install; trying to build
+        #   it from source aborts the whole admin build.  swctl's create
+        #   already synced the parent plugin's prebuilt dist into the
+        #   worktree (see sync_plugin_gitignored_artifacts), so the admin
+        #   UI is functional with the fallback assets.  We surface a clear
+        #   warning + a remedy path instead of failing the create.
+        if [ -n "${LINKED_PLUGINS:-}" ]; then
+            warn "Admin npm build failed (likely a nested plugin build), but synced prebuilt dist is present — continuing."
+            warn "If the admin UI looks stale, rebuild in the worktree:"
+            warn "  swctl exec ${ISSUE_ID:-<issue>} 'composer build:js:admin'"
+        else
+            # Admin build failed: propagate up to cmd_create so it aborts the
+            # create with STATUS=failed instead of shipping a broken admin.
+            # `return` rather than `exit` because this hook is SOURCED by
+            # run_workflow_hook; `exit` would kill the whole swctl process.
+            err "Admin npm build failed — aborting create."
+            return 2 2>/dev/null || exit 2
+        fi
     fi
     warn "Parallel JS build had errors."
 }

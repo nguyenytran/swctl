@@ -3511,6 +3511,65 @@ if ref:
 " "$deps_file" 2>/dev/null
 }
 
+sync_plugin_gitignored_artifacts() {
+    # Copy gitignored build outputs from a source plugin working tree to a
+    # nested plugin worktree we just created via `git worktree add`.
+    #
+    # Why this exists: many Shopware plugins (notably SwagCommercial) have
+    # `.gitignore` rules excluding `Resources/public/` and
+    # `Resources/app/storefront/dist/`.  Those directories hold the BUILT
+    # frontend bundles that Symfony's asset registration + the storefront
+    # serve at runtime.  When swctl runs `git worktree add`, the resulting
+    # worktree contains only TRACKED files — so the dist artifacts are
+    # absent.  Two consequences:
+    #   1. Storefront 500s ("dist directory does not exist") because Symfony
+    #      tries to register asset paths that aren't there.
+    #   2. The admin npm rebuild (triggered when ADMIN_CHANGES > 0) tries
+    #      to compile each nested plugin's admin app from source — and
+    #      Commercial's nested apps require `vite` in a LOCAL node_modules
+    #      that's also absent.  The rebuild aborts the create.
+    #
+    # Mitigation: copy the source plugin's prebuilt artifacts into the
+    # nested worktree.  Trunk has them from earlier successful builds; the
+    # worktree gets a working set without rebuilding.  Uses APFS clone
+    # (`cp -cR`) where available — instant on Macs, low-cost elsewhere.
+    #
+    # Args:
+    #   $1 source plugin path (e.g. /trunk/custom/plugins/SwagCommercial)
+    #   $2 destination plugin path (the nested worktree dir)
+    # Returns 0 on success or no-op (source has nothing to sync); never
+    # propagates a non-zero exit so create can continue if individual cps fail.
+    local src="$1"
+    local dst="$2"
+    [ -d "$src" ] || return 0
+    [ -d "$dst" ] || return 0
+
+    local synced=0
+    # Match the Shopware plugin .gitignore patterns we've seen in practice.
+    # Add new patterns here as new plugins introduce them — staying targeted
+    # avoids dragging in unrelated gitignored junk (.idea, .DS_Store, etc.).
+    local pat
+    for pat in 'Resources/public' 'Resources/app/storefront/dist' \
+               'Resources/app/administration/dist' ; do
+        # Find every dir matching `*/<pat>` under src
+        # shellcheck disable=SC2044
+        for src_dir in $(find "$src" -type d -path "*/${pat}" 2>/dev/null); do
+            local rel="${src_dir#"$src"/}"
+            local dst_dir="$dst/$rel"
+            [ -d "$dst_dir" ] && continue   # already there
+            mkdir -p "$(dirname "$dst_dir")" 2>/dev/null || true
+            if cp -cR "$src_dir" "$dst_dir" 2>/dev/null \
+                || cp -R "$src_dir" "$dst_dir" 2>/dev/null; then
+                synced=$((synced + 1))
+            fi
+        done
+    done
+    if [ "$synced" -gt 0 ]; then
+        info "Synced ${synced} gitignored artifact dir(s) from $(basename "$src") → worktree."
+    fi
+    return 0
+}
+
 create_dep_plugin_worktree() {
     # Create a git worktree for a dependency plugin at its default branch.
     local dep_name="$1"
@@ -3539,6 +3598,12 @@ create_dep_plugin_worktree() {
     git -C "$dep_repo" worktree add --detach "$dep_target" "origin/$dep_default_branch" 2>/dev/null \
         || git -C "$dep_repo" worktree add --detach "$dep_target" "$dep_default_branch" 2>/dev/null \
         || { warn "Failed to create worktree for dependency: $dep_name"; return 1; }
+
+    # Bring along the parent's prebuilt frontend artifacts (gitignored, so
+    # `git worktree add` doesn't include them).  Without this the dep plugin's
+    # nested admin app fails to compile (no local `vite` install) and aborts
+    # the whole admin build.  See sync_plugin_gitignored_artifacts.
+    sync_plugin_gitignored_artifacts "$dep_repo" "$dep_target"
 
     ok "Dependency plugin nested: custom/plugins/${dep_name} (detached at $dep_default_branch)"
 }
@@ -3976,6 +4041,15 @@ cmd_create() {
             else
                 info "Plugin worktree already exists at: $plugin_target"
             fi
+
+            # Sync gitignored build artifacts (dist + Resources/public) from
+            # the source plugin repo to the nested worktree.  Without this the
+            # admin npm build (triggered when ADMIN_CHANGES > 0) fails for any
+            # plugin that has nested admin sub-apps with their own vite.config
+            # — those sub-apps require local node_modules with `vite` which
+            # isn't installed.  Reusing the parent's prebuilt dist keeps the
+            # admin UI functional even when the rebuild can't complete.
+            sync_plugin_gitignored_artifacts "$PLUGIN_REPO_PATH" "$plugin_target"
 
             # Ensure plugin worktree is on a named branch (not detached HEAD).
             # Detached HEAD can happen when the local branch is already checked
