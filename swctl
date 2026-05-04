@@ -4915,11 +4915,24 @@ cmd_refresh() {
 }
 
 cmd_checkout() {
-    local issue_input="${1:-}"
+    local issue_input=""
+    local keep_mode=0
     local state_file="$SWCTL_STATE_DIR/checkout.state"
 
-    # --- Return mode: restore main repo to base branch, re-attach worktree ---
-    if [ "$issue_input" = "--return" ] || [ "$issue_input" = "-r" ]; then
+    # Parse args (--return / -r / --keep-mode are positional-independent)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --return|-r) issue_input="--return"; shift ;;
+            --keep-mode) keep_mode=1; shift ;;
+            -*) die "Unknown flag: $1" ;;
+            *)  [ -z "$issue_input" ] || die "Unexpected argument: $1"
+                issue_input="$1"; shift ;;
+        esac
+    done
+
+    # --- Return mode: restore main repo to base branch, re-attach worktree,
+    # and restore the worktree's pre-checkout SWCTL_MODE if we changed it. ---
+    if [ "$issue_input" = "--return" ]; then
         [ -f "$state_file" ] || die "No active checkout to return from."
         # shellcheck disable=SC1090
         . "$state_file"
@@ -4941,13 +4954,22 @@ cmd_checkout() {
         git -C "$WORKTREE_PATH" checkout "$BRANCH" \
             || die "Failed to re-attach worktree to branch '$BRANCH'."
 
+        # Restore the worktree's pre-checkout mode if it was switched on entry.
+        # CHECKOUT_PREVIOUS_MODE is "" when --keep-mode was used (no switch needed).
+        if [ -n "${CHECKOUT_PREVIOUS_MODE:-}" ] \
+           && [ "${CHECKOUT_PREVIOUS_MODE}" != "${SWCTL_MODE:-dev}" ]; then
+            info "Restoring worktree '$ISSUE_ID' to ${CHECKOUT_PREVIOUS_MODE} mode."
+            cmd_switch "$ISSUE_ID" "--${CHECKOUT_PREVIOUS_MODE}" \
+                || warn "Mode restore to ${CHECKOUT_PREVIOUS_MODE} failed; worktree left in ${SWCTL_MODE:-dev}."
+        fi
+
         rm -f "$state_file"
         ok "Returned main repo to '$CHECKOUT_PREVIOUS_BRANCH'. Worktree '$ISSUE_ID' re-attached to '$BRANCH'."
         return
     fi
 
     # --- Checkout mode: detach worktree, checkout branch in main repo ---
-    [ -n "$issue_input" ] || die "Usage: swctl checkout <issue>  or  swctl checkout --return"
+    [ -n "$issue_input" ] || die "Usage: swctl checkout <issue> [--keep-mode]  or  swctl checkout --return"
 
     # Warn if there's already an active checkout
     if [ -f "$state_file" ]; then
@@ -4967,6 +4989,11 @@ cmd_checkout() {
     [ -n "${BRANCH:-}" ] || die "Instance '$issue_input' has no branch set."
     [ -n "${WORKTREE_PATH:-}" ] || die "Instance '$issue_input' has no worktree path."
 
+    # Capture the worktree's current mode BEFORE we mutate anything.  Used
+    # by --return to restore.  Empty string = nothing to restore.
+    local previous_mode="${SWCTL_MODE:-dev}"
+    local mode_to_restore=""
+
     # Save current main repo branch
     local current_branch
     current_branch="$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null)" || true
@@ -4985,11 +5012,31 @@ cmd_checkout() {
         || { git -C "$WORKTREE_PATH" checkout "$BRANCH" 2>/dev/null || true; die "Failed to checkout '$BRANCH' in main repo."; }
     ok "Main repo now on branch '$BRANCH'."
 
-    # 3. Save state for --return
+    # 3. Auto-switch worktree to QA mode (unless --keep-mode).  Rationale:
+    # during checkout, edits go into the main repo, not the worktree, so
+    # the worktree's runtime is "watch-only".  QA mode skips the heavy dev
+    # tooling (vendor copy, console ops, frontend rebuilds) — perfect for
+    # a lean idle backend.  --return restores whatever mode was active
+    # before checkout.
+    if [ "$keep_mode" -eq 1 ]; then
+        info "Keeping worktree '$ISSUE_ID' in ${previous_mode} mode (--keep-mode)."
+    elif [ "$previous_mode" = "qa" ]; then
+        info "Worktree '$ISSUE_ID' already in qa mode."
+    else
+        info "Switching worktree '$ISSUE_ID' to qa mode for the duration of this checkout."
+        if cmd_switch "$ISSUE_ID" --qa; then
+            mode_to_restore="$previous_mode"
+        else
+            warn "Auto-switch to qa failed; worktree left in ${previous_mode} mode."
+        fi
+    fi
+
+    # 4. Save state for --return
     mkdir -p "$SWCTL_STATE_DIR"
     {
         printf 'CHECKOUT_ACTIVE_ISSUE=%q\n' "$ISSUE_ID"
         printf 'CHECKOUT_PREVIOUS_BRANCH=%q\n' "$current_branch"
+        printf 'CHECKOUT_PREVIOUS_MODE=%q\n' "$mode_to_restore"
     } > "$state_file"
 
     info "To return: swctl checkout --return"
@@ -6870,7 +6917,8 @@ Commands:
   logs        Show or follow container logs for a worktree.
   restart     Restart the app container for a worktree without full recreate.
   refresh     Pull latest changes, detect what changed, rebuild only the delta.
-  checkout    Detach worktree and checkout its branch in main repo. --return to undo.
+  checkout    Detach worktree and checkout its branch in main repo (auto-switches the
+              worktree to qa mode; pass --keep-mode to preserve dev). --return to undo.
   open        Open the worktree URL in the default browser.
   code        Open worktree in an editor: --phpstorm (default), --claude, --codex, --code, --cursor.
   switch      Switch a worktree between QA and Dev mode (rebuilds only what's needed).
