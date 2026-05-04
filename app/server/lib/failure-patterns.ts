@@ -207,6 +207,32 @@ const PATTERNS: FailurePattern[] = [
       "conflicting package.  For private deps, ensure `~/.composer/auth.json` " +
       "has the right token and is mounted into the container.",
   },
+  {
+    id: 'shopware-non-existent-service',
+    title: 'Shopware: DI compile failed — non-existent service',
+    category: 'shopware',
+    // Symfony's exact wording when one service references another that
+    // isn't registered.  Common during multi-plugin platform creates
+    // when one plugin's services.xml references a class from another
+    // plugin that isn't in the LINKED_PLUGINS set.
+    match: [
+      /You have requested a non-existent service ['"]([^'"]+)['"]/i,
+      /Service ['"]([^'"]+)['"] not found/i,
+    ],
+    hint:
+      "The container compile failed because one plugin's services.xml " +
+      "references a class from another plugin that isn't loaded in this " +
+      "instance.  Most common case: SwagCustomizedProducts uses " +
+      "`Shopware\\Commercial\\Licensing\\Features` but SwagCommercial " +
+      "isn't in your `.swctl.deps.yaml`.\n\n" +
+      "Fix: add the missing plugin to the `plugins:` list in " +
+      "`<project>/.swctl.deps.yaml`, or pass it via " +
+      "`swctl create --deps <Plugin1>,<Plugin2>`.  Then `swctl clean " +
+      "<issue> && swctl create ...` to rebuild from scratch.  If the " +
+      "missing plugin is a transitive dep that should always be present, " +
+      "add a `requires` entry to the depending plugin's composer.json so " +
+      "swctl can detect it on next iteration.",
+  },
 ]
 
 /**
