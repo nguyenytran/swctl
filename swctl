@@ -4381,26 +4381,20 @@ cmd_create() {
             printf '### CREATE STEP 2 END\n'
 
             # Resolve dependency plugins for platform worktrees.
-            #   1) `--deps Foo,Bar` CLI flag wins (existing behavior).
-            #   2) Otherwise fall back to <PROJECT_ROOT>/.swctl.deps.yaml,
-            #      `plugins:` key — auto-spin-up plugins listed there.
-            # Use case for (2): some platform issues only manifest with a
-            # specific plugin active (e.g. a core hook that SwagCommercial
-            # exercises).  The yaml lets the project default that set
-            # without burdening every `swctl create` with a flag.
+            # ONLY honored when `--deps` is explicitly passed (CLI or via the
+            # UI's plugin-picker which forwards the flag).  We deliberately
+            # DO NOT auto-read `<PROJECT_ROOT>/.swctl.deps.yaml`: the auto-
+            # load was surprising in practice — every `swctl create` for a
+            # platform issue would silently inherit whatever plugin set was
+            # listed there, even when the user just wanted a vanilla create.
+            # The user-facing way to declare a default plugin set is the
+            # UI's pre-filled picker; the yaml is no longer a swctl input.
             local dep_plugins=""
             local dep_worktree_paths=""
-            local deps=""
-            local _deps_source=""
             if [ -n "${selected_deps:-}" ]; then
+                local deps
                 deps="$(echo "$selected_deps" | tr ',' '\n')"
-                _deps_source="--deps flag"
-            else
-                deps="$(read_platform_plugin_deps "$PROJECT_ROOT")"
-                [ -n "$deps" ] && _deps_source=".swctl.deps.yaml"
-            fi
-            if [ -n "$deps" ]; then
-                info "Plugin dependencies (${_deps_source}): $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
+                info "Plugin dependencies (--deps flag): $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
                 while IFS= read -r dep_name; do
                     [ -n "$dep_name" ] || continue
                     if create_dep_plugin_worktree "$dep_name"; then
