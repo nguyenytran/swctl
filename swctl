@@ -1334,6 +1334,15 @@ git_base_ref() {
 }
 
 check_branch_staleness() {
+    # Escape hatch: user can bypass the auto-rebase entirely.  Useful when
+    # the rebase conflicts but the user knows what they're doing and wants
+    # to test against the stale base anyway.  Documented in the die()
+    # message below so the user discovers it at the right moment.
+    if [ "${SWCTL_SKIP_STALENESS_REBASE:-0}" = "1" ]; then
+        info "SWCTL_SKIP_STALENESS_REBASE=1 — skipping auto-rebase against ${SW_BASE_BRANCH}."
+        return 0
+    fi
+
     local merge_base
     local commits_behind=0
     local days_behind=0
@@ -1348,13 +1357,47 @@ check_branch_staleness() {
         info "Branch '$BRANCH' is ${commits_behind} commits behind '${SW_BASE_BRANCH}'. Rebasing..."
         if git -C "$WORKTREE_PATH" rebase "$BASE_REF" 2>&1; then
             ok "Rebased '$BRANCH' onto '${SW_BASE_BRANCH}' (was ${commits_behind} commits behind)."
-        else
-            warn "Rebase has conflicts. Aborting rebase — worktree will use the branch as-is."
-            git -C "$WORKTREE_PATH" rebase --abort 2>/dev/null || true
-            if [ "$commits_behind" -gt 100 ] || [ "$days_behind" -gt 14 ]; then
-                warn "Branch is ${commits_behind} commits / ${days_behind} days behind. Schema mismatches are likely."
-            fi
+            return 0
         fi
+
+        # Rebase failed — almost always a real merge conflict.  Earlier
+        # behavior was `warn + rebase --abort + continue`, which silently
+        # shipped a non-rebased branch and left the user to discover later
+        # that their fix was tested against a stale base.  That's worse
+        # than failing fast: schema migrations, plugin-platform version
+        # skew, and DI compile breakage all routinely cascade from a
+        # branch that thinks it's against trunk@N but is actually against
+        # trunk@N-100.
+        #
+        # New behavior: abort the rebase to leave the worktree in a
+        # clean (un-rebased) state so the user can resolve manually,
+        # then DIE with explicit recovery instructions.  The trap in
+        # cmd_create marks STATUS=failed, so `swctl refresh <issue>`
+        # picks up where we left off after the user resolves.
+        git -C "$WORKTREE_PATH" rebase --abort 2>/dev/null || true
+
+        # Build a multi-line guidance message.  die() prints whatever we
+        # pass; embed the recovery steps so the user doesn't have to
+        # context-switch to figure out what to do.
+        local _staleness_note=""
+        if [ "$commits_behind" -gt 100 ] || [ "$days_behind" -gt 14 ]; then
+            _staleness_note=$'\n            (Branch is '"${commits_behind}"' commits / '"${days_behind}"' days behind — schema/dep mismatches likely.)'
+        fi
+        die "Rebase of '$BRANCH' onto '$SW_BASE_BRANCH' has conflicts. Stopping create.${_staleness_note}
+
+  Resolve the rebase manually, then resume:
+
+    cd $WORKTREE_PATH
+    git rebase $BASE_REF
+    # ...resolve conflicts in your editor...
+    git add <resolved files>
+    git rebase --continue
+
+  Then: swctl refresh ${ISSUE_ID:-<issue>}
+
+  Or, if you'd rather skip the rebase and proceed against the stale base:
+
+    SWCTL_SKIP_STALENESS_REBASE=1 swctl refresh ${ISSUE_ID:-<issue>}"
     fi
 }
 
