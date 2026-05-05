@@ -2881,6 +2881,57 @@ _postflight_instance_ready() {
     return "$rc"
 }
 
+# Refresh + activate LINKED_PLUGINS in the worktree's container BEFORE
+# workflow hooks fire any bin/console that triggers a full DI compile.
+#
+# Why this exists (PR #33):
+# - The cloned DB inherits trunk's plugin states (active=1 records).
+# - Workflow hooks ('provision' / 'post-provision') run things like
+#   system:install or assets:install, which boot Symfony and compile
+#   the DI container for ALL active plugins.
+# - If plugin A's services.xml references a service from plugin B
+#   (e.g. Shopware\Commercial\Licensing\Features), and B's plugin record
+#   in the cloned DB is active but its bundle hasn't been re-registered
+#   against the worktree's filesystem yet, the compile fails with
+#   "non-existent service ..." before we get a chance to reconcile.
+# - plugin:refresh re-walks custom/plugins/ and updates the plugin table
+#   with the worktree's actual filesystem paths.
+# - plugin:install --activate --no-refresh ensures each declared plugin
+#   is active=1 with installed_at populated.  --no-refresh skips the
+#   redundant scan we just did.
+# - After this, the workflow hooks' bin/console invocations see a
+#   consistent plugin state and the DI compile succeeds.
+#
+# Vanilla platform creates with LINKED_PLUGINS empty are a no-op — the
+# workflow hooks handle activation themselves later.
+#
+# Failures are warned, not fatal: the workflow hook may still retry, and
+# we'd rather ship a partial-but-functional create than abort with an
+# incomprehensible message about plugin lifecycle internals.
+#
+# Args:
+#   $1 compose project name (forwarded to run_app_command)
+_pre_activate_linked_plugins() {
+    local compose_project="$1"
+
+    [ -n "${LINKED_PLUGINS:-}" ] || return 0
+
+    info "Refreshing plugin registry before workflow hooks (LINKED_PLUGINS=${LINKED_PLUGINS})"
+    run_app_command "$compose_project" "$SW_BIN_CONSOLE plugin:refresh" 2>/dev/null \
+        || warn "plugin:refresh failed (continuing — workflow hook may retry)."
+
+    local _ap_old_ifs="$IFS"
+    IFS=','
+    local _ap_dep
+    for _ap_dep in $LINKED_PLUGINS; do
+        [ -n "$_ap_dep" ] || continue
+        run_app_command "$compose_project" \
+            "$SW_BIN_CONSOLE plugin:install --activate --no-refresh $_ap_dep" 2>/dev/null \
+            || warn "Failed to pre-activate '$_ap_dep' (workflow hook may retry)."
+    done
+    IFS="$_ap_old_ifs"
+}
+
 provision_database_and_app() {
     local compose_project="$1"
     local source_db
@@ -2948,41 +2999,9 @@ provision_database_and_app() {
     fi
 
     # Refresh + activate LINKED_PLUGINS BEFORE workflow hooks fire any
-    # bin/console that triggers a full DI compile.
-    #
-    # Why this matters for multi-plugin platform creates:
-    # - The cloned DB inherits trunk's plugin states (active=1 records).
-    # - Workflow hooks ('provision' / 'post-provision') run things like
-    #   system:install or assets:install, which boot Symfony and compile
-    #   the DI container for ALL active plugins.
-    # - If plugin A's services.xml references a service from plugin B
-    #   (e.g. Shopware\Commercial\Licensing\Features), and B's plugin
-    #   record in the cloned DB is active but its bundle hasn't been
-    #   re-registered against the worktree's filesystem yet, the compile
-    #   fails with "non-existent service ..." before we get a chance to
-    #   reconcile.
-    # - Running plugin:refresh first re-walks custom/plugins/ and updates
-    #   the plugin table with the worktree's actual filesystem paths.
-    #   plugin:install --activate then ensures each declared plugin is in
-    #   active=1 with installed_at populated.  After this, hooks see a
-    #   consistent state.
-    #
-    # No-op for vanilla platform creates (LINKED_PLUGINS empty) — the
-    # workflow hook paths handle activation themselves later.
-    if [ -n "${LINKED_PLUGINS:-}" ]; then
-        info "Refreshing plugin registry before workflow hooks (LINKED_PLUGINS=${LINKED_PLUGINS})"
-        run_app_command "$compose_project" "$SW_BIN_CONSOLE plugin:refresh" 2>/dev/null \
-            || warn "plugin:refresh failed (continuing — workflow hook may retry)."
-        local _ap_old_ifs="$IFS"
-        IFS=','
-        for _ap_dep in $LINKED_PLUGINS; do
-            [ -n "$_ap_dep" ] || continue
-            run_app_command "$compose_project" \
-                "$SW_BIN_CONSOLE plugin:install --activate --no-refresh $_ap_dep" 2>/dev/null \
-                || warn "Failed to pre-activate '$_ap_dep' (workflow hook may retry)."
-        done
-        IFS="$_ap_old_ifs"
-    fi
+    # bin/console that triggers a full DI compile.  Extracted into a
+    # helper for testability — see tests/linked_plugins_pre_activation.bats.
+    _pre_activate_linked_plugins "$compose_project"
 
     # Export helpers so workflow hooks can call them
     export -f update_sales_channel_domain ensure_install_lock bootstrap_dependencies \
