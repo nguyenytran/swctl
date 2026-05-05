@@ -2959,6 +2959,7 @@ _pre_activate_linked_plugins() {
 
     [ -n "${LINKED_PLUGINS:-}" ] || return 0
 
+    local _t_start=$SECONDS
     info "Refreshing plugin registry before workflow hooks (LINKED_PLUGINS=${LINKED_PLUGINS})"
     run_app_command "$compose_project" "$SW_BIN_CONSOLE plugin:refresh" 2>/dev/null \
         || warn "plugin:refresh failed (continuing — workflow hook may retry)."
@@ -2973,6 +2974,12 @@ _pre_activate_linked_plugins() {
             || warn "Failed to pre-activate '$_ap_dep' (workflow hook may retry)."
     done
     IFS="$_ap_old_ifs"
+
+    local _t_elapsed=$((SECONDS - _t_start))
+    info "[timing] _pre_activate_linked_plugins: ${_t_elapsed}s"
+    if [ -n "${SWCTL_PERF_LOG:-}" ]; then
+        printf 'pre_activate_linked_plugins\t%s\n' "$_t_elapsed" >> "$SWCTL_PERF_LOG" 2>/dev/null || true
+    fi
 }
 
 provision_database_and_app() {
@@ -3606,6 +3613,7 @@ sync_plugin_gitignored_artifacts() {
     [ -d "$src" ] || return 0
     [ -d "$dst" ] || return 0
 
+    local _t_start=$SECONDS
     local synced=0
     # Match the Shopware plugin .gitignore patterns we've seen in practice.
     # Add new patterns here as new plugins introduce them — staying targeted
@@ -3626,8 +3634,16 @@ sync_plugin_gitignored_artifacts() {
             fi
         done
     done
+    local _t_elapsed=$((SECONDS - _t_start))
     if [ "$synced" -gt 0 ]; then
         info "Synced ${synced} gitignored artifact dir(s) from $(basename "$src") → worktree."
+        info "[timing] sync_plugin_gitignored_artifacts ($(basename "$src")): ${_t_elapsed}s"
+        # Only emit a perf log entry when we actually did work — otherwise
+        # the log fills with no-op rows for every plugin we skipped.
+        if [ -n "${SWCTL_PERF_LOG:-}" ]; then
+            printf 'sync_plugin_gitignored_artifacts.%s\t%s\n' \
+                "$(basename "$src")" "$_t_elapsed" >> "$SWCTL_PERF_LOG" 2>/dev/null || true
+        fi
     fi
     return 0
 }
@@ -4427,6 +4443,22 @@ cmd_create() {
             local step_start create_start
             create_start=$SECONDS
 
+            # Per-create perf log.  Helpers can append `<step>\t<seconds>`
+            # lines via `printf >> $SWCTL_PERF_LOG`; cmd_create reads them
+            # back at the end and writes a structured JSON to
+            # ~/.swctl/perf/.  See `swctl perf` for analysis.
+            #
+            # Why a TSV intermediate: cmd_create is a long-running shell
+            # script, helpers are sourced/exported, and we want them to
+            # be able to record timings without coordinating shared bash
+            # variables.  A flat append-only file is the simplest sink.
+            SWCTL_PERF_LOG="$SWCTL_TMP_DIR/perf-${ISSUE_ID}-$$.tsv"
+            export SWCTL_PERF_LOG
+            : > "$SWCTL_PERF_LOG"
+            _perf_log() {
+                printf '%s\t%s\n' "$1" "$2" >> "$SWCTL_PERF_LOG" 2>/dev/null || true
+            }
+
             # Step 2: Worktree.  count_changes is folded in here — it's
             # always <1s (just a git diff), bundling avoids a confusing
             # micro-step in the UI.
@@ -4434,12 +4466,12 @@ cmd_create() {
             step_start=$SECONDS
             create_worktree
             check_branch_staleness
-            info "[timing] create_worktree: $((SECONDS - step_start))s"
+            local _t=$((SECONDS - step_start)); info "[timing] create_worktree: ${_t}s"; _perf_log create_worktree "$_t"
 
             step_start=$SECONDS
             DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
             count_changes "$DIFF_FILES"
-            info "[timing] count_changes: $((SECONDS - step_start))s"
+            _t=$((SECONDS - step_start)); info "[timing] count_changes: ${_t}s"; _perf_log count_changes "$_t"
             printf '### CREATE STEP 2 END\n'
 
             # Resolve dependency plugins for platform worktrees.
@@ -4498,7 +4530,7 @@ cmd_create() {
             sync_worktree_from_trunk
             VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
             NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
-            info "[timing] sync: $((SECONDS - step_start))s"
+            _t=$((SECONDS - step_start)); info "[timing] sync: ${_t}s"; _perf_log sync "$_t"
 
             info "Mode: ${SWCTL_MODE} | Diff: migrations=${MIGRATION_CHANGES} entity=${ENTITY_CHANGES} admin=${ADMIN_CHANGES} storefront=${STOREFRONT_CHANGES} composer=${COMPOSER_CHANGES} package=${PACKAGE_CHANGES} backend=${BACKEND_CHANGES}"
             info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
@@ -4510,7 +4542,7 @@ cmd_create() {
             printf '### CREATE STEP 4 START: Provision\n'
             step_start=$SECONDS
             provision_database_and_app "$COMPOSE_PROJECT"
-            info "[timing] provision: $((SECONDS - step_start))s"
+            _t=$((SECONDS - step_start)); info "[timing] provision: ${_t}s"; _perf_log provision "$_t"
 
             # NOTE: dep plugin refresh + activation now happens INSIDE
             # provision_database_and_app (right before workflow hooks fire),
@@ -4529,7 +4561,7 @@ cmd_create() {
             printf '### CREATE STEP 5 START: Frontend build\n'
             step_start=$SECONDS
             run_frontend_build_if_needed "$COMPOSE_PROJECT" 1 "$plugin_has_extensions"
-            info "[timing] frontend: $((SECONDS - step_start))s"
+            _t=$((SECONDS - step_start)); info "[timing] frontend: ${_t}s"; _perf_log frontend "$_t"
             printf '### CREATE STEP 5 END\n'
 
             # Mark complete and remove EXIT trap
@@ -4538,11 +4570,263 @@ cmd_create() {
             trap - EXIT
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            ok "Worktree '${WORKTREE_ID}' is ready. (total: $((SECONDS - create_start))s)"
+            local _create_total=$((SECONDS - create_start))
+            _perf_log total "$_create_total"
+
+            # Persist the perf snapshot for this create.  See `swctl perf`
+            # for analysis (medians, regressions vs baseline, etc.).
+            _write_perf_snapshot "$_create_total" 2>/dev/null || true
+
+            ok "Worktree '${WORKTREE_ID}' is ready. (total: ${_create_total}s)"
             info "URL: ${APP_URL}"
             info "Worktree: ${WORKTREE_PATH}"
             ;;
     esac
+}
+
+# ---------------------------------------------------------------------------
+# Performance tracking
+#
+# `cmd_create` writes per-step timings (worktree, sync, provision, frontend,
+# helpers like sync_plugin_gitignored_artifacts) into a TSV file at
+# $SWCTL_PERF_LOG during the run.  At the end, _write_perf_snapshot bakes
+# them into a structured JSON record under ~/.swctl/perf/, keyed by
+# timestamp + project + issue + git rev.
+#
+# `swctl perf` reads those JSON files back and surfaces:
+#   - the latest run's per-step breakdown,
+#   - rolling median/p95 across the last N runs,
+#   - the delta vs the previous run for each step (regression spotter).
+#
+# Why home-grown vs an external tool: bats and shell are already the
+# tooling everywhere else in swctl, the data set is small (one JSON per
+# create), and a 10-line `jq` summary fits the use case better than
+# something like grafana.  When the data set outgrows this, swap.
+# ---------------------------------------------------------------------------
+
+# Where per-create perf snapshots live.  Per-user, lives outside the
+# repo so they're not lost on `git clean` and aren't checked in.
+_perf_dir() {
+    printf '%s\n' "${SWCTL_PERF_DIR:-$HOME/.swctl/perf}"
+}
+
+# Write a JSON snapshot of the current create's perf data.
+# Reads $SWCTL_PERF_LOG (TSV: <step>\t<seconds>) and produces:
+#   {
+#     "ts": "2026-05-05T...",
+#     "project": "trunk",
+#     "issue": "12345",
+#     "branch": "fix/foo",
+#     "rev": "abcd1234",
+#     "mode": "qa",
+#     "linked_plugins": "SwagCommercial,SwagFoo",
+#     "total_seconds": 612,
+#     "steps": {
+#       "create_worktree": 28,
+#       "count_changes": 2,
+#       "sync": 145,
+#       "sync_plugin_gitignored_artifacts.SwagCommercial": 12,
+#       "pre_activate_linked_plugins": 18,
+#       "provision": 220,
+#       "frontend": 198,
+#       "total": 612
+#     }
+#   }
+#
+# Args:
+#   $1 total seconds (already-computed by caller; redundant with the
+#      'total' line in $SWCTL_PERF_LOG but kept as an explicit param for
+#      clarity).  Optional — defaults to whatever's in the log.
+#
+# Failure tolerance: never throws.  If python3 / jq / disk are
+# unavailable, we silently skip the snapshot.  Perf tracking is a
+# diagnostic aid, not a hard requirement.
+_write_perf_snapshot() {
+    local _total="${1:-}"
+    [ -n "${SWCTL_PERF_LOG:-}" ] && [ -f "$SWCTL_PERF_LOG" ] || return 0
+
+    local _dir
+    _dir="$(_perf_dir)"
+    mkdir -p "$_dir" 2>/dev/null || return 0
+
+    local _ts _file _rev
+    _ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    _rev="$(git -C "${PROJECT_ROOT:-$PWD}" rev-parse --short HEAD 2>/dev/null || printf 'unknown')"
+    # Filename: timestamp + issue + nonce so concurrent creates don't collide
+    _file="$_dir/$(date -u '+%Y%m%dT%H%M%SZ')-${ISSUE_ID:-unknown}-$$.json"
+
+    # Stream the TSV into a tiny python serializer.  jq could do this too
+    # but python3 is already a dep elsewhere (read_plugin_deps).
+    python3 - "$_file" "$_ts" "${SW_PROJECT_SLUG:-}" "${ISSUE_ID:-}" \
+              "${BRANCH:-}" "$_rev" "${SWCTL_MODE:-}" "${LINKED_PLUGINS:-}" \
+              "$_total" "$SWCTL_PERF_LOG" <<'PY'
+import json, sys
+out_path, ts, project, issue, branch, rev, mode, linked, total, log_path = sys.argv[1:]
+steps = {}
+try:
+    with open(log_path) as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t", 1)
+            if len(parts) == 2:
+                try:
+                    steps[parts[0]] = int(parts[1])
+                except ValueError:
+                    pass
+except OSError:
+    pass
+
+doc = {
+    "ts":             ts,
+    "project":        project,
+    "issue":          issue,
+    "branch":         branch,
+    "rev":            rev,
+    "mode":           mode,
+    "linked_plugins": linked,
+    "total_seconds":  int(total) if total.isdigit() else None,
+    "steps":          steps,
+}
+with open(out_path, "w") as f:
+    json.dump(doc, f, indent=2)
+    f.write("\n")
+PY
+}
+
+cmd_perf() {
+    local count=10
+    local format="table"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--count) count="$2"; shift 2 ;;
+            --json)     format="json"; shift ;;
+            -h|--help)
+                cat <<'HELP'
+swctl perf — show recent `swctl create` timings.
+
+Usage:
+  swctl perf [-n <count>] [--json]
+
+Options:
+  -n, --count   How many recent runs to show (default: 10).
+  --json        Emit raw JSON for the last <count> runs (for piping to jq).
+
+Reads ~/.swctl/perf/*.json (written automatically by every `swctl create`).
+Override the location with SWCTL_PERF_DIR.
+HELP
+                return 0
+                ;;
+            *) die "Unknown flag: $1" ;;
+        esac
+    done
+
+    local _dir
+    _dir="$(_perf_dir)"
+    [ -d "$_dir" ] || die "No perf data yet.  Run a few \`swctl create\`s first; snapshots accumulate at $_dir."
+
+    # Most-recent N files (filenames are sortable timestamp-prefixed).
+    local _files=()
+    while IFS= read -r _f; do _files+=("$_f"); done < <(
+        find "$_dir" -maxdepth 1 -name '*.json' -print 2>/dev/null \
+            | sort -r \
+            | head -n "$count"
+    )
+    [ "${#_files[@]}" -gt 0 ] || die "No perf snapshots found in $_dir."
+
+    if [ "$format" = "json" ]; then
+        # Concatenate as a JSON array for easy piping to `jq`.
+        printf '['
+        local _first=1
+        local _f
+        for _f in "${_files[@]}"; do
+            [ "$_first" -eq 1 ] || printf ','
+            _first=0
+            cat "$_f"
+        done
+        printf ']\n'
+        return 0
+    fi
+
+    python3 - "$count" "${_files[@]}" <<'PY'
+import json, sys, statistics
+count = int(sys.argv[1])
+paths = sys.argv[2:]
+runs = []
+for p in paths:
+    try:
+        with open(p) as f:
+            runs.append(json.load(f))
+    except (OSError, ValueError):
+        pass
+
+if not runs:
+    print("(no parseable snapshots)")
+    sys.exit(0)
+
+# Latest run breakdown
+latest = runs[0]
+print(f"Latest run — {latest['ts']}  issue={latest.get('issue','?')}  branch={latest.get('branch','?')}  mode={latest.get('mode','?')}")
+print(f"  rev={latest.get('rev','?')}  linked_plugins={latest.get('linked_plugins') or '(none)'}")
+print(f"  total: {latest.get('total_seconds','?')}s")
+steps = latest.get("steps", {})
+if steps:
+    print()
+    print(f"  {'step':<55}  {'this run':>10}")
+    for name, sec in sorted(steps.items(), key=lambda kv: -(kv[1] or 0)):
+        if name == "total":
+            continue
+        print(f"  {name:<55}  {sec:>9}s")
+
+# Aggregate medians + delta
+all_step_names = set()
+for r in runs:
+    all_step_names.update(r.get("steps", {}).keys())
+
+print()
+print(f"Across last {len(runs)} runs:")
+print(f"  {'step':<55}  {'median':>8}  {'p95':>6}  {'count':>6}  {'Δ vs prev':>10}")
+
+def quantile(xs, q):
+    if not xs:
+        return None
+    xs = sorted(xs)
+    if len(xs) == 1:
+        return xs[0]
+    k = (len(xs) - 1) * q
+    f, c = int(k), int(k) + 1
+    if c >= len(xs):
+        return xs[-1]
+    return xs[f] + (xs[c] - xs[f]) * (k - f)
+
+for name in sorted(all_step_names):
+    if name == "total":
+        continue
+    vals = [r["steps"][name] for r in runs if name in r.get("steps", {})]
+    if not vals:
+        continue
+    med = statistics.median(vals)
+    p95 = quantile(vals, 0.95) if len(vals) > 1 else vals[0]
+    delta = ""
+    if len(vals) >= 2:
+        d = vals[0] - vals[1]
+        if d > 0:
+            delta = f"+{d}s"
+        elif d < 0:
+            delta = f"{d}s"
+        else:
+            delta = "0"
+    print(f"  {name:<55}  {med:>7.0f}s  {p95:>5.0f}s  {len(vals):>6}  {delta:>10}")
+
+# Total + delta
+totals = [r.get("total_seconds") for r in runs if r.get("total_seconds")]
+if totals:
+    print()
+    print(f"  total median: {statistics.median(totals):.0f}s, p95: {quantile(totals, 0.95):.0f}s, n={len(totals)}")
+    if len(totals) >= 2:
+        d = totals[0] - totals[1]
+        sign = '+' if d > 0 else ''
+        print(f"  total Δ vs prev: {sign}{d}s ({totals[0]}s vs {totals[1]}s)")
+PY
 }
 
 # ---------------------------------------------------------------------------
@@ -7311,6 +7595,8 @@ Commands:
               swctl mcp install   [--user|--project]  swctl mcp uninstall    swctl mcp status
   config      Read/write ~/.swctl/config.json (AI backend, feature flags).
               swctl config [show|path|get|set|unset|edit]
+  perf        Show recent 'swctl create' timings + medians + Δ vs prev run.
+              swctl perf [-n <count>] [--json]
   project     Manage registered projects: swctl project [add|list|remove|init]
   build-base  Pre-populate shared vendor and node_modules base volumes from the project root.
   clean-base  Remove shared base volumes for the current project.
@@ -9323,6 +9609,11 @@ main() {
         doctor|health)
             ensure_state_dirs
             cmd_doctor
+            ;;
+        perf)
+            ensure_state_dirs
+            shift
+            cmd_perf "$@"
             ;;
         volume)
             ensure_state_dirs
