@@ -48,6 +48,49 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
+# _init_perf_log: creates SWCTL_TMP_DIR if missing, sets SWCTL_PERF_LOG to
+# a fresh empty file, defines _perf_log helper.  Regression guard for the
+# bug shipped in PR #38 where the first create after `/tmp` was wiped
+# silently failed to capture any perf data.
+# ---------------------------------------------------------------------------
+
+@test "_init_perf_log: creates SWCTL_TMP_DIR if missing + sets SWCTL_PERF_LOG" {
+    SWCTL_TMP_DIR="$SW_TMP/swctl-tmp-fresh"
+    [ ! -d "$SWCTL_TMP_DIR" ]   # precondition: dir doesn't exist
+    export SWCTL_TMP_DIR
+
+    _init_perf_log "9999"
+
+    [ -d "$SWCTL_TMP_DIR" ]
+    [ -n "$SWCTL_PERF_LOG" ]
+    [ -f "$SWCTL_PERF_LOG" ]
+    [[ "$SWCTL_PERF_LOG" == *"perf-9999-"*".tsv" ]]
+    # And the inline _perf_log helper writes to it
+    _perf_log demo 42
+    grep -q '^demo	42$' "$SWCTL_PERF_LOG"
+}
+
+@test "_init_perf_log: gracefully unsets SWCTL_PERF_LOG when log can't be written" {
+    # Force the perf log to land in a path we can't open: a regular file
+    # standing in where the tmp dir should be.  Direct call (not `run`)
+    # so the env-var changes propagate to the test scope.
+    SWCTL_TMP_DIR="$SW_TMP/blocked"
+    : > "$SWCTL_TMP_DIR"   # NOT a directory
+    export SWCTL_TMP_DIR
+
+    # Capture warn output to verify the warning was surfaced
+    warn() { printf 'WARN: %s\n' "$*" >> "$SW_TMP/warns.log"; }
+    export -f warn
+
+    _init_perf_log "9999"
+
+    # SWCTL_PERF_LOG must be unset so downstream guards skip writes
+    [ -z "${SWCTL_PERF_LOG:-}" ]
+    # And a warning was emitted
+    grep -q "Perf log unavailable" "$SW_TMP/warns.log"
+}
+
+# ---------------------------------------------------------------------------
 # sync_plugin_gitignored_artifacts: emits TSV line on a real sync
 # ---------------------------------------------------------------------------
 

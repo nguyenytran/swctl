@@ -4038,9 +4038,15 @@ cmd_create() {
 
             trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
 
+            # Per-create perf log — see _init_perf_log docstring.
+            _init_perf_log "$ISSUE_ID"
+            local _pe_create_start=$SECONDS
+            local _pe_step_start
+
             # 1. Create trunk worktree at BASE_REF — the branch belongs to the
             # plugin, not the trunk.  Detached mode avoids creating a spurious
             # branch in the trunk repo.
+            _pe_step_start=$SECONDS
             mkdir -p "$SW_WORKTREE_ROOT"
             if ! worktree_exists "$WORKTREE_PATH"; then
                 # Remove leftover directory from a previous failed/cleaned create
@@ -4053,6 +4059,7 @@ cmd_create() {
                 ok "Created trunk worktree (detached at $TRUNK_WORKTREE_REF)."
             fi
             sync_lock_files
+            _perf_log create_worktree "$((SECONDS - _pe_step_start))"
 
             # 2. Nest plugin git worktree inside trunk worktree
             local plugin_target="${WORKTREE_PATH}/custom/plugins/${PLUGIN_NAME}"
@@ -4209,9 +4216,11 @@ cmd_create() {
                 fi
             done
 
+            _pe_step_start=$SECONDS
             sync_worktree_from_trunk
             VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
             NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
+            _perf_log sync "$((SECONDS - _pe_step_start))"
 
             # Plugin build cache — key off the plugin's current HEAD +
             # package-lock.json.  If we've built this exact combination
@@ -4252,7 +4261,9 @@ cmd_create() {
                 return 0
             fi
 
+            _pe_step_start=$SECONDS
             provision_database_and_app "$COMPOSE_PROJECT"
+            _perf_log provision "$((SECONDS - _pe_step_start))"
 
             # Ensure the nested plugin is properly registered AND activated
             # before the admin build.  plugin:refresh alone is not enough —
@@ -4274,6 +4285,7 @@ cmd_create() {
             run_app_command "$COMPOSE_PROJECT" "$_plugin_prep_cmd" 2>/dev/null \
                 || warn "plugin:refresh / activation failed."
 
+            _pe_step_start=$SECONDS
             if [ "$PLUGIN_BUILD_CACHE_HIT" = "1" ]; then
                 # Cache hit — Resources/public/ is already mounted from the
                 # cached volume (see write_compose_volume_override).  Just
@@ -4304,6 +4316,7 @@ cmd_create() {
                         || warn "Plugin build cache not populated; next create will rebuild."
                 fi
             fi
+            _perf_log frontend "$((SECONDS - _pe_step_start))"
             # NOTE: build.sh's happy path already runs `assets:install` (either
             # the full-build branch at hooks/build.sh:64 or the QA skip-build
             # branch at hooks/build.sh:16).  A second assets:install here is
@@ -4314,7 +4327,11 @@ cmd_create() {
             trap - EXIT
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            ok "Worktree '${WORKTREE_ID}' with plugin '${PLUGIN_NAME}' is ready."
+            local _pe_total=$((SECONDS - _pe_create_start))
+            _perf_log total "$_pe_total"
+            _write_perf_snapshot "$_pe_total" 2>/dev/null || true
+
+            ok "Worktree '${WORKTREE_ID}' with plugin '${PLUGIN_NAME}' is ready. (total: ${_pe_total}s)"
             info "URL: ${APP_URL}"
             info "Worktree: ${WORKTREE_PATH}"
             info "Plugin: ${PLUGIN_WORKTREE_PATH}"
@@ -4359,16 +4376,27 @@ cmd_create() {
 
             trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
 
+            # Per-create perf log — see _init_perf_log docstring.
+            _init_perf_log "$ISSUE_ID"
+            local _peb_create_start=$SECONDS
+            local _peb_step_start
+
+            _peb_step_start=$SECONDS
             create_worktree
             check_branch_staleness
+            _perf_log create_worktree "$((SECONDS - _peb_step_start))"
 
             # Diff analysis — focus on plugin directory for change detection
+            _peb_step_start=$SECONDS
             DIFF_FILES="$(git -C "$PROJECT_ROOT" diff --name-only "${BASE_REF}...${BRANCH}" || true)"
             count_changes "$DIFF_FILES"
+            _perf_log count_changes "$((SECONDS - _peb_step_start))"
 
+            _peb_step_start=$SECONDS
             sync_worktree_from_trunk
             VENDOR_VOLUME="$(resolve_vendor_volume "$ISSUE_ID")"
             NODE_MODULES_VOLUME="$(resolve_node_modules_volume "$ISSUE_ID")"
+            _perf_log sync "$((SECONDS - _peb_step_start))"
 
             info "Mode: ${SWCTL_MODE} | Plugin: ${PLUGIN_NAME}"
             info "Strategy: vendor=${VENDOR_VOLUME} node_modules=${NODE_MODULES_VOLUME}"
@@ -4386,8 +4414,12 @@ cmd_create() {
                 return 0
             fi
 
+            _peb_step_start=$SECONDS
             provision_database_and_app "$COMPOSE_PROJECT"
+            _perf_log provision "$((SECONDS - _peb_step_start))"
+            _peb_step_start=$SECONDS
             run_frontend_build_if_needed "$COMPOSE_PROJECT" 1
+            _perf_log frontend "$((SECONDS - _peb_step_start))"
             activate_plugin "$COMPOSE_PROJECT" "$PLUGIN_NAME"
 
             STATUS="complete"
@@ -4395,7 +4427,11 @@ cmd_create() {
             trap - EXIT
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            ok "Worktree '${WORKTREE_ID}' with plugin '${PLUGIN_NAME}' is ready."
+            local _peb_total=$((SECONDS - _peb_create_start))
+            _perf_log total "$_peb_total"
+            _write_perf_snapshot "$_peb_total" 2>/dev/null || true
+
+            ok "Worktree '${WORKTREE_ID}' with plugin '${PLUGIN_NAME}' is ready. (total: ${_peb_total}s)"
             info "URL: ${APP_URL}"
             info "Worktree: ${WORKTREE_PATH}"
             ;;
@@ -4443,21 +4479,8 @@ cmd_create() {
             local step_start create_start
             create_start=$SECONDS
 
-            # Per-create perf log.  Helpers can append `<step>\t<seconds>`
-            # lines via `printf >> $SWCTL_PERF_LOG`; cmd_create reads them
-            # back at the end and writes a structured JSON to
-            # ~/.swctl/perf/.  See `swctl perf` for analysis.
-            #
-            # Why a TSV intermediate: cmd_create is a long-running shell
-            # script, helpers are sourced/exported, and we want them to
-            # be able to record timings without coordinating shared bash
-            # variables.  A flat append-only file is the simplest sink.
-            SWCTL_PERF_LOG="$SWCTL_TMP_DIR/perf-${ISSUE_ID}-$$.tsv"
-            export SWCTL_PERF_LOG
-            : > "$SWCTL_PERF_LOG"
-            _perf_log() {
-                printf '%s\t%s\n' "$1" "$2" >> "$SWCTL_PERF_LOG" 2>/dev/null || true
-            }
+            # Per-create perf log.  See _init_perf_log() docstring.
+            _init_perf_log "$ISSUE_ID"
 
             # Step 2: Worktree.  count_changes is folded in here — it's
             # always <1s (just a git diff), bundling avoids a confusing
@@ -4608,6 +4631,52 @@ cmd_create() {
 # repo so they're not lost on `git clean` and aren't checked in.
 _perf_dir() {
     printf '%s\n' "${SWCTL_PERF_DIR:-$HOME/.swctl/perf}"
+}
+
+# Initialize the per-create perf log + the _perf_log helper.
+#
+# Sets SWCTL_PERF_LOG to a TSV file under SWCTL_TMP_DIR (which is
+# guaranteed to exist after this call — `mkdir -p`).  Helpers append
+# `<step>\t<seconds>` lines via `printf >> $SWCTL_PERF_LOG`; cmd_create
+# reads them back at the end and writes a structured JSON to
+# ~/.swctl/perf/ via _write_perf_snapshot.  See `swctl perf` for analysis.
+#
+# Why a TSV intermediate: cmd_create is a long-running shell script,
+# helpers run in subshells / sourced contexts, and we want them to be
+# able to record timings without coordinating shared bash variables.
+# A flat append-only file is the simplest sink.
+#
+# Why this is a function (vs inlining): cmd_create has THREE branches
+# (platform, plugin-external, plugin-embedded) that all need the same
+# perf-log setup.  Extracting fixes the bug shipped in PR #38 where
+# only the platform branch was instrumented.  It also handles the
+# common pre-existing footgun of SWCTL_TMP_DIR not existing when the
+# perf code first runs (macOS wipes /tmp on reboot, some sandboxes
+# never created it).
+#
+# Args:
+#   $1 issue id (used to namespace the TSV filename)
+_init_perf_log() {
+    local issue_id="$1"
+    mkdir -p "${SWCTL_TMP_DIR:-/tmp/swctl}" 2>/dev/null || true
+    SWCTL_PERF_LOG="${SWCTL_TMP_DIR:-/tmp/swctl}/perf-${issue_id}-$$.tsv"
+    export SWCTL_PERF_LOG
+    : > "$SWCTL_PERF_LOG" 2>/dev/null || {
+        # Couldn't write the perf log (read-only fs, missing parent, etc.) —
+        # disable perf tracking for this run by clearing the env var so the
+        # helpers' `[ -n "$SWCTL_PERF_LOG" ]` guards skip writes.
+        warn "Perf log unavailable (couldn't open $SWCTL_PERF_LOG); continuing without timing capture."
+        unset SWCTL_PERF_LOG
+        return 0
+    }
+
+    # Define the inline helper used by cmd_create's per-step blocks.
+    # Helpers in other functions write directly to $SWCTL_PERF_LOG
+    # (no shared shell function dependency).
+    _perf_log() {
+        [ -n "${SWCTL_PERF_LOG:-}" ] || return 0
+        printf '%s\t%s\n' "$1" "$2" >> "$SWCTL_PERF_LOG" 2>/dev/null || true
+    }
 }
 
 # Write a JSON snapshot of the current create's perf data.
