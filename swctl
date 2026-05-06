@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.2"
+SWCTL_VERSION="0.6.3"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -3771,10 +3771,19 @@ _run_preflight_checks() {
 
     # 3. swctl Docker network (created by `swctl init`).  Without it,
     #    the per-instance Caddy container has nothing to attach to.
-    local net="${SW_TRAEFIK_NETWORK:-swctl-proxy}"
-    _preflight_one "docker network ($net)" \
-        "docker network inspect '$net'" \
-        "Run 'swctl init' to create the shared network + supporting containers" || failed=1
+    #
+    #    Under OrbStack, `swctl init` deliberately skips creating this
+    #    network — OrbStack handles DNS routing differently (every
+    #    container is reachable at `<container>.orb.local` without a
+    #    shared bridge network), so the swctl-proxy network is unused.
+    #    Skip the check there too, otherwise OrbStack users get a
+    #    perpetually-failing preflight that no `swctl init` can fix.
+    if [ "$(detect_runtime)" != "orbstack" ]; then
+        local net="${SW_TRAEFIK_NETWORK:-swctl-proxy}"
+        _preflight_one "docker network ($net)" \
+            "docker network inspect '$net'" \
+            "Run 'swctl init' to create the shared network + supporting containers" || failed=1
+    fi
 
     # 4. Shared mariadb container running — source for per-instance DB
     #    clones.  `swctl init` starts it; if it crashed or was manually
