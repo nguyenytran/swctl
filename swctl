@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.0"
+SWCTL_VERSION="0.6.2"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -1230,6 +1230,13 @@ init_infra() {
     SW_DB_ROOT_USER="${SW_DB_ROOT_USER:-root}"
     SW_DB_ROOT_PASSWORD="${SW_DB_ROOT_PASSWORD:-shopware}"
     SW_DB_PORT="${SW_DB_PORT:-3306}"
+    # SW_DB_HOST is only referenced for the "MariaDB is reachable on
+    # <host>:<port>" log line — mysql_exec connects via `docker exec`,
+    # not over the network — but `set -u` still bites if it's unset
+    # when init runs on a fresh machine before any .swctl.conf exists.
+    # 127.0.0.1 matches what the published port maps to from the user's
+    # shell, which is the most accurate thing to print anyway.
+    SW_DB_HOST="${SW_DB_HOST:-127.0.0.1}"
 
     if [ "$runtime" = "traefik" ]; then
         ensure_network
