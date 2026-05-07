@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.3"
+SWCTL_VERSION="0.6.4"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -1362,35 +1362,107 @@ check_branch_staleness() {
 
     if [ "$commits_behind" -gt 0 ]; then
         info "Branch '$BRANCH' is ${commits_behind} commits behind '${SW_BASE_BRANCH}'. Rebasing..."
-        if git -C "$WORKTREE_PATH" rebase "$BASE_REF" 2>&1; then
+
+        # Pass an explicit committer identity to the rebase.  Without
+        # this, when swctl runs inside the swctl-ui Docker container
+        # (no global git config; HOME=/root), the FIRST rebased commit
+        # bombs with:
+        #
+        #   Committer identity unknown
+        #   *** Please tell me who you are.
+        #   fatal: unable to auto-detect email address (got 'root@<id>.(none)')
+        #
+        # Two-tier fallback so we honor an existing identity when one
+        # is set (most host invocations) and only synthesize one inside
+        # the container.  The author of each commit is preserved either
+        # way — only the committer (whoever ran the rebase) changes.
+        local _git_id_args=()
+        local _user_email _user_name
+        _user_email="$(git -C "$WORKTREE_PATH" config --get user.email 2>/dev/null || true)"
+        _user_name="$(git -C "$WORKTREE_PATH" config --get user.name 2>/dev/null || true)"
+        if [ -z "$_user_email" ] || [ -z "$_user_name" ]; then
+            _git_id_args=(
+                -c "user.email=${_user_email:-swctl@local}"
+                -c "user.name=${_user_name:-swctl}"
+            )
+        fi
+
+        # Capture rebase output so we can distinguish failure modes.
+        # Real conflicts are common and warrant the long recovery
+        # message; other errors (config missing, network, corrupt
+        # repo) shouldn't be reported as "conflicts" — that's
+        # misleading and the recovery steps don't apply.
+        #
+        # The `${arr[@]+"${arr[@]}"}` dance is a bash-3.2 compatibility
+        # workaround: under `set -u`, expanding an empty array via
+        # `"${arr[@]}"` triggers "unbound variable" on macOS's stock
+        # bash.  The +"alternate" form expands to nothing when the
+        # array is empty, sidestepping the bug.
+        local _rebase_out _rebase_rc
+        set +e
+        _rebase_out="$(git -C "$WORKTREE_PATH" ${_git_id_args[@]+"${_git_id_args[@]}"} rebase "$BASE_REF" 2>&1)"
+        _rebase_rc=$?
+        set -e
+        if [ $_rebase_rc -eq 0 ]; then
             ok "Rebased '$BRANCH' onto '${SW_BASE_BRANCH}' (was ${commits_behind} commits behind)."
             return 0
         fi
 
-        # Rebase failed — almost always a real merge conflict.  Earlier
-        # behavior was `warn + rebase --abort + continue`, which silently
-        # shipped a non-rebased branch and left the user to discover later
-        # that their fix was tested against a stale base.  That's worse
-        # than failing fast: schema migrations, plugin-platform version
-        # skew, and DI compile breakage all routinely cascade from a
-        # branch that thinks it's against trunk@N but is actually against
-        # trunk@N-100.
-        #
-        # New behavior: abort the rebase to leave the worktree in a
-        # clean (un-rebased) state so the user can resolve manually,
-        # then DIE with explicit recovery instructions.  The trap in
-        # cmd_create marks STATUS=failed, so `swctl refresh <issue>`
-        # picks up where we left off after the user resolves.
+        # Always abort whatever in-progress rebase state remains so the
+        # worktree is clean for the user to inspect / re-rebase manually.
+        # The trap in cmd_create marks STATUS=failed, so `swctl refresh
+        # <issue>` picks up where we left off after the user resolves.
         git -C "$WORKTREE_PATH" rebase --abort 2>/dev/null || true
 
-        # Build a multi-line guidance message.  die() prints whatever we
-        # pass; embed the recovery steps so the user doesn't have to
-        # context-switch to figure out what to do.
-        local _staleness_note=""
-        if [ "$commits_behind" -gt 100 ] || [ "$days_behind" -gt 14 ]; then
-            _staleness_note=$'\n            (Branch is '"${commits_behind}"' commits / '"${days_behind}"' days behind — schema/dep mismatches likely.)'
-        fi
-        die "Rebase of '$BRANCH' onto '$SW_BASE_BRANCH' has conflicts. Stopping create.${_staleness_note}
+        # Branch on what kind of failure we hit.  Each pattern triggers
+        # a different recovery message — telling someone with a missing
+        # git identity to "resolve conflicts in your editor" wastes
+        # their time.
+        local _failure_kind="conflict"
+        case "$_rebase_out" in
+            *"unable to auto-detect email"*|*"Committer identity unknown"*|*"Please tell me who you are"*)
+                _failure_kind="identity"
+                ;;
+            *"could not apply"*|*"CONFLICT (content)"*|*"merge conflict"*|*"Merge conflict"*)
+                _failure_kind="conflict"
+                ;;
+            *)
+                # Anything else — print the raw output verbatim so the
+                # user has at least the original error to debug from.
+                _failure_kind="other"
+                ;;
+        esac
+
+        case "$_failure_kind" in
+            identity)
+                die "Rebase of '$BRANCH' onto '$SW_BASE_BRANCH' failed: git can't identify the committer.
+
+  swctl was running inside an environment without a git user.email /
+  user.name set (typically the swctl-ui container).
+
+  Set an identity for the worktree so future rebases work:
+
+    git -C $WORKTREE_PATH config user.email \"you@example.com\"
+    git -C $WORKTREE_PATH config user.name  \"Your Name\"
+
+  Or set a global identity once (recommended):
+
+    git config --global user.email \"you@example.com\"
+    git config --global user.name  \"Your Name\"
+
+  Then: swctl refresh ${ISSUE_ID:-<issue>}
+
+  (Note: swctl already falls back to 'swctl <swctl@local>' when no
+  identity is available.  If you're seeing this anyway, the worktree's
+  local git config disagrees with the host or container — re-check
+  with: git -C $WORKTREE_PATH config --get user.email)"
+                ;;
+            conflict)
+                local _staleness_note=""
+                if [ "$commits_behind" -gt 100 ] || [ "$days_behind" -gt 14 ]; then
+                    _staleness_note=$'\n            (Branch is '"${commits_behind}"' commits / '"${days_behind}"' days behind — schema/dep mismatches likely.)'
+                fi
+                die "Rebase of '$BRANCH' onto '$SW_BASE_BRANCH' has conflicts. Stopping create.${_staleness_note}
 
   Resolve the rebase manually, then resume:
 
@@ -1405,6 +1477,22 @@ check_branch_staleness() {
   Or, if you'd rather skip the rebase and proceed against the stale base:
 
     SWCTL_SKIP_STALENESS_REBASE=1 swctl refresh ${ISSUE_ID:-<issue>}"
+                ;;
+            *)
+                die "Rebase of '$BRANCH' onto '$SW_BASE_BRANCH' failed (not a merge conflict).
+
+  Original git output:
+
+${_rebase_out}
+
+  Fix the underlying issue (often a corrupt repo, missing remote, or
+  detached HEAD), then: swctl refresh ${ISSUE_ID:-<issue>}
+
+  Or skip the auto-rebase entirely:
+
+    SWCTL_SKIP_STALENESS_REBASE=1 swctl refresh ${ISSUE_ID:-<issue>}"
+                ;;
+        esac
     fi
 }
 

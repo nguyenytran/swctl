@@ -138,6 +138,51 @@ teardown() {
 # Happy path: branch behind but rebase succeeds (no conflicts) → ok, no die.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Identity-fallback path (v0.6.4): when the worktree has no user.email /
+# user.name (e.g. inside the swctl-ui Docker container with no global
+# config), the rebase used to crash with "Committer identity unknown"
+# and our error handler misreported it as a merge conflict.
+# check_branch_staleness now passes an explicit `swctl <swctl@local>`
+# committer so the rebase can complete on hosts where git can't auto-
+# detect an identity.
+# ---------------------------------------------------------------------------
+
+@test "rebase succeeds when worktree has no user.email / user.name (swctl@local fallback)" {
+    git -C "$BASE_REPO" worktree remove --force "$WORKTREE_PATH" 2>/dev/null
+    rm -rf "$WORKTREE_PATH"
+    git -C "$BASE_REPO" worktree prune 2>/dev/null
+
+    # Make a non-conflicting branch first (while we still have an
+    # identity to commit with).
+    git -C "$BASE_REPO" branch clean-fix trunk~1
+    git -C "$BASE_REPO" worktree add -q "$WORKTREE_PATH" clean-fix
+    echo 'clean change' > "$WORKTREE_PATH/clean.txt"
+    git -C "$WORKTREE_PATH" add clean.txt
+    git -C "$WORKTREE_PATH" -c user.email=bats@example.com -c user.name=Bats \
+        commit -q -m 'clean branch change'
+    BRANCH="clean-fix"
+
+    # Strip identity from both the worktree-local and main-repo config
+    # so git can't auto-detect a committer.  Override HOME too so any
+    # global config on the test runner doesn't mask the regression.
+    git -C "$WORKTREE_PATH" config --unset user.email 2>/dev/null || true
+    git -C "$WORKTREE_PATH" config --unset user.name 2>/dev/null || true
+    git -C "$BASE_REPO" config --unset user.email 2>/dev/null || true
+    git -C "$BASE_REPO" config --unset user.name 2>/dev/null || true
+
+    HOME="$SW_TMP/no-config" run check_branch_staleness
+    [ "$status" -eq 0 ]
+
+    # Worktree's HEAD merge-base with trunk should now be trunk's tip
+    # (the rebase moved the branch's parent onto trunk's HEAD even
+    # without a real user identity).
+    local mb trunk_head
+    mb="$(git -C "$WORKTREE_PATH" merge-base HEAD trunk)"
+    trunk_head="$(git -C "$BASE_REPO" rev-parse trunk)"
+    [ "$mb" = "$trunk_head" ]
+}
+
 @test "branch behind, rebase succeeds: returns 0 and HEAD advances onto trunk" {
     # Tear down the conflict-fixture worktree.
     git -C "$BASE_REPO" worktree remove --force "$WORKTREE_PATH" 2>/dev/null
@@ -165,3 +210,5 @@ teardown() {
     trunk_head="$(git -C "$BASE_REPO" rev-parse trunk)"
     [ "$mb" = "$trunk_head" ]
 }
+
+
