@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.4"
+SWCTL_VERSION="0.6.5"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -605,6 +605,36 @@ load_instance_metadata() {
     # so default to claude.  Live value overrides if metadata was
     # written by a newer swctl.
     RESOLVE_BACKEND="${RESOLVE_BACKEND:-claude}"
+}
+
+# Cleanup hook fired by cmd_create's EXIT trap.
+#
+# Semantics: when create fails before any real artifact exists on disk
+# (typical for an early git-worktree-add or preflight failure), DELETE
+# the registry .env so the next create doesn't see a "phantom"
+# instance and refuse with "worktree already exists".  When create
+# fails AFTER artifacts exist (worktree dir / docker volumes / DB),
+# keep the .env and mark status=failed so the user can `swctl clean`
+# the leftovers.
+#
+# Decision signal: existence of WORKTREE_PATH on disk.  Cheap and
+# unambiguous — present means there's something for the next clean to
+# do, absent means there isn't.
+_create_failure_finalize() {
+    local meta_file="${SWCTL_ACTIVE_META_FILE:-}"
+    [ -n "$meta_file" ] || return 0
+
+    if [ -n "${WORKTREE_PATH:-}" ] && [ -d "$WORKTREE_PATH" ]; then
+        # Real artifacts exist → leave metadata so user can clean.
+        STATUS=failed
+        FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"
+        write_metadata "$meta_file" 2>/dev/null || true
+    else
+        # Nothing on disk → registry .env is the only artifact.
+        # Unlink it so subsequent `swctl create <same-issue>` can
+        # proceed without a manual `rm` from ~/.local/state.
+        rm -f "$meta_file" 2>/dev/null || true
+    fi
 }
 
 write_metadata() {
@@ -3885,9 +3915,22 @@ _run_preflight_checks() {
     #    files; a cold pull from a docker config that uses a credential
     #    helper missing inside the container fails opaquely.  Pre-flight
     #    catches it before the populate step trips on it.
+    # Auto-pull alpine on first install instead of forcing the user to
+    # run `docker pull alpine:latest` manually — alpine is a tiny public
+    # image (~3MB compressed), so the convenience win outweighs the
+    # surprise of an unexpected pull.  Falls back to the original
+    # "fix the above and retry" behaviour if the pull fails (network /
+    # daemon issue) so the message stays actionable.
+    if ! docker image inspect alpine:latest >/dev/null 2>&1 \
+        && ! docker image inspect alpine >/dev/null 2>&1; then
+        info "alpine:latest not cached — pulling for first-time setup…"
+        if docker pull alpine:latest >/dev/null 2>&1; then
+            : # fall through to the inspect check below for the green tick.
+        fi
+    fi
     _preflight_one "alpine image cached" \
         'docker image inspect alpine:latest || docker image inspect alpine' \
-        'Run: docker pull alpine:latest' || failed=1
+        'docker pull alpine:latest failed — check network / Docker daemon and retry' || failed=1
 
     # 6. Worktree path doesn't already collide.  We don't try to
     #    distinguish "ours" from "stale" — flagging the collision and
@@ -4140,7 +4183,7 @@ cmd_create() {
             BACKEND_CHANGES=0; FRONTEND_CHANGES=0
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+            trap '[ "${STATUS:-}" = "creating" ] && _create_failure_finalize' EXIT
 
             # Per-create perf log — see _init_perf_log docstring.
             _init_perf_log "$ISSUE_ID"
@@ -4478,7 +4521,7 @@ cmd_create() {
             FRONTEND_CHANGES="${FRONTEND_CHANGES:-0}"
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+            trap '[ "${STATUS:-}" = "creating" ] && _create_failure_finalize' EXIT
 
             # Per-create perf log — see _init_perf_log docstring.
             _init_perf_log "$ISSUE_ID"
@@ -4578,7 +4621,7 @@ cmd_create() {
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
             # On any exit while STATUS=creating, mark as failed
-            trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+            trap '[ "${STATUS:-}" = "creating" ] && _create_failure_finalize' EXIT
 
             local step_start create_start
             create_start=$SECONDS
@@ -6157,6 +6200,16 @@ cmd_clean() {
         warn "No tracked worktree found for issue '$issue_input'. Nothing to clean."
         return 0
     }
+
+    # Idempotency guarantee: unlink the registry .env on ANY exit path
+    # (success, set -e bailout, mysql_exec failure, …).  The original
+    # body only did `rm -f "$meta_file"` at the bottom; if any step
+    # in between hit a fatal error (e.g. mariadb unreachable), the .env
+    # stayed on disk and the next `swctl create <same-issue>` failed
+    # with the misleading "worktree already exists" error.  Trap
+    # guarantees we always converge to a clean registry.
+    # shellcheck disable=SC2064  # intentional early-expansion of $meta_file
+    trap "rm -f '$meta_file' 2>/dev/null || true" EXIT
 
     load_instance_metadata "$meta_file"
 
