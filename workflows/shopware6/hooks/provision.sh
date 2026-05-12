@@ -19,7 +19,27 @@
 set -euo pipefail
 
 # --- QA mode: minimal setup (no composer install, no npm, just DB + cache) ---
+#
+# Exception (added 2026-05-12 after #15629/#16496 lock-drift incident):
+# when the branch's composer.json bumps package constraints that the
+# shared trunk-vendor doesn't satisfy (e.g. opensearch-php ^2.3.1 →
+# ^2.6.0), we MUST run bootstrap_dependencies so the v0.6.7 drift
+# parser in `_composer_update_missing` can run
+# `composer update <pkgs> --with-dependencies` and heal the dedicated
+# vendor volume.  Skipping this leaves the worktree with a vendor whose
+# autoload classmap doesn't include the new transitive deps —
+# manifesting at runtime as `ClassNotFoundError` (the
+# GuzzleHttpClientFactory + Psr17FactoryDiscovery cascades we hit).
+#
+# Heuristic: COMPOSER_CHANGES > 0 means composer.json/lock differs from
+# trunk, so the cloned vendor volume is stale w.r.t. the lockfile.
+# bootstrap_dependencies is idempotent + cheap when the lock matches
+# (composer install becomes a no-op).
 if [ "$SWCTL_MODE" = "qa" ]; then
+    if [ "${COMPOSER_CHANGES:-0}" -gt 0 ]; then
+        info "Composer drift detected in QA mode (composer=${COMPOSER_CHANGES} files). Bootstrapping dependencies to heal lockfile."
+        _swctl_bootstrap_dependencies "$COMPOSE_PROJECT"
+    fi
     # Run migrations if the branch has schema changes
     if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected in QA mode. Running migrations."
