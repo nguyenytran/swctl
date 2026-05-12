@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.6"
+SWCTL_VERSION="0.6.7"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -2723,22 +2723,73 @@ fix_volume_ownership() {
         "chown ${SW_UID}:${SW_GID} /var/www/html/vendor /var/www/html/node_modules 2>/dev/null" || true
 }
 
+# Parse `composer install --dry-run` output for the names of packages
+# the lock file disagrees with composer.json on.  Two patterns we've
+# seen in the wild — both fixed by the same `composer update <pkgs>
+# --with-dependencies` invocation:
+#
+#   pattern A — "is not present in the lock file"
+#       Trigger: composer.json adds a brand-new dependency that
+#       composer.lock has never seen.  Verbatim line:
+#           - Required package "X" is not present in the lock file.
+#
+#   pattern B — "is in the lock file as ... but ... does not satisfy your constraint"
+#       Trigger: composer.json bumps an existing package's version
+#       constraint (e.g. ^2.3.1 → ^2.6.0) without regenerating the
+#       lockfile.  Verbatim line:
+#           - Required package "X" is in the lock file as "Y" but that does not satisfy your constraint "Z".
+#
+# Pattern B was the one biting the search-stack branches
+# (feat/elasticsearch-*) where opensearch-project/opensearch-php went
+# from ^2.3.1 → ^2.6.0, picking up the new
+# OpenSearch\HttpClient\GuzzleHttpClientFactory class.  Without this
+# parser the fallthrough was a full `composer update` (which can
+# remove synced-but-not-in-composer.json plugins like
+# shopware/commercial).
+_composer_extract_drifted_pkgs() {
+    local dry_run_output="$1"
+    # `|| true` on every grep so a no-match (exit 1) under the caller's
+    # `set -e` doesn't kill the whole function before the awk dedupe.
+    # awk is the single point where the two patterns merge + dedupe;
+    # NF guards against empty lines, !seen[]++ collapses duplicates
+    # that composer sometimes prints on retry.
+    {
+        # Pattern A — net-new package missing from the lockfile.
+        printf '%s\n' "$dry_run_output" \
+            | grep 'is not present in the lock file' \
+            | sed -E 's/.*package "([^"]+)".*/\1/' \
+            || true
+        # Pattern B — package present in lock but at a version the new
+        # composer.json constraint rejects (the search-stack case).
+        printf '%s\n' "$dry_run_output" \
+            | grep 'is in the lock file as .* but that does not satisfy your constraint' \
+            | sed -E 's/.*package "([^"]+)".*/\1/' \
+            || true
+    } | awk 'NF && !seen[$0]++' | tr '\n' ' '
+}
+
 _composer_update_missing() {
     # When `composer install` fails because the lock is stale (branch's composer.json
-    # has packages not in the lock), extract the missing package names and update ONLY
-    # those.  A bare `composer update` is dangerous — it resolves everything from
-    # composer.json and can REMOVE packages needed by synced plugins (e.g. shopware/commercial).
+    # has packages not in the lock, OR has bumped constraints the lock doesn't
+    # satisfy), extract the affected package names and update ONLY those.  A bare
+    # `composer update` is dangerous — it resolves everything from composer.json
+    # and can REMOVE packages needed by synced plugins (e.g. shopware/commercial).
+    #
+    # --with-dependencies pulls in transitive bumps (e.g. updating
+    # opensearch-project/opensearch-php to a version that adds a new
+    # subdependency).  Without this flag the install can still fail on
+    # cascading constraint errors a single targeted update misses.
     local compose_project="$1"
     local missing_output
     missing_output="$(run_app_command "$compose_project" \
         "composer install --dry-run --no-interaction 2>&1 || true" 2>/dev/null)" || true
     local missing_pkgs=""
-    missing_pkgs="$(echo "$missing_output" | grep 'is not present in the lock file' \
-        | sed 's/.*package "\([^"]*\)".*/\1/' | tr '\n' ' ')" || true
+    missing_pkgs="$(_composer_extract_drifted_pkgs "$missing_output")" || true
 
     if [ -n "${missing_pkgs// /}" ]; then
-        info "Lock is missing packages: $missing_pkgs— running targeted composer update."
-        run_app_command "$compose_project" "composer update --no-interaction $missing_pkgs" \
+        info "Lock drift detected for: $missing_pkgs— running targeted composer update --with-dependencies."
+        run_app_command "$compose_project" \
+            "composer update --no-interaction --with-dependencies $missing_pkgs" \
             || warn "composer update failed for: $missing_pkgs"
     else
         warn "composer install failed for unknown reason. Trying full composer update."
