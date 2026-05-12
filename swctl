@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.8"
+SWCTL_VERSION="0.6.9"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -3889,14 +3889,71 @@ sync_plugin_gitignored_artifacts() {
     return 0
 }
 
+# Resolve the remote's default branch for a plugin repo (e.g. "trunk"
+# or "main").  Querying `origin/HEAD` is the robust source of truth —
+# it follows whatever the upstream marked as default and is invariant
+# under whatever local branch the user happens to have checked out.
+#
+# Falls back to a small list of conventional names (trunk → main → master)
+# when origin/HEAD isn't set (rare; happens on freshly-cloned repos that
+# never ran `git remote set-head`).  Final fallback: refuse and let the
+# caller bail loudly — way better than silently picking the user's
+# local feature branch (which is how a stray SwagCommercial checkout on
+# `fix/recommended-bundles-cms-migration-backfill` silently broke
+# `--deps SwagCommercial` for issue #6345 on 2026-05-12).
+_resolve_remote_default_branch() {
+    local dep_repo="$1"
+    local resolved=""
+
+    # Path A — origin/HEAD symbolic-ref (the canonical answer).
+    resolved="$(git -C "$dep_repo" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+        | sed 's@^refs/remotes/origin/@@')" || true
+    if [ -n "$resolved" ]; then
+        printf '%s' "$resolved"
+        return 0
+    fi
+
+    # Path B — try to fix it up automatically.  `set-head -a` queries
+    # the remote for its default branch and writes origin/HEAD locally.
+    # Quiet output; failure (no network / no remote / no auth) drops to
+    # the conventional-names fallback.
+    git -C "$dep_repo" remote set-head origin -a >/dev/null 2>&1 || true
+    resolved="$(git -C "$dep_repo" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+        | sed 's@^refs/remotes/origin/@@')" || true
+    if [ -n "$resolved" ]; then
+        printf '%s' "$resolved"
+        return 0
+    fi
+
+    # Path C — try conventional names in order.  Plugins in the
+    # Shopware org settled on `trunk` (commercial, customized-products
+    # …) while open-source third parties usually use `main`.  `master`
+    # is the legacy fallback.
+    local cand
+    for cand in trunk main master; do
+        if git -C "$dep_repo" rev-parse --verify "origin/${cand}" >/dev/null 2>&1; then
+            printf '%s' "$cand"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 create_dep_plugin_worktree() {
-    # Create a git worktree for a dependency plugin at its default branch.
+    # Create a git worktree for a dependency plugin at its REMOTE default
+    # branch (origin/HEAD, not local HEAD — see _resolve_remote_default_branch
+    # for why).  Loud failure: when something goes wrong, return non-zero
+    # AND `err` (not `warn`) so the surrounding create flow can surface
+    # the missing dep at the end of provision instead of letting the admin
+    # silently show 0 plugins later.
     local dep_name="$1"
     local dep_repo="${PROJECT_ROOT}/custom/plugins/${dep_name}"
     local dep_target="${WORKTREE_PATH}/custom/plugins/${dep_name}"
 
     if [ ! -d "$dep_repo/.git" ]; then
-        warn "Dependency plugin repo not found: $dep_repo — skipping."
+        err "Dependency plugin repo not found at $dep_repo — '--deps ${dep_name}' will be ignored."
+        err "    Tip: clone the plugin into custom/plugins/${dep_name} or check the spelling."
         return 1
     fi
 
@@ -3905,18 +3962,26 @@ create_dep_plugin_worktree() {
         return 0
     fi
 
-    # Determine the dep's default branch
-    local dep_default_branch
-    dep_default_branch="$(git -C "$dep_repo" symbolic-ref --short HEAD 2>/dev/null)" || dep_default_branch="main"
+    # Fetch first so origin/HEAD + remote refs are current.  Failure
+    # (offline, auth) is non-fatal — the local clone may still satisfy.
+    git -C "$dep_repo" fetch --all --prune 2>/dev/null || true
 
-    info "Creating dependency worktree: $dep_name (at $dep_default_branch)"
+    local dep_default_branch
+    if ! dep_default_branch="$(_resolve_remote_default_branch "$dep_repo")"; then
+        err "Could not resolve a default branch for dependency '${dep_name}' (no origin/HEAD, no origin/trunk|main|master)."
+        err "    Tip: run 'git -C $dep_repo remote set-head origin -a' or set up the remote and retry."
+        return 1
+    fi
+
+    info "Creating dependency worktree: $dep_name (at origin/$dep_default_branch)"
     mkdir -p "$(dirname "$dep_target")"
     rm -rf "$dep_target" 2>/dev/null || true
 
-    git -C "$dep_repo" fetch --all --prune 2>/dev/null || true
-    git -C "$dep_repo" worktree add --detach "$dep_target" "origin/$dep_default_branch" 2>/dev/null \
-        || git -C "$dep_repo" worktree add --detach "$dep_target" "$dep_default_branch" 2>/dev/null \
-        || { warn "Failed to create worktree for dependency: $dep_name"; return 1; }
+    if ! git -C "$dep_repo" worktree add --detach "$dep_target" "origin/$dep_default_branch" 2>/dev/null; then
+        err "git worktree add failed for dependency '${dep_name}' at origin/${dep_default_branch}."
+        err "    Tip: try 'git -C $dep_repo worktree prune' and 'git fetch origin'."
+        return 1
+    fi
 
     # Bring along the parent's prebuilt frontend artifacts (gitignored, so
     # `git worktree add` doesn't include them).  Without this the dep plugin's
@@ -3924,7 +3989,7 @@ create_dep_plugin_worktree() {
     # the whole admin build.  See sync_plugin_gitignored_artifacts.
     sync_plugin_gitignored_artifacts "$dep_repo" "$dep_target"
 
-    ok "Dependency plugin nested: custom/plugins/${dep_name} (detached at $dep_default_branch)"
+    ok "Dependency plugin nested: custom/plugins/${dep_name} (detached at origin/${dep_default_branch})"
 }
 
 # --- Pre-flight checks for `swctl create` -----------------------------------
@@ -4438,14 +4503,22 @@ cmd_create() {
             fi
             if [ -n "$deps" ]; then
                 info "Plugin dependencies declared: $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
+                local _failed_deps=""
                 while IFS= read -r dep_name; do
                     [ -n "$dep_name" ] || continue
                     [ "$dep_name" = "$PLUGIN_NAME" ] && continue  # skip self
                     if create_dep_plugin_worktree "$dep_name"; then
                         dep_plugins="${dep_plugins:+${dep_plugins},}${dep_name}"
                         dep_worktree_paths="${dep_worktree_paths:+${dep_worktree_paths},}${WORKTREE_PATH}/custom/plugins/${dep_name}"
+                    else
+                        _failed_deps="${_failed_deps:+${_failed_deps},}${dep_name}"
                     fi
                 done <<< "$deps"
+                if [ -n "$_failed_deps" ]; then
+                    err "DEPENDENCY LINKING FAILED: ${_failed_deps}"
+                    err "  These plugins were requested but could not be linked."
+                    err "  The instance will continue to provision WITHOUT them; check the err lines above."
+                fi
             fi
 
             # 3. Standard trunk flow: diff, sync, provision
@@ -4789,13 +4862,27 @@ cmd_create() {
                 local deps
                 deps="$(echo "$selected_deps" | tr ',' '\n')"
                 info "Plugin dependencies (--deps flag): $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
+                # Accumulate failed deps so we can summarise loudly at the end.
+                # Silent dep failures used to produce a working create whose
+                # admin showed 0 plugins — the user had no way to spot the
+                # mismatch between what they asked for and what shipped
+                # (the #6345 incident, 2026-05-12).
+                local _failed_deps=""
                 while IFS= read -r dep_name; do
                     [ -n "$dep_name" ] || continue
                     if create_dep_plugin_worktree "$dep_name"; then
                         dep_plugins="${dep_plugins:+${dep_plugins},}${dep_name}"
                         dep_worktree_paths="${dep_worktree_paths:+${dep_worktree_paths},}${WORKTREE_PATH}/custom/plugins/${dep_name}"
+                    else
+                        _failed_deps="${_failed_deps:+${_failed_deps},}${dep_name}"
                     fi
                 done <<< "$deps"
+                if [ -n "$_failed_deps" ]; then
+                    err "DEPENDENCY LINKING FAILED: ${_failed_deps}"
+                    err "  These plugins were requested via --deps but could not be linked."
+                    err "  The instance will continue to provision WITHOUT them; check the err lines above."
+                    err "  Recover with: swctl clean ${ISSUE_ID} && swctl create --deps <fixed-deps> ..."
+                fi
             fi
 
             # Check dependency plugins for admin/storefront extensions
