@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.5"
+SWCTL_VERSION="0.6.6"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -635,6 +635,58 @@ _create_failure_finalize() {
         # proceed without a manual `rm` from ~/.local/state.
         rm -f "$meta_file" 2>/dev/null || true
     fi
+}
+
+# Decide whether the freshly-created instance should have Elasticsearch
+# enabled (writes SHOPWARE_ES_* env, runs `es:index`, drains the queue
+# in post-provision).  Resolution precedence:
+#
+#   1. SWCTL_ENABLE_ES_OVERRIDE="1"  → force on  (`--enable-es`)
+#   2. SWCTL_ENABLE_ES_OVERRIDE="0"  → force off (`--no-enable-es`)
+#   3. Auto-detect from the issue's GitHub labels: any of
+#      `component/search`, `component/elasticsearch`, `domain/search`
+#      → on.  This catches the exact ~5 % of issues where the user
+#      tested an ES-dependent flow and got mysterious empty results
+#      because the worktree defaulted to MySQL fallback (the case
+#      that prompted this feature on 2026-05-11).
+#   4. Otherwise → off.  Skipping ES on non-search issues keeps the
+#      create path ~30–60 s faster (no es:index, no queue drain).
+#
+# Returns 0 when ES should be enabled, 1 otherwise.  Stdout receives
+# a one-line human-readable reason for the decision; the caller logs
+# it via `info "$(_decide_enable_es)"` so the audit trail is visible.
+_decide_enable_es() {
+    case "${SWCTL_ENABLE_ES_OVERRIDE:-}" in
+        1) printf 'forced on via --enable-es\n'; return 0 ;;
+        0) printf 'forced off via --no-enable-es\n'; return 1 ;;
+    esac
+
+    # Best-effort label fetch.  Quiet failures (no token, no network,
+    # plugin/external issue) fall through to "off" — never block the
+    # create on a 3rd-party API call.
+    local labels=""
+    local issue_id="${ISSUE_ID:-}"
+    if [ -z "$issue_id" ] || ! command -v gh >/dev/null 2>&1; then
+        printf 'auto-detect skipped (no gh CLI or ISSUE_ID)\n'
+        return 1
+    fi
+
+    # Default to shopware/shopware; let SWCTL_GITHUB_ORG/REPO override
+    # for plugin-issue scopes (the resolve path already populates the
+    # right repo into SWCTL_LABEL_FETCH_REPO when available).
+    local repo="${SWCTL_LABEL_FETCH_REPO:-${SWCTL_GITHUB_ORG:-shopware}/${SWCTL_GITHUB_REPO:-shopware}}"
+    labels="$(gh api "repos/${repo}/issues/${issue_id}" --jq '.labels[].name' 2>/dev/null || true)"
+    if [ -z "$labels" ]; then
+        printf 'auto-detect: no labels fetched for #%s (off)\n' "$issue_id"
+        return 1
+    fi
+
+    if printf '%s\n' "$labels" | grep -qiE '^(component/(search|elasticsearch)|domain/search)$'; then
+        printf 'auto-detect: matched ES-related label on #%s\n' "$issue_id"
+        return 0
+    fi
+    printf 'auto-detect: no ES-related label on #%s (off)\n' "$issue_id"
+    return 1
 }
 
 write_metadata() {
@@ -3190,6 +3242,19 @@ provision_database_and_app() {
     # in-function definitions caused 'command not found' errors when
     # `swctl switch` (qa→dev) called the build hook directly.
 
+    # Decide ES-enablement once, log the reason, and export the
+    # boolean for the post-provision hook to act on.  Auto-detect
+    # via issue labels (`component/search` etc.) so the user doesn't
+    # need to remember `--enable-es` for every search PR.
+    local _es_reason
+    if _es_reason="$(_decide_enable_es)"; then
+        export SWCTL_ENABLE_ES=1
+        info "[es] $_es_reason — will enable Elasticsearch + run es:index in post-provision."
+    else
+        export SWCTL_ENABLE_ES=0
+        info "[es] $_es_reason"
+    fi
+
     # Delegate to workflow hooks (provision → post-provision)
     run_workflow_hook "provision"
     run_workflow_hook "post-provision"
@@ -3984,6 +4049,13 @@ cmd_create() {
     local adopt_worktree_path=""
     local no_provision=0
     local skip_preflight=0
+    # SWCTL_ENABLE_ES is tri-state:
+    #   ""  → auto-detect from issue labels (default).
+    #   "1" → forced on via `--enable-es` flag.
+    #   "0" → forced off via `--no-enable-es` (escape hatch when label
+    #         detection misfires or the user just doesn't want ES on a
+    #         search issue, e.g. they're going to test the SQL fallback).
+    local enable_es_override=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --qa)      SWCTL_MODE="qa"; shift ;;
@@ -4001,11 +4073,18 @@ cmd_create() {
             --adopt-worktree) adopt_worktree_path="$2"; shift 2 ;;
             --no-provision) no_provision=1; shift ;;
             --skip-preflight) skip_preflight=1; shift ;;
+            # Force-enable Elasticsearch on the new instance (writes
+            # SHOPWARE_ES_* into .env.local + runs es:index in
+            # post-provision).  Default is auto-detect from the
+            # issue's GitHub labels — see _detect_enable_es().
+            --enable-es)    enable_es_override="1"; shift ;;
+            --no-enable-es) enable_es_override="0"; shift ;;
             *)         break ;;
         esac
     done
     export SWCTL_MODE
     export SWCTL_NO_PROVISION="$no_provision"
+    export SWCTL_ENABLE_ES_OVERRIDE="$enable_es_override"
     ISSUE="${1:-}"
     BRANCH="${2:-}"
     [ -n "$ISSUE" ] || die "Usage: swctl create [--qa|--dev] [--project <name>] [--plugin <name>] <issue> [<branch>]"
@@ -7761,7 +7840,7 @@ swctl ${SWCTL_VERSION}
 
 Usage:
   swctl init
-  swctl create [--qa|--dev] <issue> [<branch>]
+  swctl create [--qa|--dev] [--enable-es|--no-enable-es] <issue> [<branch>]
   swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]
   swctl status
   swctl exec <issue> '<cmd>'
@@ -7786,6 +7865,9 @@ Usage:
 Commands:
   init        Idempotent setup of Traefik, MariaDB, Redis, and the swctl Docker network.
   create      Create a worktree. --qa: auto-build everything needed (vendor from trunk). --dev: writable vendor (default).
+              --enable-es / --no-enable-es overrides the auto-detect: when the issue has a `component/search`,
+              `component/elasticsearch`, or `domain/search` label, swctl writes SHOPWARE_ES_* into .env.local
+              and runs es:index in post-provision.  Useful when the resolver wants ES live before testing.
   batch       Batch create worktrees from CLI pairs, a file, or GitLab/GitHub MRs.
   status      Show tracked worktrees, routed domains, container state, and DB mode.
   exec        Execute a command inside the worktree's app container.
