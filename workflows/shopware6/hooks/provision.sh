@@ -36,10 +36,18 @@ set -euo pipefail
 # bootstrap_dependencies is idempotent + cheap when the lock matches
 # (composer install becomes a no-op).
 if [ "$SWCTL_MODE" = "qa" ]; then
-    if [ "${COMPOSER_CHANGES:-0}" -gt 0 ]; then
-        info "Composer drift detected in QA mode (composer=${COMPOSER_CHANGES} files). Bootstrapping dependencies to heal lockfile."
-        _swctl_bootstrap_dependencies "$COMPOSE_PROJECT"
-    fi
+    # v0.6.10: bootstrap is ALWAYS called now, not gated on COMPOSER_CHANGES.
+    # v0.6.8 only ran bootstrap when the BRANCH bumped composer relative
+    # to trunk — but trunk itself can advance after `vendor-base-<project>`
+    # was first populated.  Other teammates reported the same
+    # ClassNotFoundError on FRESH creates on v0.6.9 because their cached
+    # vendor-base volume was populated months ago at an older trunk and
+    # never refreshed (COMPOSER_CHANGES=0, so v0.6.8 stayed silent).
+    #
+    # bootstrap_dependencies' new `_vendor_satisfies_lockfile` jq check
+    # is ~50 ms when the vendor is fresh (composer doesn't even boot).
+    # Let that be the real gate.
+    _swctl_bootstrap_dependencies "$COMPOSE_PROJECT"
     # Run migrations if the branch has schema changes
     if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected in QA mode. Running migrations."

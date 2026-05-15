@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.9"
+SWCTL_VERSION="0.6.10"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -2798,6 +2798,37 @@ _composer_update_missing() {
     fi
 }
 
+# Cheap drift check: does the container's vendor satisfy composer.lock?
+#
+# Background: swctl's shared `vendor-base-<project>` Docker volume is
+# populated once per machine on first need.  Trunk's composer.lock
+# advances over time (e.g., when a Shopware/* PR bumps a package and
+# merges).  Without a refresh signal, every NEW instance on that
+# machine clones the stale volume and runs with the OLD vendor —
+# breaking at runtime as soon as someone calls a class that only
+# exists in the new package version.  The opensearch-php 2.3.1 →
+# 2.6.0 bump bit at least two teammates this way on 2026-05-14/15.
+#
+# Compare package versions in composer.lock vs vendor/composer/installed.json.
+# Misses file-level corruption but catches "trunk advanced, vendor lagged" —
+# the only class of drift swctl can heal automatically.  ~50 ms inside
+# the container (pure jq, no composer boot — 100× cheaper than
+# `composer install --dry-run` which spins up the full plugin loader).
+#
+# Returns 0 = vendor matches lockfile (skip install).
+# Returns 1 = drift detected OR check could not run (be safe → install).
+_vendor_satisfies_lockfile() {
+    local compose_project="$1"
+    run_app_command "$compose_project" '
+        set -e
+        [ -f composer.lock ] || exit 1
+        [ -f vendor/composer/installed.json ] || exit 1
+        lock=$(jq -S ".packages | map({name, version}) | sort_by(.name)" composer.lock 2>/dev/null)
+        inst=$(jq -S ".packages | map({name, version}) | sort_by(.name)" vendor/composer/installed.json 2>/dev/null)
+        [ -n "$lock" ] && [ -n "$inst" ] && [ "$lock" = "$inst" ]
+    ' >/dev/null 2>&1
+}
+
 bootstrap_dependencies() {
     local compose_project="$1"
     local package_install_cmd=""
@@ -2815,6 +2846,13 @@ bootstrap_dependencies() {
         # Shared base volume is empty (first-time populate)
         vendor_needs_install=1
         info "Shared vendor volume is empty. Will populate with composer install."
+    elif ! _vendor_satisfies_lockfile "$compose_project"; then
+        # Shared base volume is populated, but its packages don't match
+        # the current composer.lock — fresh trunk + stale vendor-base.
+        # Heal by running composer install; `_composer_update_missing`
+        # picks up any lock-vs-json mismatch via the v0.6.7 parser.
+        vendor_needs_install=1
+        info "Vendor doesn't satisfy current composer.lock (stale shared volume) — running install to sync."
     else
         info "Reusing existing vendor. Skipping composer install."
     fi

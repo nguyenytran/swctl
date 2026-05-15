@@ -1,5 +1,5 @@
 SHELL := /usr/bin/env bash
-VERSION ?= 0.6.9
+VERSION ?= 0.6.10
 DIST_DIR := dist
 PACKAGE := swctl-$(VERSION)
 ARTIFACT := $(DIST_DIR)/$(PACKAGE).tar.gz

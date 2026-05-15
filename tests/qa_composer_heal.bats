@@ -106,26 +106,34 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
-# COMPOSER_CHANGES == 0 → bootstrap_dependencies MUST NOT run (legacy fast path).
-# This is the common case for issues that touch only PHP code, not deps.
+# v0.6.10 change: bootstrap_dependencies now runs UNCONDITIONALLY in
+# QA mode, not only when COMPOSER_CHANGES > 0.  Reason: a teammate's
+# `vendor-base-<project>` Docker volume can be stale even when the
+# branch matches trunk (e.g., volume populated 3 weeks ago, trunk's
+# opensearch-php bumped 2 weeks ago, branch synced today — diff is
+# zero, but the cached vendor still has the old package).  The
+# `_vendor_satisfies_lockfile` jq check inside bootstrap_dependencies
+# is ~50 ms — cheap enough to run every time.
 # ---------------------------------------------------------------------------
 
-@test "QA mode + COMPOSER_CHANGES = 0 → bootstrap_dependencies skipped" {
+@test "QA mode + COMPOSER_CHANGES = 0 → bootstrap_dependencies STILL fires (v0.6.10 stale-vendor guard)" {
     COMPOSER_CHANGES=0
     export COMPOSER_CHANGES
     bash "$HOOK"
-    ! grep -q '^bootstrap_dependencies' "$CALL_LOG"
+    grep -q '^bootstrap_dependencies trunk-test$' "$CALL_LOG"
 }
 
 # ---------------------------------------------------------------------------
-# COMPOSER_CHANGES unset (legacy callers) → treated as 0 → no bootstrap.
-# Without the ${VAR:-0} guard this would explode under `set -u`.
+# COMPOSER_CHANGES unset (legacy callers) — bootstrap still runs.
+# The hook no longer needs the ${VAR:-0} guard for this var, but
+# leaving the test guards against a regression where some path forgot
+# to export COMPOSER_CHANGES at all.
 # ---------------------------------------------------------------------------
 
-@test "QA mode + COMPOSER_CHANGES unset → bootstrap_dependencies skipped (no crash)" {
+@test "QA mode + COMPOSER_CHANGES unset → bootstrap_dependencies still fires (no crash)" {
     unset COMPOSER_CHANGES
     bash "$HOOK"
-    ! grep -q '^bootstrap_dependencies' "$CALL_LOG"
+    grep -q '^bootstrap_dependencies trunk-test$' "$CALL_LOG"
 }
 
 # ---------------------------------------------------------------------------
