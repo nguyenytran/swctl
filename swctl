@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.12"
+SWCTL_VERSION="0.6.13"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -3139,14 +3139,34 @@ _postflight_instance_ready() {
     fi
     ok "  ✓ container running (${container:0:12})"
 
-    # 2. /admin reachable.  Use a short timeout so a wedged app doesn't
-    # hang the whole provision flow.
-    local http
-    http="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "${app_url}/admin" 2>/dev/null || echo '000')"
+    # 2. /admin reachable — with retry/backoff.
+    #
+    # The old single-shot check (curl --max-time 8) gave too many false
+    # alarms under batch-load: when the host is at load average 15+ from
+    # 3-4 parallel creates, PHP-FPM / Caddy can take >8 s just to answer
+    # the first HTTP request even though the container is technically
+    # "up."  Postflight would then tag STATUS=failed and the user would
+    # find the instance is actually fine 30 s later.  (#4799, #6774 on
+    # 2026-05-15 afternoon both hit this — every postflight check
+    # passed manually but the create flow died on /admin.)
+    #
+    # New: 3 attempts × 8 s timeout × 5 s backoff = up to ~40 s total
+    # budget.  Bails fast on success.  Genuinely-broken containers
+    # still fail clearly with a final HTTP code in the error message.
+    local http=""
+    local attempt
+    for attempt in 1 2 3; do
+        http="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "${app_url}/admin" 2>/dev/null || echo '000')"
+        if [ "$http" = "200" ] || [ "$http" = "302" ] || [ "$http" = "301" ]; then
+            break
+        fi
+        # Don't sleep after the last attempt.
+        [ "$attempt" -lt 3 ] && sleep 5
+    done
     if [ "$http" = "200" ] || [ "$http" = "302" ] || [ "$http" = "301" ]; then
         ok "  ✓ /admin reachable (HTTP ${http})"
     else
-        err "  ✗ /admin not reachable at ${app_url} (HTTP ${http})"
+        err "  ✗ /admin not reachable at ${app_url} after 3 attempts (HTTP ${http})"
         err "    Remedy: check 'docker logs ${container}' for PHP-FPM/Caddy errors, then 'swctl refresh ${ISSUE_ID}'."
         rc=1
     fi
@@ -3180,7 +3200,15 @@ _postflight_instance_ready() {
 
     # 6. DB reachable by the app.  Use the app's own connection so we
     # catch both "db host down" and "app can't see it".
-    if docker exec "$container" sh -c 'bin/console dbal:refresh:index --dry-run >/dev/null 2>&1' 2>/dev/null; then
+    #
+    # Command name fix (v0.6.13): the previous `dbal:refresh:index` is
+    # not a real Shopware command (the namespace was `dal`, not `dbal`),
+    # so this check used to ALWAYS fail and just emit the warn — never
+    # actually verified the DB.  Switched to `debug:container database_connection`
+    # which is a proper DI-container probe: succeeds iff the connection
+    # service can be resolved, and doesn't depend on any optional
+    # console namespace.
+    if docker exec "$container" sh -c 'bin/console debug:container database_connection >/dev/null 2>&1' 2>/dev/null; then
         ok "  ✓ database reachable"
     else
         # Not fatal — some plugin-external setups skip this path.  Warn only.

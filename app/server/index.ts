@@ -258,7 +258,19 @@ app.get('/api/system-info', cacheGet({ ttlMs: 60_000, tag: 'system' }), (c) => {
   const cpuCores = os.cpus().length
   const freeMemoryGB = +(os.freemem() / (1024 * 1024 * 1024)).toFixed(1)
   const totalMemoryGB = +(os.totalmem() / (1024 * 1024 * 1024)).toFixed(1)
-  const suggestedConcurrency = Math.min(Math.max(1, Math.floor(cpuCores / 2)), 4)
+  // Cap lowered from 4 → 2 in v0.6.13.  Background:
+  //   - Each concurrent create spins up 1 web container (PHP-FPM + Caddy)
+  //     + a parallel DB clone via mariadb + a composer install dry-run +
+  //     a cache:clear (full DI compile).  On most dev machines, 3+
+  //     parallel creates push OrbStack's docker daemon hard enough that
+  //     its DNS daemon stops answering — `swctl.orb.local` itself
+  //     becomes unreachable mid-batch (#15504/#6345/#5393/#6304 incident
+  //     2026-05-15: 4 parallel creates → load avg 15+/24+/34+ → docker
+  //     socket returned EOF → DNS NXDOMAIN for *.orb.local).
+  //   - 2 keeps OrbStack happy on every machine we've tested.  Users
+  //     who want more can bump the slider; the auto-default is the
+  //     safe baseline.
+  const suggestedConcurrency = Math.min(Math.max(1, Math.floor(cpuCores / 2)), 2)
   return c.json({ cpuCores, freeMemoryGB, totalMemoryGB, suggestedConcurrency })
 })
 
