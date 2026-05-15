@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.15"
+SWCTL_VERSION="0.6.16"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -2070,10 +2070,67 @@ _ensure_alpine_image() {
 # $3 sentinel relpath     (a file inside the source that proves population
 #                         succeeded — e.g. composer/installed.json for vendor,
 #                         package-lock.json for node_modules)
+# Compute a portable content key for a source dir.  Used to detect
+# when the host source has advanced past what's in `vendor-base-*`
+# / `*-nm-base-*` docker volumes (added 2026-05-15 after teammates
+# kept hitting "ClassNotFoundError: OpenSearch\\HttpClient\\GuzzleHttpClientFactory"
+# because their cached vendor volume was populated MONTHS ago at an
+# older trunk and there was no signal to invalidate it).
+#
+# For vendor we hash composer.lock — the canonical statement of what
+# versions SHOULD be installed.  For node_modules we hash either
+# package-lock.json or .package-lock.json (the latter is what npm
+# leaves inside node_modules/ after install).  Empty hash means
+# "couldn't compute" — caller treats as "no key" and falls back to
+# the old sentinel-only check.
+_compute_source_key() {
+    local src="$1"
+    local kind="${2:-}"   # 'vendor' | 'node_modules'
+
+    case "$kind" in
+        vendor)
+            # `$src` is the host's vendor/ dir.  Its sibling `composer.lock`
+            # lives in the parent (the project root).
+            local lock="$(dirname "$src")/composer.lock"
+            [ -f "$lock" ] || return 0
+            shasum -a 256 "$lock" 2>/dev/null | awk '{print $1}' \
+                || sha256sum "$lock" 2>/dev/null | awk '{print $1}' \
+                || true
+            ;;
+        node_modules)
+            # The .package-lock.json lives INSIDE node_modules and reflects
+            # what npm last installed.  Falling back to ../package-lock.json
+            # (the source of truth for the next install) when missing.
+            local hash_file=""
+            if [ -f "$src/.package-lock.json" ]; then
+                hash_file="$src/.package-lock.json"
+            elif [ -f "$(dirname "$src")/package-lock.json" ]; then
+                hash_file="$(dirname "$src")/package-lock.json"
+            fi
+            [ -n "$hash_file" ] || return 0
+            shasum -a 256 "$hash_file" 2>/dev/null | awk '{print $1}' \
+                || sha256sum "$hash_file" 2>/dev/null | awk '{print $1}' \
+                || true
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
 _ensure_base_volume_populated() {
     local vol="$1"
     local src="$2"
     local sentinel="${3:-.swctl-populated}"
+    # v0.6.16: optional 4th arg — content key from the source.  When
+    # provided, the fast-path additionally compares it against the
+    # stored .swctl-source-key inside the volume; mismatch triggers a
+    # repopulate (overlay via cp -a — readers might briefly see
+    # transitional state but that's strictly better than the OLD
+    # "populated once, stale forever" behaviour that bit teammates
+    # whose vendor volume was provisioned months before the
+    # opensearch-php 2.6.0 bump landed in trunk).
+    local source_key="${4:-}"
 
     docker volume inspect "$vol" >/dev/null 2>&1 || \
         docker volume create "$vol" >/dev/null
@@ -2084,7 +2141,16 @@ _ensure_base_volume_populated() {
     # a stale or partially-empty volume.
     if docker run --rm -v "${vol}:/v" alpine sh -c \
         "test -f /v/.ready && test -f /v/${sentinel}" 2>/dev/null; then
-        return 0
+        if [ -z "$source_key" ]; then
+            return 0
+        fi
+        # Compare stored key to current source key.  Match = fast path.
+        local stored_key
+        stored_key="$(docker run --rm -v "${vol}:/v" alpine cat /v/.swctl-source-key 2>/dev/null || true)"
+        if [ "$stored_key" = "$source_key" ]; then
+            return 0
+        fi
+        info "Shared volume '$vol' source key advanced (${stored_key:0:8}… → ${source_key:0:8}…); refreshing in-place."
     fi
 
     [ -d "$src" ] || { warn "Source '$src' missing; volume '$vol' will stay empty."; return 1; }
@@ -2122,10 +2188,23 @@ _ensure_base_volume_populated() {
     # volume) was invisible.
     local run_err
     run_err="$(mktemp)"
+    # Pass the source key through as an env var so the inline shell
+    # can write it AFTER cp -a + touch .ready.  Empty key → no marker
+    # written; subsequent reads fall back to "no key" path which is
+    # backward-compatible with volumes populated by older swctl.
     if ! docker run --rm \
         -v "${src}:/src:ro" \
         -v "${vol}:/dst" \
-        alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>"$run_err" >/dev/null; then
+        -e SWCTL_SOURCE_KEY="$source_key" \
+        alpine sh -c '
+            set -e
+            cp -a /src/. /dst/
+            touch /dst/.ready
+            if [ -n "${SWCTL_SOURCE_KEY:-}" ]; then
+                printf "%s" "$SWCTL_SOURCE_KEY" > /dst/.swctl-source-key
+            fi
+            chown -R 1000:1000 /dst
+        ' 2>"$run_err" >/dev/null; then
         err "Failed to populate volume '$vol' from '$src'."
         if [ -s "$run_err" ]; then
             # Indent so it's obviously the docker output, not swctl's own.
@@ -2397,17 +2476,26 @@ write_compose_volume_override() {
     # All volume ops are locked per-volume to avoid TOCTOU races when
     # multiple creates run in parallel.
     local _trunk_root="${PROJECT_ROOT:-/Users/ytran/Shopware/trunk}"
+    # v0.6.16: compute content-keys for shared volumes so a host-side
+    # composer/package upgrade triggers a transparent re-populate of
+    # the cached vendor/node_modules volume.  Empty when the host
+    # file is missing — _ensure_base_volume_populated falls back to
+    # the sentinel-only check (legacy behaviour).
+    local _vendor_key _admin_nm_key _sf_nm_key
+    _vendor_key="$(_compute_source_key "$_trunk_root/vendor" vendor)"
+    _admin_nm_key="$(_compute_source_key "$_trunk_root/src/Administration/Resources/app/administration/node_modules" node_modules)"
+    _sf_nm_key="$(_compute_source_key "$_trunk_root/src/Storefront/Resources/app/storefront/node_modules" node_modules)"
     # Vendor
     if [ "$vendor_is_shared" -eq 1 ]; then
         swctl_lock "volume-$VENDOR_VOLUME" _ensure_base_volume_populated \
-            "$VENDOR_VOLUME" "$_trunk_root/vendor" "autoload.php"
+            "$VENDOR_VOLUME" "$_trunk_root/vendor" "autoload.php" "$_vendor_key"
     else
         # Dedicated vendor volume — clone from base, then the container's
         # composer install step (triggered by the compose/provision path)
         # applies the lockfile diff.
         local _vendor_base="vendor-base-${SW_PROJECT_SLUG}"
         swctl_lock "volume-$_vendor_base" _ensure_base_volume_populated \
-            "$_vendor_base" "$_trunk_root/vendor" "autoload.php"
+            "$_vendor_base" "$_trunk_root/vendor" "autoload.php" "$_vendor_key"
         swctl_lock "volume-$VENDOR_VOLUME" _clone_docker_volume \
             "$_vendor_base" "$VENDOR_VOLUME" \
             || warn "Failed to clone vendor base → $VENDOR_VOLUME; container will install from scratch."
@@ -2416,11 +2504,11 @@ write_compose_volume_override() {
     local _admin_src="$_trunk_root/src/Administration/Resources/app/administration/node_modules"
     if [ "$admin_nm_is_shared" -eq 1 ]; then
         swctl_lock "volume-$ADMIN_NM_VOLUME" _ensure_base_volume_populated \
-            "$ADMIN_NM_VOLUME" "$_admin_src" ".package-lock.json"
+            "$ADMIN_NM_VOLUME" "$_admin_src" ".package-lock.json" "$_admin_nm_key"
     else
         local _admin_base="admin-nm-base-${SW_PROJECT_SLUG}"
         swctl_lock "volume-$_admin_base" _ensure_base_volume_populated \
-            "$_admin_base" "$_admin_src" ".package-lock.json"
+            "$_admin_base" "$_admin_src" ".package-lock.json" "$_admin_nm_key"
         swctl_lock "volume-$ADMIN_NM_VOLUME" _clone_docker_volume \
             "$_admin_base" "$ADMIN_NM_VOLUME" \
             || warn "Failed to clone admin_nm base → $ADMIN_NM_VOLUME; build may need npm install."
@@ -2429,11 +2517,11 @@ write_compose_volume_override() {
     local _sf_src="$_trunk_root/src/Storefront/Resources/app/storefront/node_modules"
     if [ "$sf_nm_is_shared" -eq 1 ]; then
         swctl_lock "volume-$STOREFRONT_NM_VOLUME" _ensure_base_volume_populated \
-            "$STOREFRONT_NM_VOLUME" "$_sf_src" ".package-lock.json"
+            "$STOREFRONT_NM_VOLUME" "$_sf_src" ".package-lock.json" "$_sf_nm_key"
     else
         local _sf_base="storefront-nm-base-${SW_PROJECT_SLUG}"
         swctl_lock "volume-$_sf_base" _ensure_base_volume_populated \
-            "$_sf_base" "$_sf_src" ".package-lock.json"
+            "$_sf_base" "$_sf_src" ".package-lock.json" "$_sf_nm_key"
         swctl_lock "volume-$STOREFRONT_NM_VOLUME" _clone_docker_volume \
             "$_sf_base" "$STOREFRONT_NM_VOLUME" \
             || warn "Failed to clone storefront_nm base → $STOREFRONT_NM_VOLUME; build may need npm install."
