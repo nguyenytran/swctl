@@ -157,6 +157,41 @@ teardown() {
 # order matters — assert it explicitly.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# v0.6.11 regression guard: when bootstrap_dependencies fails (e.g., a
+# transient docker exec error under parallel load), the rest of the
+# provision flow — most critically `_swctl_ensure_install_lock` — MUST
+# still run.  Before this guard, `set -euo pipefail` would propagate the
+# bootstrap error and kill the hook; the instance ended up with a fully-
+# cloned DB but no install.lock, so the storefront redirected to
+# /installer forever (#15504/#6345 incident on 2026-05-15).
+# ---------------------------------------------------------------------------
+
+@test "QA mode: bootstrap_dependencies failure does NOT prevent ensure_install_lock" {
+    COMPOSER_CHANGES=0
+    export COMPOSER_CHANGES
+    # Make bootstrap intentionally fail to simulate the parallel-load
+    # docker-exec-timeout case we observed.
+    _swctl_bootstrap_dependencies() {
+        printf 'bootstrap_dependencies %s [FAILED]\n' "$1" >> "$CALL_LOG"
+        return 1
+    }
+    export -f _swctl_bootstrap_dependencies
+
+    bash "$HOOK"
+
+    # Bootstrap ran and failed — recorded for visibility.
+    grep -q '^bootstrap_dependencies trunk-test \[FAILED\]$' "$CALL_LOG"
+
+    # But the post-bootstrap steps still ran.  Without the `|| warn`
+    # guard added in v0.6.11, these would be absent and the storefront
+    # would be stuck at /installer.
+    grep -q '^update_sales_channel trunk-test' "$CALL_LOG"
+    grep -q '^ensure_install_lock trunk-test$' "$CALL_LOG"
+    # And the final cache:clear fired
+    grep -q 'cache:clear' "$CALL_LOG"
+}
+
 @test "QA-mode flow: bootstrap_dependencies runs BEFORE migrations" {
     COMPOSER_CHANGES=5
     MIGRATION_CHANGES=2

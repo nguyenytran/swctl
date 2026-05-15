@@ -47,7 +47,21 @@ if [ "$SWCTL_MODE" = "qa" ]; then
     # bootstrap_dependencies' new `_vendor_satisfies_lockfile` jq check
     # is ~50 ms when the vendor is fresh (composer doesn't even boot).
     # Let that be the real gate.
-    _swctl_bootstrap_dependencies "$COMPOSE_PROJECT"
+    #
+    # v0.6.11: the bootstrap call is GUARDED with `|| warn` because under
+    # parallel load (batch creates of 4+ instances at once), an unrelated
+    # transient failure inside bootstrap (e.g., a docker exec timeout on a
+    # busy daemon) would propagate through `set -euo pipefail` and exit
+    # the script BEFORE _swctl_ensure_install_lock could fire.  Result:
+    # the worktree provisioned a fully-cloned DB but never touched
+    # `install.lock`, so the storefront kept redirecting to /installer.
+    # Recovery was one `touch install.lock + cache:clear` away — but the
+    # user saw STATUS=failed in the registry and assumed the whole create
+    # was unrecoverable.  Bootstrap errors are loud but non-fatal now;
+    # the install-lock + sales-channel-domain + cache:clear MUST always
+    # run, regardless of what bootstrap reports.
+    _swctl_bootstrap_dependencies "$COMPOSE_PROJECT" \
+        || warn "bootstrap_dependencies returned non-zero — continuing provision so install.lock + cache:clear still run."
     # Run migrations if the branch has schema changes
     if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected in QA mode. Running migrations."
@@ -64,8 +78,13 @@ fi
 
 # --- Dev mode ---
 
-# Bootstrap dependencies (composer install, npm install, JWT keys)
-_swctl_bootstrap_dependencies "$COMPOSE_PROJECT"
+# Bootstrap dependencies (composer install, npm install, JWT keys).
+# Guarded with `|| warn` for the same reason as the QA branch above:
+# a transient bootstrap failure must not prevent install.lock / sales
+# channel domain / cache:clear from running.  Recovery from a partial
+# bootstrap is cheap; recovery from an un-installed Shopware is messier.
+_swctl_bootstrap_dependencies "$COMPOSE_PROJECT" \
+    || warn "bootstrap_dependencies returned non-zero — continuing provision."
 
 if [ "$DB_STATE" = "fresh" ]; then
     # Fresh install
