@@ -184,12 +184,60 @@ teardown() {
     grep -q '^bootstrap_dependencies trunk-test \[FAILED\]$' "$CALL_LOG"
 
     # But the post-bootstrap steps still ran.  Without the `|| warn`
-    # guard added in v0.6.11, these would be absent and the storefront
-    # would be stuck at /installer.
+    # guards added in v0.6.11+v0.6.12, these would be absent and the
+    # storefront would be stuck at /installer.
     grep -q '^update_sales_channel trunk-test' "$CALL_LOG"
     grep -q '^ensure_install_lock trunk-test$' "$CALL_LOG"
     # And the final cache:clear fired
     grep -q 'cache:clear' "$CALL_LOG"
+}
+
+# ---------------------------------------------------------------------------
+# v0.6.12 regression guard: install.lock MUST be written FIRST in QA mode,
+# before bootstrap_dependencies / migrations / update_sales_channel_domain.
+# Reason: those later steps can fail under parallel-batch docker contention.
+# install.lock has no upstream dependency — the QA-mode DB is clone-from-
+# installed, so writing the file marker as the first act guarantees the
+# storefront NEVER ends up redirecting to /installer just because a later
+# step fell over.  Original incident: #15504/#6345/#5393/#6304 all
+# provisioned with fully-cloned DBs but no install.lock because a
+# downstream step's failure propagated through `set -euo pipefail`.
+# ---------------------------------------------------------------------------
+
+@test "QA-mode flow: ensure_install_lock runs BEFORE bootstrap_dependencies" {
+    COMPOSER_CHANGES=0
+    export COMPOSER_CHANGES
+    bash "$HOOK"
+
+    local lock_line boot_line
+    lock_line=$(grep -n '^ensure_install_lock trunk-test$'  "$CALL_LOG" | head -1 | cut -d: -f1)
+    boot_line=$(grep -n '^bootstrap_dependencies trunk-test$' "$CALL_LOG" | head -1 | cut -d: -f1)
+    [ -n "$lock_line" ]
+    [ -n "$boot_line" ]
+    [ "$lock_line" -lt "$boot_line" ]
+}
+
+# ---------------------------------------------------------------------------
+# v0.6.12 regression guard: ALL downstream QA-mode steps are best-effort.
+# Specifically tests that `update_sales_channel_domain` failure doesn't
+# bypass subsequent cache:clear.  Before v0.6.12, sales-channel-domain
+# was unguarded — its failure (e.g., container DB connection blip)
+# would set -e the script before cache:clear could run.
+# ---------------------------------------------------------------------------
+
+@test "QA mode: update_sales_channel_domain failure does NOT prevent cache:clear" {
+    COMPOSER_CHANGES=0
+    export COMPOSER_CHANGES
+    _swctl_update_sales_channel_domain() {
+        printf 'update_sales_channel %s %s [FAILED]\n' "$1" "$2" >> "$CALL_LOG"
+        return 1
+    }
+    export -f _swctl_update_sales_channel_domain
+
+    bash "$HOOK"
+
+    grep -q '\[FAILED\]' "$CALL_LOG"            # the failure was recorded
+    grep -q 'cache:clear' "$CALL_LOG"           # cache:clear still ran
 }
 
 @test "QA-mode flow: bootstrap_dependencies runs BEFORE migrations" {

@@ -60,8 +60,29 @@ if [ "$SWCTL_MODE" = "qa" ]; then
     # was unrecoverable.  Bootstrap errors are loud but non-fatal now;
     # the install-lock + sales-channel-domain + cache:clear MUST always
     # run, regardless of what bootstrap reports.
+    # v0.6.12: write install.lock FIRST.
+    #
+    # In QA mode the DB is cloned from a working installed Shopware, so the
+    # instance is "installed" by definition — install.lock is just a file
+    # marker that prevents Shopware's index controller from redirecting to
+    # /installer.  Writing it BEFORE any other step means: no matter what
+    # bootstrap / migrations / sales-channel-domain do, the storefront
+    # never gets stuck at /installer.
+    #
+    # The original ordering buried install.lock near the end, so a
+    # parallel-load docker-exec timeout in any earlier step propagated
+    # through `set -euo pipefail` and aborted before install.lock was
+    # touched (#15504/#6345 on 2026-05-15 morning, #5393/#6304 on the
+    # afternoon).
+    _swctl_ensure_install_lock "$COMPOSE_PROJECT" \
+        || warn "ensure_install_lock failed — manual fix: 'touch install.lock' inside the container."
+
+    # All subsequent QA-mode steps are STRICTLY BEST-EFFORT: each is
+    # guarded with `|| warn` so a single transient failure (e.g., the
+    # docker daemon serializing exec calls under heavy batch load)
+    # can't kill the rest of the hook.
     _swctl_bootstrap_dependencies "$COMPOSE_PROJECT" \
-        || warn "bootstrap_dependencies returned non-zero — continuing provision so install.lock + cache:clear still run."
+        || warn "bootstrap_dependencies returned non-zero — continuing."
     # Run migrations if the branch has schema changes
     if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected in QA mode. Running migrations."
@@ -69,8 +90,8 @@ if [ "$SWCTL_MODE" = "qa" ]; then
             "$WORKFLOW_CONSOLE database:migrate --all && $WORKFLOW_CONSOLE database:migrate-destructive --all" \
             || warn "Migrations failed."
     fi
-    _swctl_update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-    _swctl_ensure_install_lock "$COMPOSE_PROJECT"
+    _swctl_update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL" \
+        || warn "update_sales_channel_domain failed — admin URL may need manual fix."
     # Always clear cache so DI container / routing / config changes take effect
     run_app_command "$COMPOSE_PROJECT" "$WORKFLOW_CONSOLE cache:clear" || warn "cache:clear failed."
     return 0 2>/dev/null || exit 0
