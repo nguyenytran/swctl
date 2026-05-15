@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch, triggerRef } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useInstances } from '@/composables/useInstances'
 import { useActiveProject } from '@/composables/useActiveProject'
@@ -205,14 +205,33 @@ function handleDelete(inst: Instance) {
   }
 }
 
+// Per-instance pending action — same shape as Dashboard.  Drives
+// the spinner on each row's Stop/Start button while the API call is
+// in flight (visible feedback for the 1-3 s the docker socket needs).
+const pendingAction = ref<Map<string, 'stop' | 'start'>>(new Map())
+
 async function handleStop(inst: Instance) {
-  await stopInstance(inst.issueId)
-  refresh()
+  pendingAction.value.set(inst.issueId, 'stop')
+  triggerRef(pendingAction)
+  try {
+    await stopInstance(inst.issueId)
+  } finally {
+    pendingAction.value.delete(inst.issueId)
+    triggerRef(pendingAction)
+    refresh()
+  }
 }
 
 async function handleStart(inst: Instance) {
-  await startInstance(inst.issueId)
-  refresh()
+  pendingAction.value.set(inst.issueId, 'start')
+  triggerRef(pendingAction)
+  try {
+    await startInstance(inst.issueId)
+  } finally {
+    pendingAction.value.delete(inst.issueId)
+    triggerRef(pendingAction)
+    refresh()
+  }
 }
 
 function statusDot(inst: Instance) {
@@ -488,14 +507,26 @@ watch(() => stream.result.value, (val) => {
           <div class="ml-auto flex items-center gap-2">
             <button
               v-if="inst.status === 'complete' && inst.containerStatus === 'exited'"
-              class="text-xs text-emerald-400 hover:text-emerald-300 transition-colors"
+              class="text-xs text-emerald-400 hover:text-emerald-300 transition-colors disabled:opacity-60 disabled:cursor-wait"
+              :disabled="pendingAction.get(inst.issueId) === 'start'"
               @click="handleStart(inst)"
-            >Start</button>
+            >
+              <span v-if="pendingAction.get(inst.issueId) === 'start'" class="inline-flex items-center gap-1">
+                <span class="inline-block animate-spin">↻</span>Starting…
+              </span>
+              <span v-else>Start</span>
+            </button>
             <button
               v-if="inst.status === 'complete' && inst.containerStatus === 'running'"
-              class="text-xs text-yellow-400 hover:text-yellow-300 transition-colors"
+              class="text-xs text-yellow-400 hover:text-yellow-300 transition-colors disabled:opacity-60 disabled:cursor-wait"
+              :disabled="pendingAction.get(inst.issueId) === 'stop'"
               @click="handleStop(inst)"
-            >Stop</button>
+            >
+              <span v-if="pendingAction.get(inst.issueId) === 'stop'" class="inline-flex items-center gap-1">
+                <span class="inline-block animate-spin">↻</span>Stopping…
+              </span>
+              <span v-else>Stop</span>
+            </button>
             <button
               class="text-xs text-red-400 hover:text-red-300 transition-colors"
               @click="handleDelete(inst)"

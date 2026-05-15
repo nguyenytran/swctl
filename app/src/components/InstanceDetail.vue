@@ -390,19 +390,40 @@ function scrollWtTerminal() {
   })
 }
 
+// Single-instance pending action — visual feedback for the
+// Stop/Start/Restart buttons in the InstanceDetail header.  Null
+// when idle.  Restart counts as "stop" for the spinner since visually
+// the user is asking the container to go down briefly.
+const lifecycleAction = ref<'stop' | 'start' | 'restart' | null>(null)
+
 async function handleStop() {
-  await stopInstance(props.instance.issueId)
-  emit('refresh')
+  lifecycleAction.value = 'stop'
+  try {
+    await stopInstance(props.instance.issueId)
+  } finally {
+    lifecycleAction.value = null
+    emit('refresh')
+  }
 }
 
 async function handleStart() {
-  await startInstance(props.instance.issueId)
-  emit('refresh')
+  lifecycleAction.value = 'start'
+  try {
+    await startInstance(props.instance.issueId)
+  } finally {
+    lifecycleAction.value = null
+    emit('refresh')
+  }
 }
 
 async function handleRestart() {
-  await restartInstance(props.instance.issueId)
-  emit('refresh')
+  lifecycleAction.value = 'restart'
+  try {
+    await restartInstance(props.instance.issueId)
+  } finally {
+    lifecycleAction.value = null
+    emit('refresh')
+  }
 }
 
 function handleRefresh() {
@@ -543,19 +564,31 @@ function formatDate(iso: string) {
         >Open Admin</a>
         <button
           v-if="instance.containerStatus === 'running'"
-          class="px-3 py-1 text-xs bg-yellow-600/20 text-yellow-400 border border-yellow-600/30 rounded hover:bg-yellow-600/30 transition-colors"
+          class="px-3 py-1 text-xs bg-yellow-600/20 text-yellow-400 border border-yellow-600/30 rounded hover:bg-yellow-600/30 transition-colors disabled:opacity-60 disabled:cursor-wait inline-flex items-center gap-1"
+          :disabled="lifecycleAction !== null"
           @click="handleStop"
-        >Stop</button>
+        >
+          <span v-if="lifecycleAction === 'stop'" class="inline-block animate-spin">↻</span>
+          {{ lifecycleAction === 'stop' ? 'Stopping…' : 'Stop' }}
+        </button>
         <button
           v-if="instance.containerStatus === 'exited'"
-          class="px-3 py-1 text-xs bg-emerald-600/20 text-emerald-400 border border-emerald-600/30 rounded hover:bg-emerald-600/30 transition-colors"
+          class="px-3 py-1 text-xs bg-emerald-600/20 text-emerald-400 border border-emerald-600/30 rounded hover:bg-emerald-600/30 transition-colors disabled:opacity-60 disabled:cursor-wait inline-flex items-center gap-1"
+          :disabled="lifecycleAction !== null"
           @click="handleStart"
-        >Start</button>
+        >
+          <span v-if="lifecycleAction === 'start'" class="inline-block animate-spin">↻</span>
+          {{ lifecycleAction === 'start' ? 'Starting…' : 'Start' }}
+        </button>
         <button
           v-if="instance.containerStatus === 'running'"
-          class="px-3 py-1 text-xs bg-blue-600/20 text-blue-400 border border-blue-600/30 rounded hover:bg-blue-600/30 transition-colors"
+          class="px-3 py-1 text-xs bg-blue-600/20 text-blue-400 border border-blue-600/30 rounded hover:bg-blue-600/30 transition-colors disabled:opacity-60 disabled:cursor-wait inline-flex items-center gap-1"
+          :disabled="lifecycleAction !== null"
           @click="handleRestart"
-        >Restart</button>
+        >
+          <span v-if="lifecycleAction === 'restart'" class="inline-block animate-spin">↻</span>
+          {{ lifecycleAction === 'restart' ? 'Restarting…' : 'Restart' }}
+        </button>
         <button
           v-if="instance.containerStatus === 'running' && instance.status === 'complete'"
           class="px-3 py-1 text-xs bg-purple-600/20 text-purple-400 border border-purple-600/30 rounded hover:bg-purple-600/30 transition-colors disabled:opacity-50"

@@ -3,7 +3,18 @@ import type { Instance } from '@/types'
 import { usePlugins, buildPluginContext } from '@/composables/usePlugins'
 import { computed } from 'vue'
 
-const props = defineProps<{ instance: Instance; selected: boolean }>()
+const props = defineProps<{
+  instance: Instance
+  selected: boolean
+  /**
+   * Which row-level action is currently in flight for this instance,
+   * if any.  Drives the spinner + disabled state on the Stop/Start
+   * buttons so the user sees feedback while the API call is pending
+   * (stop/start can take ~1-3 s under load).  Parent owns the state;
+   * Row is purely presentational.  Null/undefined = idle.
+   */
+  loadingAction?: 'stop' | 'start' | null
+}>()
 const emit = defineEmits<{
   delete: []
   retry: []
@@ -185,19 +196,29 @@ function provisionBadge(status: string) {
       <template v-else>
         <button
           v-if="instance.containerStatus === 'running'"
-          class="text-xs text-yellow-400 hover:text-yellow-300 transition-colors"
+          class="text-xs text-yellow-400 hover:text-yellow-300 transition-colors disabled:opacity-60 disabled:cursor-wait"
+          :disabled="loadingAction === 'stop'"
           @click="emit('stop')"
-          title="Stop container"
+          :title="loadingAction === 'stop' ? 'Stopping…' : 'Stop container'"
         >
-          Stop
+          <span v-if="loadingAction === 'stop'" class="inline-flex items-center gap-1">
+            <span class="inline-block animate-spin">↻</span>
+            Stopping…
+          </span>
+          <span v-else>Stop</span>
         </button>
         <button
           v-if="instance.containerStatus === 'exited'"
-          class="text-xs text-emerald-400 hover:text-emerald-300 transition-colors"
+          class="text-xs text-emerald-400 hover:text-emerald-300 transition-colors disabled:opacity-60 disabled:cursor-wait"
+          :disabled="loadingAction === 'start'"
           @click="emit('start')"
-          title="Start container"
+          :title="loadingAction === 'start' ? 'Starting…' : 'Start container'"
         >
-          Start
+          <span v-if="loadingAction === 'start'" class="inline-flex items-center gap-1">
+            <span class="inline-block animate-spin">↻</span>
+            Starting…
+          </span>
+          <span v-else>Start</span>
         </button>
         <button
           class="text-xs text-red-400 hover:text-red-300 transition-colors"
