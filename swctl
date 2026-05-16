@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.16"
+SWCTL_VERSION="0.6.17"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -4238,13 +4238,44 @@ _run_preflight_checks() {
             "Run 'swctl init' to create the shared network + supporting containers" || failed=1
     fi
 
-    # 4. Shared mariadb container running — source for per-instance DB
-    #    clones.  `swctl init` starts it; if it crashed or was manually
-    #    stopped, every clone-based provision will hang.
-    local db_container="${SW_INFRA_DB_CONTAINER:-swctl-mariadb}"
-    _preflight_one "shared mariadb running ($db_container)" \
-        "docker ps --filter 'name=^${db_container}\$' --format '{{.Names}}' | grep -q ." \
-        "Run 'swctl init' to start the shared mariadb (or 'docker start ${db_container}')" || failed=1
+    # 4. Database container running — source for per-instance DB clones,
+    #    and the DNS target every per-instance container resolves via the
+    #    project network.
+    #
+    # Two setups in the wild:
+    #   - Project's own compose provides the `database` alias (e.g.
+    #     `trunk-database-1` aliased as `database` in `trunk_default`).
+    #     This is what shopware/shopware's own docker-compose.yml does
+    #     and what every per-instance container expects.  When the
+    #     project's database container exits (OrbStack restart,
+    #     load-induced kill, etc.), per-instance containers get
+    #     `SQLSTATE[HY000] [2002] getaddrinfo for database failed:
+    #     Name does not resolve` at boot — even though swctl-mariadb
+    #     is still alive.  (Real incident 2026-05-16: thrashing load 67
+    #     killed trunk-database-1 without restart policy; next
+    #     `swctl create` succeeded preflight against swctl-mariadb but
+    #     the instance was DOA on first request.)
+    #   - Legacy/standalone swctl-managed mariadb (`swctl init` setups
+    #     that pre-date project-side compose).
+    #
+    # Detection: look for `<project_slug>-database-1` in ANY state.
+    # If it exists, the project owns its database — preflight must
+    # check THAT and offer a project-side remedy.  Otherwise fall back
+    # to the legacy swctl-mariadb check.
+    local _project_db=""
+    if [ -n "${PROJECT_SLUG:-}" ]; then
+        _project_db="$(docker ps -a --filter "name=^${PROJECT_SLUG}-database-1$" --format '{{.Names}}' 2>/dev/null | head -1)"
+    fi
+    if [ -n "$_project_db" ]; then
+        _preflight_one "project database running ($_project_db)" \
+            "docker ps --filter 'name=^${_project_db}\$' --format '{{.Names}}' | grep -q ." \
+            "Run 'cd ${PROJECT_ROOT:-<project-root>} && docker compose up -d' — project's own database is down" || failed=1
+    else
+        local db_container="${SW_INFRA_DB_CONTAINER:-swctl-mariadb}"
+        _preflight_one "shared mariadb running ($db_container)" \
+            "docker ps --filter 'name=^${db_container}\$' --format '{{.Names}}' | grep -q ." \
+            "Run 'swctl init' to start the shared mariadb (or 'docker start ${db_container}')" || failed=1
+    fi
 
     # 5. Alpine image cached.  populate_volume() spawns alpine to copy
     #    files; a cold pull from a docker config that uses a credential
