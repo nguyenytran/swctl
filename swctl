@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.18"
+SWCTL_VERSION="0.6.19"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -4214,6 +4214,46 @@ _run_preflight_checks() {
     _preflight_one "docker daemon" \
         'docker info' \
         'Start Docker Desktop / OrbStack and retry' || failed=1
+
+    # 1b. Host load average sanity (v0.6.19).
+    #
+    # When the host is thrashing, every docker op in this create —
+    # `compose up`, 3× alpine `cp -a` volume clones (~1.5 GB vendor,
+    # ~500 MB-1 GB admin/storefront node_modules each), and the
+    # mariadb-dump DB clone — hits a sluggish daemon and is 10-100×
+    # more likely to hang or SIGTERM mid-flight.  Refusing the create
+    # NOW saves the user from the stale-registry / half-cloned-DB
+    # cascade we hit repeatedly on 2026-05-15 / 16 when load spiked
+    # from 27 to 67 across the day.  (Recovery from those was a
+    # documented multi-step manual heal; preventing the failure is
+    # cheaper.)
+    #
+    # 1-minute load is the right window — it captures "right now" vs
+    # the 5/15-min averages which lag and might already include the
+    # user's earlier failed batch's spike.  Threshold default 10:
+    # modern Macs (M-series, ~8-12 cores) sit around load 1-3 idle;
+    # sustained load > 10 means OrbStack + heavy host apps are
+    # competing for cores.  Override with SWCTL_MAX_LOAD=N to tune
+    # (or 0 to disable).
+    local max_load="${SWCTL_MAX_LOAD:-10}"
+    if [ "$max_load" != "0" ]; then
+        # uptime's load-average line is the same shape on macOS and
+        # Linux modulo "averages" vs "average".  Strip commas (Linux
+        # uses them between values), take the first number (1-min
+        # window), floor to int for shell comparison.
+        local load_1m
+        load_1m="$(uptime 2>/dev/null \
+            | awk -F'load averages?:' '{print $2}' \
+            | tr -d ',' \
+            | awk '{printf "%d", $1}')"
+        if [ -n "$load_1m" ] && [ "$load_1m" -gt "$max_load" ]; then
+            printf '[preflight] ✗ host load too high (1-min avg: %s, threshold: %s)\n' "$load_1m" "$max_load" >&2
+            printf '            └─ Wait until load <%s (run `uptime`), or close heavy apps (Claude Desktop / Chrome / Telegram / antivirus), or set SWCTL_MAX_LOAD=999 to skip.\n' "$max_load" >&2
+            failed=1
+        else
+            printf '[preflight] ✓ host load OK (1-min avg: %s, threshold: %s)\n' "${load_1m:-?}" "$max_load"
+        fi
+    fi
 
     # 2. Compose templates accessible — installed by Homebrew tap into
     #    pkgshare, or read from the project root in dev installs.
