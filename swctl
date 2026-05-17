@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.19"
+SWCTL_VERSION="0.6.20"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -3259,8 +3259,31 @@ _postflight_instance_ready() {
         rc=1
     fi
 
+    # Helper: retry a docker-exec check with 2 s backoff before giving up.
+    #
+    # v0.6.20: under heavy host load (load avg > 30), even a trivial
+    # `docker exec test -f path` can return non-zero or hang briefly
+    # because the docker daemon is queuing requests behind the
+    # currently-running compose-up / volume-clone work.  v0.6.13 added
+    # retry to the /admin probe; this generalises the same retry shape
+    # to all the docker-exec file/dir checks below.  Two attempts
+    # with 2 s sleep between is enough to absorb a transient stall
+    # while still failing clearly when the container is genuinely
+    # broken (the genuinely-broken case fails BOTH attempts in <100ms).
+    _postflight_docker_check() {
+        local check_cmd="$1"
+        local attempt
+        for attempt in 1 2; do
+            if docker exec "$container" sh -c "$check_cmd" 2>/dev/null; then
+                return 0
+            fi
+            [ "$attempt" -lt 2 ] && sleep 2
+        done
+        return 1
+    }
+
     # 3. Media dir writable by the container (admin uploads need this).
-    if docker exec "$container" sh -c 'test -w /var/www/html/public/media' 2>/dev/null; then
+    if _postflight_docker_check 'test -w /var/www/html/public/media'; then
         ok "  ✓ public/media is writable"
     else
         err "  ✗ public/media is read-only — admin uploads will fail with mkdir() errors."
@@ -3269,7 +3292,7 @@ _postflight_instance_ready() {
     fi
 
     # 4. Vendor populated (admin/storefront builds depend on autoload.php).
-    if docker exec "$container" test -f /var/www/html/vendor/autoload.php 2>/dev/null; then
+    if _postflight_docker_check 'test -f /var/www/html/vendor/autoload.php'; then
         ok "  ✓ vendor/autoload.php present"
     else
         err "  ✗ vendor/autoload.php missing — Shopware will not boot."
@@ -3278,7 +3301,7 @@ _postflight_instance_ready() {
     fi
 
     # 5. public/index.php must exist for Caddy to route any request.
-    if docker exec "$container" test -f /var/www/html/public/index.php 2>/dev/null; then
+    if _postflight_docker_check 'test -f /var/www/html/public/index.php'; then
         ok "  ✓ public/index.php present"
     else
         err "  ✗ public/index.php missing — worktree is incomplete."
@@ -3296,7 +3319,9 @@ _postflight_instance_ready() {
     # which is a proper DI-container probe: succeeds iff the connection
     # service can be resolved, and doesn't depend on any optional
     # console namespace.
-    if docker exec "$container" sh -c 'bin/console debug:container database_connection >/dev/null 2>&1' 2>/dev/null; then
+    # Retried: PHP kernel boot is the slowest postflight op (~3-5 s
+    # cold).  Under load it can exceed 10 s — single-shot is brittle.
+    if _postflight_docker_check 'bin/console debug:container database_connection >/dev/null 2>&1'; then
         ok "  ✓ database reachable"
     else
         # Not fatal — some plugin-external setups skip this path.  Warn only.
