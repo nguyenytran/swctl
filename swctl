@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.20"
+SWCTL_VERSION="0.6.22"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -1926,6 +1926,45 @@ print('sync_dirs=\"{}\"'.format(' '.join(dirs)))
     fi
 }
 
+# v0.6.21: detect composer.lock drift between the worktree and trunk
+# (the project root that vendor-base-* was populated from).  Returns 0
+# if a drift is present, 1 if no drift or the check could not run.
+#
+# Why: in projects where composer.lock is gitignored (Shopware does this
+# for trunk + every worktree) the diff-based COMPOSER_CHANGES counter
+# can't see lock drift.  A branch that locked newer flysystem / removed
+# a package will get COMPOSER_CHANGES=0 from `count_changes`, which
+# routes the instance to the shared `vendor-base-trunk` volume — mounted
+# RO.  Bootstrap then sees the lock-vs-installed.json mismatch, tries
+# `composer install` against the RO mount, fails, and tags STATUS=failed
+# every time.  (#6072 incident 2026-05-17 was a textbook example.)
+#
+# Healing here: hash worktree's composer.lock vs the on-host trunk
+# composer.lock that `vendor-base-*` mirrors.  Differ → return 0 →
+# caller bumps COMPOSER_CHANGES so `resolve_vendor_volume` picks a
+# dedicated `vendor-<issue>` volume (cloned from base, writable), and
+# the in-container composer install succeeds.
+#
+# Never throws.  Missing lock on either side, missing hash util, or
+# WORKTREE_PATH=PROJECT_ROOT (trunk refresh) all return 1 (= no drift).
+_composer_lock_drifted_from_trunk() {
+    local wt_root="${WORKTREE_PATH:-}"
+    local trunk_root="${PROJECT_ROOT:-}"
+    [ -n "$wt_root" ] && [ -n "$trunk_root" ] || return 1
+    # Same path → not a worktree refresh; nothing to compare.
+    [ "$wt_root" = "$trunk_root" ] && return 1
+    local wt_lock="$wt_root/composer.lock"
+    local trunk_lock="$trunk_root/composer.lock"
+    [ -f "$wt_lock" ] && [ -f "$trunk_lock" ] || return 1
+    local h_wt h_trunk
+    h_wt="$( { shasum -a 256 "$wt_lock" 2>/dev/null \
+        || sha256sum "$wt_lock" 2>/dev/null; } | awk '{print $1}')"
+    h_trunk="$( { shasum -a 256 "$trunk_lock" 2>/dev/null \
+        || sha256sum "$trunk_lock" 2>/dev/null; } | awk '{print $1}')"
+    [ -n "$h_wt" ] && [ -n "$h_trunk" ] || return 1
+    [ "$h_wt" != "$h_trunk" ]
+}
+
 count_changes() {
     local diff_files="$1"
 
@@ -1965,6 +2004,15 @@ print('pat_backend=\"{}\"'.format(d.get('backend', '\\\\.php\$')))
     BACKEND_CHANGES="$(printf '%s\n' "$diff_files" | grep -E "$pat_backend" | grep -Evc "$pat_migration|$pat_entity" || true)"
     # Backward compat: FRONTEND_CHANGES = ADMIN + STOREFRONT
     FRONTEND_CHANGES="$((ADMIN_CHANGES + STOREFRONT_CHANGES))"
+
+    # v0.6.21: bump COMPOSER_CHANGES on gitignored-composer.lock drift.
+    # Detail in _composer_lock_drifted_from_trunk's header comment.
+    # Quiet on create (no worktree yet) — only fires on refresh of an
+    # existing worktree whose lockfile diverges from trunk's.
+    if _composer_lock_drifted_from_trunk; then
+        info "composer.lock drift detected vs ${SW_BASE_BRANCH:-trunk} — forcing dedicated vendor volume."
+        COMPOSER_CHANGES=$((COMPOSER_CHANGES + 1))
+    fi
 }
 
 sync_worktree_deps() {
@@ -2188,11 +2236,32 @@ _ensure_base_volume_populated() {
     # volume) was invisible.
     local run_err
     run_err="$(mktemp)"
+    # v0.6.22: name the populate container deterministically and
+    # pre-kill any orphan with the same name.  Background:
+    # `docker run --rm` does NOT tie container lifetime to the parent
+    # shell — if swctl gets SIGKILL'd (UI restart, user Ctrl-C, OOM)
+    # while cp -a is mid-flight, the alpine container keeps running
+    # orphaned.  The next swctl run would then remove the (now-stale)
+    # swctl_lock for this volume and spawn a SECOND `cp -a` concurrent
+    # with the orphan, racing them on the same /dst — partial files,
+    # weird permission states, occasional hangs.  (2026-05-17 incident
+    # surfaced this when `swctl-ui restart` killed an in-flight
+    # populate and the next create's swctl_lock stale-recovery removed
+    # the dead-pid lock without seeing the still-running alpine
+    # container.)
+    #
+    # Fix: name the container `swctl-populate-<vol>` so docker enforces
+    # uniqueness atomically, and `docker rm -f` pre-emptively before
+    # the run so an orphan is terminated and removed.  swctl_lock still
+    # serializes parallel creates of the same project; this is the
+    # belt-and-suspenders cleanup that runs once we hold the lock.
+    local _populate_name="swctl-populate-${vol}"
+    docker rm -f "$_populate_name" >/dev/null 2>&1 || true
     # Pass the source key through as an env var so the inline shell
     # can write it AFTER cp -a + touch .ready.  Empty key → no marker
     # written; subsequent reads fall back to "no key" path which is
     # backward-compatible with volumes populated by older swctl.
-    if ! docker run --rm \
+    if ! docker run --rm --name "$_populate_name" \
         -v "${src}:/src:ro" \
         -v "${vol}:/dst" \
         -e SWCTL_SOURCE_KEY="$source_key" \
@@ -2211,6 +2280,10 @@ _ensure_base_volume_populated() {
             sed 's/^/  /' "$run_err" >&2
         fi
         rm -f "$run_err"
+        # If the docker run failed mid-way the container may have stuck
+        # around in "exited" or "created" state — clear it so the next
+        # invocation isn't blocked by a duplicate-name error.
+        docker rm -f "$_populate_name" >/dev/null 2>&1 || true
         return 1
     fi
     rm -f "$run_err"
@@ -2238,7 +2311,12 @@ _clone_docker_volume() {
 
     local run_err
     run_err="$(mktemp)"
-    if ! docker run --rm \
+    # v0.6.22: name the clone container + pre-kill any orphan.  Same
+    # rationale as in _ensure_base_volume_populated — see that
+    # function's `_populate_name` block for the full explanation.
+    local _clone_name="swctl-clone-${dst}"
+    docker rm -f "$_clone_name" >/dev/null 2>&1 || true
+    if ! docker run --rm --name "$_clone_name" \
         -v "${src}:/src:ro" \
         -v "${dst}:/dst" \
         alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>"$run_err" >/dev/null; then
@@ -2247,6 +2325,7 @@ _clone_docker_volume() {
             sed 's/^/  /' "$run_err" >&2
         fi
         rm -f "$run_err"
+        docker rm -f "$_clone_name" >/dev/null 2>&1 || true
         return 1
     fi
     rm -f "$run_err"
@@ -5981,6 +6060,53 @@ cmd_start() {
     ok "Started '$ISSUE_ID'."
 }
 
+# v0.6.21: probe a STATUS=failed instance for actual liveness before
+# letting cmd_refresh re-run the full ~10 min provisioning pipeline.
+#
+# Background: under heavy host load (load avg 20+), postflight checks
+# could flag a healthy instance as failed (a docker exec stalled
+# briefly, /admin took >8 s on a cold PHP-FPM, etc.).  v0.6.20 added
+# retry-with-backoff to the postflight checks themselves, which fixes
+# MOST first-time false alarms.  But once an instance is tagged
+# STATUS=failed, the next `swctl refresh` would re-run sync +
+# DB-provision + frontend-build + postflight (each of which can
+# false-alarm AGAIN), making "retry from UI" a 10-min dice roll under
+# load.  (#6072 incident 2026-05-17: instance running fine on HTTP
+# 200, retried 4× from the UI, each retry died at composer install
+# step against a RO-mounted vendor — see _composer_lock_drifted_from_trunk
+# for that companion fix.)
+#
+# Behaviour: only fires when STATUS=failed AND the compose container
+# is running.  Runs `_postflight_instance_ready` once.  If it passes
+# the instance is genuinely healthy — the STATUS=failed flag was
+# stale from a prior false-alarm cycle — so flip STATUS=complete and
+# return 0 to short-circuit cmd_refresh.  If it doesn't pass, return
+# 1 to fall through to the full resume path.  Never runs for
+# STATUS=creating / provisioning-deferred (those truly need the full
+# pipeline; the instance was never finished).
+#
+# Caller pre-condition: COMPOSE_PROJECT, APP_URL, ISSUE_ID,
+# SWCTL_ACTIVE_META_FILE are populated.
+#
+# Returns: 0 = healed and registry updated, 1 = fast-path did not
+# apply OR postflight failed (caller continues to full resume).
+_resume_fast_path_heal() {
+    [ "${STATUS:-complete}" = "failed" ] || return 1
+    container_running "${COMPOSE_PROJECT}-${SW_SERVICE_NAME:-web}-1" || return 1
+    info "Worktree '$ISSUE_ID' has STATUS=failed. Probing instance health before re-provisioning…"
+    if ! _postflight_instance_ready "$COMPOSE_PROJECT" "$APP_URL"; then
+        info "Postflight did not pass — falling through to full re-provisioning."
+        return 1
+    fi
+    ok "Instance is healthy — STATUS=failed was a stale flag from a previous postflight false alarm."
+    STATUS="complete"
+    FAILED_AT=""
+    write_metadata "$SWCTL_ACTIVE_META_FILE"
+    ok "Worktree '$ISSUE_ID' healed without re-provisioning."
+    info "URL: ${APP_URL}"
+    return 0
+}
+
 cmd_refresh() {
     local issue_input="${1:-}"
     SWCTL_ACTIVE_META_FILE=""
@@ -5998,11 +6124,10 @@ cmd_refresh() {
     if [ "${STATUS:-complete}" = "failed" ] \
        || [ "${STATUS:-complete}" = "creating" ] \
        || [ "${STATUS:-complete}" = "provisioning-deferred" ]; then
-        info "Worktree '$ISSUE_ID' has status '${STATUS}'. Resuming provisioning..."
-        STATUS="creating"
-        ensure_infra_ready
 
-        # Recompute derived variables not stored in metadata
+        # Recompute derived variables not stored in metadata.  Done BEFORE
+        # the fast-path heal below so _postflight_instance_ready has
+        # COMPOSE_PROJECT + APP_URL ready.
         WORKTREE_ID="${WORKTREE_ID:-$ISSUE_ID}"
         if [ -z "${COMPOSE_PROJECT:-}" ]; then
             COMPOSE_PROJECT="$(sanitize_slug "${SW_PROJECT_SLUG}-${ISSUE_ID}")"
@@ -6020,6 +6145,19 @@ cmd_refresh() {
             fi
             APP_URL="http://${DOMAIN}"
         fi
+
+        # v0.6.21 fast-path heal — see `_resume_fast_path_heal` header
+        # for the full rationale.  TL;DR: when STATUS=failed but the
+        # instance is actually serving HTTP 200, flip metadata to
+        # complete in ~3-5 s instead of running the 10-min full
+        # re-provision pipeline that would just false-alarm again.
+        if _resume_fast_path_heal; then
+            return
+        fi
+
+        info "Worktree '$ISSUE_ID' has status '${STATUS}'. Resuming provisioning..."
+        STATUS="creating"
+        ensure_infra_ready
 
         # On any exit while STATUS=creating, mark as failed
         trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
