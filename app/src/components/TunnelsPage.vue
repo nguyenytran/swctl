@@ -159,11 +159,20 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
         <span v-if="cfgDomain" class="text-xs text-gray-500 font-mono">sw-&lt;issue&gt;.{{ cfgDomain }}</span>
       </button>
       <div v-if="showConfig" class="px-3 pb-3 space-y-3 border-t border-white/5 pt-3">
-        <p class="text-xs text-gray-500">
-          Saved to the project's <code class="font-mono">.swctl.conf</code>. The tunnel must have a wildcard
-          <code class="font-mono">*.&lt;domain&gt;</code> DNS record and credentials at
-          <code class="font-mono">~/.cloudflared/&lt;tunnel-id&gt;.json</code>.
-        </p>
+        <p class="text-xs text-gray-500">Saved to the project's <code class="font-mono">.swctl.conf</code>.</p>
+
+        <!-- Login / setup help: cloudflared login is an interactive browser
+             flow, so it can't run from the UI — show the exact terminal steps. -->
+        <details class="text-xs text-gray-500 bg-black/20 rounded border border-white/5">
+          <summary class="cursor-pointer px-2 py-1.5 hover:text-gray-300">How do I log in / set up a tunnel?</summary>
+          <div class="px-2 pb-2 space-y-1 text-gray-400">
+            <p>Run these in your terminal (login opens a browser — it can't be done from here):</p>
+            <pre class="whitespace-pre-wrap font-mono text-[11px] text-gray-300 bg-black/30 rounded p-2 leading-relaxed">cloudflared tunnel login                       # pick the {{ cfgDomain || 'your-domain' }} zone
+cloudflared tunnel create swctl-preview         # creates the tunnel + creds
+cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}'   # wildcard DNS</pre>
+            <p>Then hit <span class="font-mono">↻</span> next to “Tunnel” to refresh the list and pick it.</p>
+          </div>
+        </details>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label class="block">
             <span class="text-xs text-gray-400">Preview domain</span>
