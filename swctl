@@ -7515,6 +7515,20 @@ cmd_clean() {
     # was lost but the sidecar is still up.
     docker rm -f "swctl-preview-$(sanitize_slug "$ISSUE_ID")" >/dev/null 2>&1 || true
 
+    # Tear down a named preview (if configured) so the shared tunnel stops
+    # routing sw-<issue>.<domain> to this now-deleted instance.  The DB
+    # sales-channel domain removal is moot (the instance DB is dropped below),
+    # so we just drop the per-issue ingress rule and reload the shared tunnel.
+    if [ -n "${SW_PREVIEW_DOMAIN:-}" ] && [ -n "${SW_PREVIEW_TUNNEL_ID:-}" ]; then
+        local _named_ingress
+        _named_ingress="$(_named_ingress_dir)/$(_named_domain_for "$ISSUE_ID").yml"
+        if [ -f "$_named_ingress" ]; then
+            rm -f "$_named_ingress"
+            _named_assemble_and_reload >/dev/null 2>&1 || true
+            info "Removed named preview $(_named_domain_for "$ISSUE_ID")."
+        fi
+    fi
+
     # Plugin-aware cleanup: remove nested plugin worktrees before trunk cleanup
     # In the new flow, plugin-external instances ARE trunk worktrees with a
     # nested plugin git worktree inside.  We must detach that plugin worktree
