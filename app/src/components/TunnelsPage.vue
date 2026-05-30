@@ -250,17 +250,17 @@ cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}' 
         </details>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label class="block">
-            <span class="text-xs text-gray-400">Preview domain</span>
+            <span class="text-xs text-gray-400 flex items-center h-5">Preview domain</span>
             <input
               v-model="cfgDomain"
               type="text"
               placeholder="y-tn.dev"
               spellcheck="false"
-              class="mt-1 w-full bg-surface border border-border rounded px-2 py-1 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
+              class="mt-1 w-full h-9 box-border bg-surface border border-border rounded px-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
             />
           </label>
           <label class="block">
-            <span class="text-xs text-gray-400 flex items-center gap-2">
+            <span class="text-xs text-gray-400 flex items-center gap-2 h-5">
               Tunnel
               <span v-if="cfLoading" class="inline-block w-3 h-3 border-2 border-gray-500 border-t-transparent rounded-full animate-spin" />
               <button type="button" class="text-gray-500 hover:text-gray-300" title="Reload tunnels" @click="loadCfTunnels">↻</button>
@@ -269,7 +269,7 @@ cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}' 
             <select
               v-if="cfTunnels.length"
               v-model="cfgTunnelId"
-              class="mt-1 w-full bg-surface border border-border rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500"
+              class="mt-1 w-full h-9 box-border bg-surface border border-border rounded px-2 text-sm text-white focus:outline-none focus:border-blue-500"
             >
               <option value="" disabled>Select a tunnel…</option>
               <option v-for="t in cfTunnels" :key="t.id" :value="t.id">
@@ -286,7 +286,7 @@ cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}' 
               type="text"
               placeholder="502a0836-…  (tunnel UUID)"
               spellcheck="false"
-              class="mt-1 w-full bg-surface border border-border rounded px-2 py-1 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
+              class="mt-1 w-full h-9 box-border bg-surface border border-border rounded px-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
             />
             <span v-if="cfError" class="mt-1 block text-xs text-amber-400/80">{{ cfError }}</span>
             <span
