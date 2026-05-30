@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import {
   getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig,
-  listCloudflaredTunnels, startCloudflaredLogin, cloudflaredLoginStatus, cancelCloudflaredLogin, getCloudflaredAccount,
+  listCloudflaredTunnels, startCloudflaredLogin, cloudflaredLoginStatus, cancelCloudflaredLogin, getCloudflaredAccount, createCloudflaredTunnel,
   type Tunnel, type CloudflaredTunnel, type CloudflaredAccount,
 } from '@/api'
 import ConfirmDialog from './ConfirmDialog.vue'
@@ -107,6 +107,34 @@ async function cancelLogin() {
   try { await cancelCloudflaredLogin() } catch {}
   loginState.value = 'idle'
   loginUrl.value = ''
+}
+
+// Create a new tunnel (+ wildcard DNS) from the UI.
+const newTunnelName = ref('swctl-preview')
+const creating = ref(false)
+const createMsg = ref('')
+
+async function createTunnel() {
+  if (!newTunnelName.value.trim()) return
+  creating.value = true
+  createMsg.value = ''
+  try {
+    const r = await createCloudflaredTunnel(newTunnelName.value.trim(), cfgDomain.value.trim())
+    if (r.ok && r.id) {
+      await loadCfTunnels()
+      cfgTunnelId.value = r.id
+      await saveConfig()
+      createMsg.value = r.dnsWarning
+        ? `Created “${r.name}” and selected it. DNS note: ${r.dnsWarning}`
+        : `Created “${r.name}”, wildcard DNS added, and selected it.`
+    } else {
+      createMsg.value = `Failed: ${r.error || 'unknown error'}`
+    }
+  } catch (e: any) {
+    createMsg.value = `Failed: ${e?.message || String(e)}`
+  } finally {
+    creating.value = false
+  }
 }
 
 async function loadCfTunnels() {
@@ -266,6 +294,30 @@ onUnmounted(() => { if (timer) clearInterval(timer); stopLoginPoll() })
           <a :href="loginUrl" target="_blank" rel="noopener" class="text-sky-400 hover:underline">click here</a>,
           pick the <span class="font-mono">{{ cfgDomain || 'your' }}</span> zone, and this updates automatically.
         </p>
+
+        <!-- Create a new tunnel (+ wildcard DNS) from the UI. -->
+        <div v-if="account.loggedIn" class="flex items-end gap-2 flex-wrap">
+          <label class="block">
+            <span class="text-xs text-gray-400">New tunnel name</span>
+            <input
+              v-model="newTunnelName"
+              type="text"
+              spellcheck="false"
+              class="mt-1 w-48 h-9 box-border bg-surface border border-border rounded px-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
+            />
+          </label>
+          <button
+            type="button"
+            class="h-9 px-3 text-sm rounded font-medium bg-gray-700 hover:bg-gray-600 text-white disabled:opacity-60 inline-flex items-center gap-2"
+            :disabled="creating || !newTunnelName.trim()"
+            :title="cfgDomain ? `Creates the tunnel and adds *.${cfgDomain} DNS` : 'Set a domain above first for wildcard DNS'"
+            @click="createTunnel"
+          >
+            <span v-if="creating" class="inline-block w-3 h-3 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
+            {{ creating ? 'Creating…' : 'Create tunnel' }}
+          </button>
+          <span v-if="createMsg" class="text-xs text-gray-400">{{ createMsg }}</span>
+        </div>
 
         <details class="text-xs text-gray-500 bg-black/20 rounded border border-white/5">
           <summary class="cursor-pointer px-2 py-1.5 hover:text-gray-300">Or set it up from the terminal</summary>

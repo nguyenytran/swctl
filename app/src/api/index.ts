@@ -185,6 +185,15 @@ export async function cancelCloudflaredLogin(): Promise<{ ok: boolean }> {
   return res.json()
 }
 
+export async function createCloudflaredTunnel(name: string, domain: string): Promise<{ ok: boolean; id?: string; name?: string; dnsWarning?: string; error?: string }> {
+  const res = await fetch(`${BASE}/cloudflared/create-tunnel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, domain }),
+  })
+  return res.json()
+}
+
 export async function getTunnelConfig(): Promise<TunnelConfig> {
   const res = await fetch(`${BASE}/tunnel-config`)
   return res.json()

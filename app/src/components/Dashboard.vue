@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, triggerRef } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, triggerRef } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useInstances } from '@/composables/useInstances'
 import { useProjects } from '@/composables/useProjects'
@@ -14,7 +14,8 @@ import ConfirmDialog from './ConfirmDialog.vue'
 import InstanceDetail from './InstanceDetail.vue'
 import PluginSlot from './PluginSlot.vue'
 import { usePlugins } from '@/composables/usePlugins'
-import { buildStreamUrl, buildCreateUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject } from '@/api'
+import { useFeatures } from '@/composables/useFeatures'
+import { buildStreamUrl, buildCreateUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject, getTunnels } from '@/api'
 import type { Instance, ExternalWorktree } from '@/types'
 
 const route = useRoute()
@@ -248,7 +249,29 @@ watch(lastEvent, (event) => {
 // Re-fetch on mount so navigating here from another route (e.g. from
 // the /resolve plugin page after a run just finished) always shows the
 // latest instances without a manual page reload.
-onMounted(() => { refresh() })
+// Per-instance preview URLs (feature-gated). Shown as a 🌐 badge on each row.
+const { features } = useFeatures()
+const tunnelByIssue = ref<Record<string, string>>({})
+let tunnelTimer: ReturnType<typeof setInterval> | null = null
+
+async function loadTunnels() {
+  if (!features.value.tunnelsEnabled) { tunnelByIssue.value = {}; return }
+  try {
+    const r = await getTunnels()
+    const map: Record<string, string> = {}
+    for (const t of r.tunnels || []) {
+      if (t.issue && t.url && !map[t.issue]) map[t.issue] = t.url
+    }
+    tunnelByIssue.value = map
+  } catch { /* ignore */ }
+}
+
+onMounted(() => {
+  refresh()
+  loadTunnels()
+  tunnelTimer = setInterval(loadTunnels, 10_000)
+})
+onUnmounted(() => { if (tunnelTimer) clearInterval(tunnelTimer) })
 
 // If the user lands on /dashboard/instance/<id> for an instance we haven't
 // loaded yet (e.g. just-created), refresh so the detail view can render it.
@@ -358,6 +381,7 @@ watch(() => route.params.issueId, (id) => {
               :instance="inst"
               :selected="selected.has(inst.issueId)"
               :loading-action="pendingAction.get(inst.issueId) || null"
+              :tunnel-url="tunnelByIssue[inst.issueId]"
               @toggle-select="toggleSelect(inst.issueId)"
               @delete="handleDelete(inst.issueId, inst.linkedPlugins.length > 0)"
               @retry="handleRetry(inst.issueId)"

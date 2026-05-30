@@ -14,6 +14,8 @@ const props = defineProps<{
    * Row is purely presentational.  Null/undefined = idle.
    */
   loadingAction?: 'stop' | 'start' | null
+  /** Public preview URL for this instance, if a tunnel is running (feature-gated). */
+  tunnelUrl?: string
 }>()
 const emit = defineEmits<{
   delete: []
@@ -92,6 +94,15 @@ function provisionBadge(status: string) {
       >
         {{ provisionBadge(instance.status)!.text }}
       </span>
+      <a
+        v-if="tunnelUrl"
+        :href="tunnelUrl"
+        target="_blank"
+        rel="noopener"
+        class="ml-2 text-[10px] px-1.5 py-0.5 rounded border border-sky-500/30 text-sky-300 bg-sky-500/10 hover:bg-sky-500/20"
+        :title="tunnelUrl"
+        @click.stop
+      >🌐 preview</a>
     </td>
     <td class="px-4 py-3 text-gray-400 max-w-[200px] truncate" :title="instance.branch">
       {{ instance.branch || '—' }}

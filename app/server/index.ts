@@ -1426,6 +1426,48 @@ app.delete('/api/cloudflared/login', (c) => {
   return c.json({ ok: true })
 })
 
+// Create a new named tunnel + wildcard DNS, from the UI. Requires login.
+app.post('/api/cloudflared/create-tunnel', async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const name = String(body.name ?? '').trim()
+  const domain = String(body.domain ?? '').trim()
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) return c.json({ ok: false, error: 'Invalid tunnel name (letters, digits, - _)' }, 400)
+  if (domain && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(domain)) return c.json({ ok: false, error: 'Invalid domain' }, 400)
+  const home = cfHome()
+  if (!fs.existsSync(`${home}/.cloudflared/cert.pem`)) return c.json({ ok: false, error: 'Not logged in to Cloudflare' }, 400)
+
+  const run = (args: string) => execSync(
+    `docker run --rm --user 0:0 -e TUNNEL_ORIGIN_CERT=/etc/cloudflared/cert.pem ` +
+    `-v ${home}/.cloudflared:/etc/cloudflared cloudflare/cloudflared:latest ${args}`,
+    { stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 },
+  ).toString()
+
+  let id = ''
+  try {
+    const out = run(`tunnel create ${name}`)
+    const m = out.match(/with id ([0-9a-f-]{36})/) || out.match(/([0-9a-f]{8}-[0-9a-f-]{27})/)
+    id = m ? m[1] : ''
+  } catch (e: any) {
+    return c.json({ ok: false, error: (e?.stderr?.toString?.() || e?.message || String(e)).slice(0, 300) }, 400)
+  }
+  if (!id) return c.json({ ok: false, error: 'Tunnel created but its id could not be parsed' }, 500)
+
+  // Wildcard DNS so any sw-<issue>.<domain> resolves. Single-quote the '*' so
+  // the container shell doesn't glob it. Best-effort: tolerate "already exists".
+  let dnsWarning: string | undefined
+  if (domain) {
+    try { run(`tunnel route dns ${name} '*.${domain}'`) }
+    catch (e: any) { dnsWarning = (e?.stderr?.toString?.() || '').slice(0, 200) || undefined }
+  }
+  // Restore ownership of the freshly-written creds + cert to the dir's owner.
+  try {
+    const st = fs.statSync(`${home}/.cloudflared`)
+    if (fs.existsSync(`${home}/.cloudflared/${id}.json`)) fs.chownSync(`${home}/.cloudflared/${id}.json`, st.uid, st.gid)
+    fs.chownSync(`${home}/.cloudflared/cert.pem`, st.uid, st.gid)
+  } catch {}
+  return c.json({ ok: true, id, name, dnsWarning })
+})
+
 // Named-preview tunnel configuration (SW_PREVIEW_* in the project's .swctl.conf).
 app.get('/api/tunnel-config', (c) => {
   const cfg = readProjectConfig()
