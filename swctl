@@ -6107,6 +6107,212 @@ _resume_fast_path_heal() {
     return 0
 }
 
+# Snapshot the per-instance database to a compressed dump under
+# $SWCTL_STATE_DIR/instances/<project>/<issue>/snapshots/<name>.sql.gz.
+#
+# Subcommands:
+#   swctl snapshot <issue>                  → create with auto-name `auto-<unix-ts>`
+#   swctl snapshot <issue> <name>           → create with given name
+#   swctl snapshot <issue> --list           → list snapshots
+#   swctl snapshot <issue> --delete <name>  → remove a snapshot
+#
+# Why dump (not docker-volume snapshot): swctl uses a SHARED mariadb
+# container (`swctl-mariadb`), not a per-instance DB container.  The
+# volume holds every instance's data — so a volume snapshot is wrong by
+# construction.  `mariadb-dump --single-transaction --quick` is the
+# logical-level equivalent that targets one database.  Cost: 5-20 s for
+# a typical Shopware install vs ~1 s for a volume swap, but correctness
+# matters more here.
+#
+# Restore-while-running is safe enough for typical dev use — the app
+# container will see the new schema after `cache:clear`.  We warn loudly
+# but don't stop the app container automatically.
+cmd_snapshot() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl snapshot <issue> [<name>|--list|--delete <name>]"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" \
+        || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+    [ -n "${DB_NAME:-}" ] || die "Instance '${ISSUE_ID:-$issue_input}' has no DB_NAME in metadata."
+
+    local snap_dir
+    snap_dir="$(_snapshot_dir)"
+    mkdir -p "$snap_dir"
+
+    case "${2:-}" in
+        --list|-l)
+            _snapshot_list "$snap_dir"
+            return
+            ;;
+        --delete|-d|--rm)
+            local name="${3:-}"
+            [ -n "$name" ] || die "Usage: swctl snapshot <issue> --delete <name>"
+            _snapshot_delete "$snap_dir" "$name"
+            return
+            ;;
+    esac
+
+    # Default action: create snapshot with given or auto name.
+    local name="${2:-auto-$(date +%s)}"
+    # Sanitize: only allow [A-Za-z0-9._-] in snapshot names so they're
+    # filesystem-safe across all platforms.
+    case "$name" in
+        *[!A-Za-z0-9._-]*) die "Snapshot name '${name}' contains invalid characters. Use only [A-Za-z0-9._-]." ;;
+    esac
+    _snapshot_create "$snap_dir" "$name"
+}
+
+# Restore a previously-taken snapshot.  Always prompts for confirmation
+# because this overwrites the live per-instance database.
+cmd_restore() {
+    local issue_input="${1:-}"
+    local name="${2:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl restore <issue> <name>"
+    [ -n "$name" ] || die "Usage: swctl restore <issue> <name>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" \
+        || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+    [ -n "${DB_NAME:-}" ] || die "Instance '${ISSUE_ID:-$issue_input}' has no DB_NAME in metadata."
+
+    local snap_dir
+    snap_dir="$(_snapshot_dir)"
+    _snapshot_restore "$snap_dir" "$name"
+}
+
+# Resolve the snapshots directory for the currently-loaded instance.
+# Caller must have populated SW_PROJECT_SLUG and ISSUE_ID via
+# load_instance_metadata first.
+_snapshot_dir() {
+    printf '%s/instances/%s/%s/snapshots' "$SWCTL_STATE_DIR" "$SW_PROJECT_SLUG" "$ISSUE_ID"
+}
+
+_snapshot_create() {
+    local snap_dir="$1" name="$2"
+    local file="${snap_dir}/${name}.sql.gz"
+
+    if [ -e "$file" ]; then
+        die "Snapshot '${name}' already exists at ${file}. Delete it first or pick another name."
+    fi
+
+    require_cmd docker
+    require_cmd gzip
+
+    local db_container
+    db_container="$(resolve_db_container)"
+    container_running "$db_container" || die "Database container '${db_container}' is not running."
+
+    info "Snapshotting database '${DB_NAME}' → ${file}"
+    local t_start="$SECONDS"
+
+    # --single-transaction → consistent dump without table locks (InnoDB only).
+    # --quick → stream rows instead of buffering; safe for big tables.
+    # Pipe to gzip so the on-disk file is ~5-10× smaller.
+    if ! docker exec -i "$db_container" mariadb-dump \
+            -u "$SW_DB_ROOT_USER" "-p$SW_DB_ROOT_PASSWORD" \
+            --single-transaction --quick "$DB_NAME" 2>/dev/null \
+            | gzip -c > "$file"; then
+        rm -f "$file"
+        die "mariadb-dump failed for database '${DB_NAME}' on container '${db_container}'."
+    fi
+
+    local size elapsed
+    size="$(_snapshot_human_size "$file")"
+    elapsed=$((SECONDS - t_start))
+    ok "Snapshot '${name}' created (${size}, ${elapsed}s)."
+}
+
+_snapshot_restore() {
+    local snap_dir="$1" name="$2"
+    local file="${snap_dir}/${name}.sql.gz"
+
+    [ -f "$file" ] \
+        || die "Snapshot '${name}' not found at ${file}. Run 'swctl snapshot ${ISSUE_ID} --list' to see available snapshots."
+
+    require_cmd docker
+    require_cmd gzip
+
+    local db_container
+    db_container="$(resolve_db_container)"
+    container_running "$db_container" || die "Database container '${db_container}' is not running."
+
+    warn "Restoring snapshot '${name}' will OVERWRITE database '${DB_NAME}' on instance '${ISSUE_ID}'."
+    warn "All current data in that database will be replaced."
+    local confirm
+    confirm="$(prompt_text "Type 'yes' to confirm")"
+    if [ "$confirm" != "yes" ]; then
+        info "Aborted."
+        return 1
+    fi
+
+    info "Restoring '${name}' → '${DB_NAME}'..."
+    local t_start="$SECONDS"
+
+    # Drop + recreate so the dump's CREATE TABLE statements don't collide
+    # with existing tables that the snapshot doesn't cover (orphans from
+    # plugins installed after the snapshot was taken).
+    if ! docker exec -i "$db_container" mariadb \
+            -u "$SW_DB_ROOT_USER" "-p$SW_DB_ROOT_PASSWORD" \
+            -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`; CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
+        die "Failed to drop+recreate database '${DB_NAME}'."
+    fi
+
+    if ! gunzip -c "$file" | docker exec -i "$db_container" mariadb \
+            -u "$SW_DB_ROOT_USER" "-p$SW_DB_ROOT_PASSWORD" "$DB_NAME"; then
+        die "Restore failed during SQL import."
+    fi
+
+    local elapsed=$((SECONDS - t_start))
+    ok "Restored '${name}' in ${elapsed}s."
+    info "Run 'swctl exec ${ISSUE_ID} \"bin/console cache:clear\"' to drop stale Symfony cache."
+}
+
+_snapshot_list() {
+    local snap_dir="$1"
+
+    if [ ! -d "$snap_dir" ] || ! ls "$snap_dir"/*.sql.gz >/dev/null 2>&1; then
+        info "No snapshots for issue '${ISSUE_ID}'."
+        return 0
+    fi
+
+    printf '%-30s  %10s  %s\n' "NAME" "SIZE" "CREATED"
+    printf '%-30s  %10s  %s\n' "----" "----" "-------"
+    local f
+    for f in "$snap_dir"/*.sql.gz; do
+        [ -f "$f" ] || continue
+        local n s c
+        n="$(basename "$f" .sql.gz)"
+        s="$(_snapshot_human_size "$f")"
+        c="$(_snapshot_mtime_human "$f")"
+        printf '%-30s  %10s  %s\n' "$n" "$s" "$c"
+    done
+}
+
+_snapshot_delete() {
+    local snap_dir="$1" name="$2"
+    local file="${snap_dir}/${name}.sql.gz"
+    [ -f "$file" ] || die "Snapshot '${name}' not found at ${file}."
+    rm -f "$file"
+    ok "Deleted snapshot '${name}'."
+}
+
+# du -h is portable across macOS/Linux and gives "12K" / "4.0M" style output.
+_snapshot_human_size() {
+    du -h "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# macOS uses `stat -f`, GNU uses `stat -c`.  Try macOS first; if it
+# fails, fall back to GNU.  Both produce "YYYY-MM-DD HH:MM"-ish strings.
+_snapshot_mtime_human() {
+    stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$1" 2>/dev/null \
+        || stat -c '%y' "$1" 2>/dev/null | cut -d. -f1
+}
+
 cmd_refresh() {
     local issue_input="${1:-}"
     SWCTL_ACTIVE_META_FILE=""
@@ -8377,6 +8583,8 @@ Usage:
   swctl code <issue> [--claude|--codex|--phpstorm|--code|--cursor]
   swctl switch <issue> --qa|--dev
   swctl clean <issue>
+  swctl snapshot <issue> [<name>|--list|--delete <name>]
+  swctl restore <issue> <name>
   swctl resolve [--select] [--jobs N] <issue...>
   swctl resolve resume <issue>
   swctl resolve status
@@ -8406,6 +8614,11 @@ Commands:
   code        Open worktree in an editor: --phpstorm (default), --claude, --codex, --code, --cursor.
   switch      Switch a worktree between QA and Dev mode (rebuilds only what's needed).
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
+  snapshot    Snapshot the per-instance database to a compressed dump under
+              ~/.local/state/swctl/instances/<project>/<issue>/snapshots/<name>.sql.gz.
+              No args → auto-name. --list → list snapshots. --delete <name> → remove one.
+  restore     Restore a previously-taken snapshot. Drops + recreates the per-instance DB
+              before importing. Always prompts to confirm.
   resolve     Dispatch issues to Claude Code for automated resolution and manage results.
               swctl resolve [--select] [--github <owner/repo>] [--jobs N] [--supervised] <issue...>
               swctl resolve resume <issue>          Resume a paused Claude session.
@@ -10478,6 +10691,16 @@ main() {
             ensure_state_dirs
             shift
             cmd_kill_exec "${1:-}"
+            ;;
+        snapshot|snap)
+            ensure_state_dirs
+            shift
+            cmd_snapshot "$@"
+            ;;
+        restore)
+            ensure_state_dirs
+            shift
+            cmd_restore "$@"
             ;;
         refresh)
             ensure_state_dirs
