@@ -6639,10 +6639,14 @@ _preview_stop_all() {
         return 0
     fi
     info "Stopping all swctl preview tunnels…"
+    local n
+    n="$(printf '%s\n' "$ids" | grep -c .)"
     # shellcheck disable=SC2086
-    docker rm -f $ids >/dev/null 2>&1 \
-        && ok "Stopped $(printf '%s\n' "$ids" | grep -c .) preview tunnel(s)." \
-        || warn "Some tunnels could not be removed; check 'docker ps -a'."
+    if docker rm -f $ids >/dev/null 2>&1; then
+        ok "Stopped ${n} preview tunnel(s)."
+    else
+        warn "Some tunnels could not be removed; check 'docker ps -a'."
+    fi
 }
 
 # === Named preview tunnels =================================================
