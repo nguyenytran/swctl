@@ -6,6 +6,7 @@ import { stopInstance, startInstance, restartInstance, buildStreamUrl, killExec,
 import {
   listSnapshots, createSnapshot, deleteSnapshot, restoreSnapshot,
   getPreviewStatus, startPreview, stopPreview,
+  getNamedPreview, startNamedPreview, stopNamedPreview,
   type Snapshot,
 } from '@/api'
 import { usePlugins } from '@/composables/usePlugins'
@@ -312,6 +313,12 @@ const previewRunning = ref(false)
 const previewUrl = ref<string | null>(null)
 const previewMessage = ref('')
 
+// Named preview — stable sw-<issue>.<domain> tunnel (shared per project).
+const namedLoading = ref(false)
+const namedRunning = ref(false)
+const namedUrl = ref<string | null>(null)
+const namedMessage = ref('')
+
 const snapshots = ref<Snapshot[]>([])
 const snapshotsLoading = ref(false)
 const snapshotName = ref('')
@@ -319,7 +326,48 @@ const snapshotBusy = ref<string | null>(null)  // name currently being acted on
 const snapshotMessage = ref('')
 
 async function loadOps() {
-  await Promise.all([loadPreview(), loadSnapshots()])
+  await Promise.all([loadPreview(), loadNamedPreview(), loadSnapshots()])
+}
+
+async function loadNamedPreview() {
+  namedLoading.value = true
+  try {
+    const r = await getNamedPreview(props.instance.issueId)
+    namedRunning.value = r.running
+    namedUrl.value = r.url
+  } finally {
+    namedLoading.value = false
+  }
+}
+
+async function toggleNamedPreview() {
+  namedLoading.value = true
+  namedMessage.value = ''
+  try {
+    if (namedRunning.value) {
+      const r = await stopNamedPreview(props.instance.issueId)
+      namedMessage.value = r.ok ? 'Named tunnel stopped.' : `Stop failed: ${r.output}`
+      namedRunning.value = false
+      namedUrl.value = null
+    } else {
+      const r = await startNamedPreview(props.instance.issueId)
+      if (r.ok && r.url) {
+        namedRunning.value = true
+        namedUrl.value = r.url
+        namedMessage.value = 'Named tunnel live.'
+      } else {
+        namedMessage.value = `Start failed: ${r.output}`
+      }
+    }
+  } finally {
+    namedLoading.value = false
+  }
+}
+
+async function copyNamedUrl() {
+  if (!namedUrl.value) return
+  try { await navigator.clipboard.writeText(namedUrl.value); namedMessage.value = 'URL copied to clipboard.' }
+  catch { namedMessage.value = 'Clipboard unavailable — copy manually.' }
 }
 
 async function loadPreview() {
@@ -1149,6 +1197,55 @@ function formatDate(iso: string) {
                 : (previewRunning ? 'Stop tunnel' : 'Start tunnel') }}
             </button>
             <span v-if="previewMessage" class="text-xs text-gray-400">{{ previewMessage }}</span>
+          </div>
+        </section>
+
+        <!-- Named preview / stable domain (sw-<issue>.<domain>) -->
+        <section class="rounded border border-gray-700 bg-gray-800/50 p-4">
+          <header class="mb-3 flex items-center justify-between">
+            <h3 class="text-base font-semibold text-white">Stable preview</h3>
+            <span
+              class="text-xs px-2 py-0.5 rounded"
+              :class="namedRunning ? 'bg-emerald-700/40 text-emerald-200' : 'bg-gray-700 text-gray-400'"
+            >
+              {{ namedRunning ? 'Live' : 'Stopped' }}
+            </span>
+          </header>
+
+          <p class="text-xs text-gray-400 mb-3">
+            Fixed domain <code class="font-mono">sw-{{ instance.issueId }}.&lt;domain&gt;</code> via the shared
+            tunnel. Auto-registers the storefront sales-channel domain. Requires
+            <code class="font-mono">SW_PREVIEW_DOMAIN</code> + <code class="font-mono">SW_PREVIEW_TUNNEL_ID</code> in
+            <code class="font-mono">.swctl.conf</code>.
+          </p>
+
+          <div v-if="namedUrl" class="flex items-center gap-2 mb-3">
+            <a
+              :href="namedUrl"
+              target="_blank"
+              rel="noopener"
+              class="flex-1 truncate font-mono text-sm text-sky-300 hover:underline"
+            >{{ namedUrl }}</a>
+            <button
+              class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+              @click="copyNamedUrl"
+            >Copy</button>
+          </div>
+
+          <div class="flex items-center gap-3">
+            <button
+              :disabled="namedLoading"
+              class="px-3 py-1.5 text-sm rounded font-medium"
+              :class="namedRunning
+                ? 'bg-rose-700 hover:bg-rose-600 text-white'
+                : 'bg-emerald-700 hover:bg-emerald-600 text-white'"
+              @click="toggleNamedPreview"
+            >
+              {{ namedLoading
+                ? (namedRunning ? 'Stopping…' : 'Starting…')
+                : (namedRunning ? 'Stop named tunnel' : 'Start named tunnel') }}
+            </button>
+            <span v-if="namedMessage" class="text-xs text-gray-400">{{ namedMessage }}</span>
           </div>
         </section>
 

@@ -152,6 +152,22 @@ export async function stopPreview(issueId: string): Promise<{ ok: boolean; outpu
   return res.json()
 }
 
+// Named preview (stable sw-<issue>.<domain>) — per instance.
+export async function getNamedPreview(issueId: string): Promise<{ ok: boolean; running: boolean; url: string | null }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/named-preview`)
+  return res.json()
+}
+
+export async function startNamedPreview(issueId: string): Promise<{ ok: boolean; url: string | null; output: string }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/named-preview`, { method: 'POST' })
+  return res.json()
+}
+
+export async function stopNamedPreview(issueId: string): Promise<{ ok: boolean; output: string }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/named-preview`, { method: 'DELETE' })
+  return res.json()
+}
+
 // Fleet-wide tunnel management (quick + named) for the Tunnels panel.
 export interface Tunnel {
   issue: string

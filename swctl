@@ -6336,6 +6336,8 @@ _snapshot_mtime_human() {
 #   swctl preview <issue>            → start tunnel, print URL
 #   swctl preview <issue> --stop     → tear down tunnel (instance keeps running)
 #   swctl preview <issue> --status   → show current tunnel URL / state
+#   swctl preview <issue> --named    → stable sw-<issue>.<domain> tunnel
+#   swctl preview <issue> --named --stop → stop the named tunnel
 #   swctl preview list               → table of ALL tunnels (quick + named)
 #   swctl preview stop-all           → stop every swctl quick tunnel
 #
@@ -6368,23 +6370,28 @@ cmd_preview() {
     load_instance_metadata "$meta_file"
     SWCTL_ACTIVE_META_FILE="$meta_file"
 
-    case "${2:-}" in
-        --stop|stop)
-            _preview_stop
-            return
-            ;;
-        --status|status)
-            _preview_status
-            return
-            ;;
-        "")
-            _preview_start
-            return
-            ;;
-        *)
-            die "Usage: swctl preview <issue> [--stop|--status]"
-            ;;
-    esac
+    # Scan flags after <issue> (order-independent): --named, --stop, --status.
+    local want_named=0 want_stop=0 want_status=0 a
+    shift || true
+    for a in "$@"; do
+        case "$a" in
+            --named|named)   want_named=1 ;;
+            --stop|stop)     want_stop=1 ;;
+            --status|status) want_status=1 ;;
+            *) die "Usage: swctl preview <issue> [--named] [--stop|--status]" ;;
+        esac
+    done
+
+    if [ "$want_named" -eq 1 ]; then
+        [ "$want_status" -eq 1 ] && { _named_status; return; }
+        [ "$want_stop" -eq 1 ] && { _named_stop; return; }
+        _named_start
+        return
+    fi
+
+    if [ "$want_stop" -eq 1 ]; then _preview_stop; return; fi
+    if [ "$want_status" -eq 1 ]; then _preview_status; return; fi
+    _preview_start
 }
 
 # Deterministic container name → docker enforces uniqueness atomically.
@@ -6568,13 +6575,30 @@ _preview_list() {
     done < <(docker ps -a --filter 'label=swctl-preview' \
         --format '{{.Label "swctl-preview"}}|{{.Label "swctl-preview-type"}}|{{.Label "swctl-preview-url"}}|{{.Names}}|{{.State}}' 2>/dev/null)
 
-    # Unlinked named tunnels: cloudflared containers with no swctl-preview label.
-    while IFS='|' read -r name state lbl; do
+    # Named previews served by a shared per-project tunnel: read the ingress.d
+    # set (one file per hostname). Each maps to an instance via the sw-<issue>
+    # hostname; status comes from whether that project's shared container runs.
+    local ph pj phost pissue pcontainer pstate
+    for ph in "$HOME"/.cloudflared/swctl-ingress.d/*/*.yml; do
+        [ -e "$ph" ] || continue
+        pj="$(basename "$(dirname "$ph")")"
+        phost="$(grep -m1 'hostname:' "$ph" | sed 's/.*hostname:[[:space:]]*//')"
+        [ -n "$phost" ] || continue
+        pissue="${phost#sw-}"; pissue="${pissue%%.*}"
+        pcontainer="swctl-tunnel-${pj}"
+        if container_running "$pcontainer"; then pstate="running"; else pstate="stopped"; fi
+        records+=("${pissue}|named|${pcontainer}|${pstate}|https://${phost}")
+    done
+
+    # Unlinked named tunnels: cloudflared containers that are neither a labeled
+    # quick tunnel nor a shared swctl tunnel (e.g. a hand-rolled one).
+    while IFS='|' read -r name state lbl tproj; do
         [ -n "$name" ] || continue
-        [ -n "$lbl" ] && continue   # already listed above (linked)
+        [ -n "$lbl" ] && continue       # labeled quick tunnel — already listed
+        [ -n "$tproj" ] && continue     # shared swctl tunnel — listed via ingress.d
         records+=("|named|${name}|${state}|")
     done < <(docker ps -a --filter 'ancestor=cloudflare/cloudflared:latest' \
-        --format '{{.Names}}|{{.State}}|{{.Label "swctl-preview"}}' 2>/dev/null)
+        --format '{{.Names}}|{{.State}}|{{.Label "swctl-preview"}}|{{.Label "swctl-tunnel-project"}}' 2>/dev/null)
 
     if [ "$json" -eq 1 ]; then
         # jq is a hard dependency — build well-formed JSON safely.
@@ -6619,6 +6643,148 @@ _preview_stop_all() {
     docker rm -f $ids >/dev/null 2>&1 \
         && ok "Stopped $(printf '%s\n' "$ids" | grep -c .) preview tunnel(s)." \
         || warn "Some tunnels could not be removed; check 'docker ps -a'."
+}
+
+# === Named preview tunnels =================================================
+# A stable per-instance domain (sw-<issue>.$SW_PREVIEW_DOMAIN) served by ONE
+# shared cloudflared container per project. A wildcard *.<domain> DNS record
+# routes every sw-<issue> hostname to the shared tunnel; per-issue ingress
+# rules under ~/.cloudflared/swctl-ingress.d/<project>/ map each hostname to
+# that instance's web container. Start/stop rewrites the ingress set, reloads
+# the shared container, and (un)registers the sales-channel domain + trusted
+# proxies so the storefront resolves over HTTPS.  Requires in .swctl.conf:
+#   SW_PREVIEW_DOMAIN=y-tn.dev
+#   SW_PREVIEW_TUNNEL_ID=<cloudflared tunnel UUID with wildcard *.<domain> DNS>
+_named_domain_for()  { printf 'sw-%s.%s' "$1" "${SW_PREVIEW_DOMAIN}"; }
+_named_ingress_dir() { printf '%s/.cloudflared/swctl-ingress.d/%s' "$HOME" "${SW_PROJECT_SLUG}"; }
+_named_config_file() { printf '%s/.cloudflared/swctl-tunnel-%s.yml' "$HOME" "${SW_PROJECT_SLUG}"; }
+_named_container()   { printf 'swctl-tunnel-%s' "${SW_PROJECT_SLUG}"; }
+
+_named_require_config() {
+    [ -n "${SW_PREVIEW_DOMAIN:-}" ]    || die "Named previews need SW_PREVIEW_DOMAIN (e.g. y-tn.dev) in .swctl.conf."
+    [ -n "${SW_PREVIEW_TUNNEL_ID:-}" ] || die "Named previews need SW_PREVIEW_TUNNEL_ID (cloudflared tunnel UUID) in .swctl.conf."
+    [ -f "$HOME/.cloudflared/${SW_PREVIEW_TUNNEL_ID}.json" ] \
+        || die "Missing tunnel creds ~/.cloudflared/${SW_PREVIEW_TUNNEL_ID}.json — run: cloudflared tunnel token --cred-file ~/.cloudflared/${SW_PREVIEW_TUNNEL_ID}.json <tunnel>"
+}
+
+# Rebuild the shared config from the ingress.d set and (re)start the container.
+_named_assemble_and_reload() {
+    require_cmd docker
+    local cfg dir container
+    cfg="$(_named_config_file)"; dir="$(_named_ingress_dir)"; container="$(_named_container)"
+    {
+        printf 'tunnel: %s\n' "$SW_PREVIEW_TUNNEL_ID"
+        printf 'credentials-file: /etc/cloudflared/%s.json\n\ningress:\n' "$SW_PREVIEW_TUNNEL_ID"
+        local f
+        for f in "$dir"/*.yml; do [ -e "$f" ] || continue; cat "$f"; done
+        printf '  - service: http_status:404\n'
+    } > "$cfg"
+
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    if ! grep -q 'hostname:' "$cfg" 2>/dev/null; then
+        info "No named previews remain — shared tunnel '${container}' stopped."
+        return 0
+    fi
+    docker run -d --name "$container" --restart unless-stopped \
+        --network "${SW_PROJECT_NETWORK:-trunk_default}" \
+        --user "$(id -u):$(id -g)" \
+        --label "swctl-tunnel-project=${SW_PROJECT_SLUG}" \
+        -v "$HOME/.cloudflared:/etc/cloudflared:ro" \
+        cloudflare/cloudflared:latest \
+        tunnel --config "/etc/cloudflared/$(basename "$cfg")" --no-autoupdate run >/dev/null 2>&1 \
+        || die "Failed to (re)start shared tunnel '${container}'. Inspect: docker logs ${container}"
+}
+
+# The instance's web container name (resolvable on the shared network).
+_named_app_hostname() {
+    local app_id; app_id="$(app_container_id "$COMPOSE_PROJECT")"
+    [ -n "$app_id" ] || die "App container for '${COMPOSE_PROJECT}' not running. Start it with 'swctl refresh ${ISSUE_ID}'."
+    docker inspect "$app_id" --format '{{.Name}}' | sed 's|^/||'
+}
+
+# Trust proxy headers so Shopware honours X-Forwarded-Proto=https.
+_named_ensure_trusted_proxies() {
+    local f="${WORKTREE_PATH}/config/packages/zzz-swctl-trusted-proxies.yaml"
+    [ -f "$f" ] && return 0
+    mkdir -p "$(dirname "$f")"
+    cat > "$f" <<'YAML'
+# Added by `swctl preview --named`. Trust docker/proxy subnets so the tunnel's
+# X-Forwarded-Proto=https is honoured and the https:// domain matches. Local-only.
+framework:
+    trusted_proxies: '127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
+    trusted_headers: ['x-forwarded-for','x-forwarded-host','x-forwarded-proto','x-forwarded-port','x-forwarded-prefix']
+YAML
+}
+
+# Add/remove a sales-channel domain in the instance DB (PHP helper in container).
+_named_domain_db() {  # $1=add|remove  $2=url
+    local action="$1" url="$2"
+    cat > "$WORKTREE_PATH/.swctl-named-domain.php" <<'PHPEOF'
+<?php
+$action = $argv[1] ?? ''; $url = $argv[2] ?? '';
+$db = getenv('DATABASE_URL') ?: '';
+if (!$db && is_file(__DIR__.'/.env.local')) { preg_match('/DATABASE_URL=(.+)/', file_get_contents(__DIR__.'/.env.local'), $m); $db = trim($m[1] ?? ''); }
+$p = parse_url($db);
+$pdo = new PDO(sprintf('mysql:host=%s;port=%s;dbname=%s', $p['host'], $p['port'] ?? 3306, ltrim($p['path'] ?? '', '/')), $p['user'] ?? 'root', $p['pass'] ?? '');
+if ($action === 'remove') { $s=$pdo->prepare('DELETE FROM sales_channel_domain WHERE url=?'); $s->execute([$url]); echo "removed {$s->rowCount()}\n"; exit; }
+$ex=$pdo->prepare('SELECT 1 FROM sales_channel_domain WHERE url=?'); $ex->execute([$url]); if ($ex->fetchColumn()) { echo "exists\n"; exit; }
+$src=$pdo->query("SELECT * FROM sales_channel_domain WHERE url NOT LIKE '%headless%' ORDER BY url LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+if (!$src) { fwrite(STDERR,"no storefront domain to clone\n"); exit(1); }
+$src['url']=$url; $src['created_at']=date('Y-m-d H:i:s.v'); $src['updated_at']=null;
+$cols=[];$ph=[];$params=[];
+foreach (array_keys($src) as $c) {
+  if ($c==='id') { $cols[]='id'; $ph[]="UNHEX('".bin2hex(random_bytes(16))."')"; continue; }
+  $cols[]=$c; $ph[]='?'; $params[]=$src[$c];
+}
+$pdo->prepare('INSERT INTO sales_channel_domain ('.implode(',',$cols).') VALUES ('.implode(',',$ph).')')->execute($params);
+echo "added $url\n";
+PHPEOF
+    run_app_command "$COMPOSE_PROJECT" "php .swctl-named-domain.php '$action' '$url'" \
+        || warn "Could not ${action} sales-channel domain '${url}'."
+    rm -f "$WORKTREE_PATH/.swctl-named-domain.php" 2>/dev/null || true
+}
+
+_named_start() {  # expects ISSUE_ID, COMPOSE_PROJECT, WORKTREE_PATH loaded
+    _named_require_config
+    local host app_host port file
+    host="$(_named_domain_for "$ISSUE_ID")"
+    app_host="$(_named_app_hostname)"
+    port="${SW_INTERNAL_PORT:-8000}"
+    file="$(_named_ingress_dir)/${host}.yml"
+    mkdir -p "$(_named_ingress_dir)"
+    printf '  - hostname: %s\n    service: http://%s:%s\n' "$host" "$app_host" "$port" > "$file"
+    info "Routing ${host} → ${app_host}:${port}"
+    _named_assemble_and_reload
+    _named_ensure_trusted_proxies
+    _named_domain_db add "https://${host}"
+    run_app_command "$COMPOSE_PROJECT" "bin/console cache:pool:clear --all" >/dev/null 2>&1 || true
+    ok "Named preview live: https://${host}"
+    info "  Stop with: swctl preview ${ISSUE_ID} --named --stop"
+}
+
+_named_stop() {
+    _named_require_config
+    local host file
+    host="$(_named_domain_for "$ISSUE_ID")"
+    file="$(_named_ingress_dir)/${host}.yml"
+    rm -f "$file"
+    _named_assemble_and_reload
+    _named_domain_db remove "https://${host}"
+    run_app_command "$COMPOSE_PROJECT" "bin/console cache:pool:clear --all" >/dev/null 2>&1 || true
+    ok "Named preview stopped for ${ISSUE_ID} (${host})."
+}
+
+_named_status() {
+    _named_require_config
+    local host file
+    host="$(_named_domain_for "$ISSUE_ID")"
+    file="$(_named_ingress_dir)/${host}.yml"
+    if [ -f "$file" ] && container_running "$(_named_container)"; then
+        ok "Named preview running for ${ISSUE_ID}:"
+        info "  URL: https://${host}"
+    else
+        info "No named preview for ${ISSUE_ID} (${host})."
+    fi
 }
 
 cmd_refresh() {
@@ -8907,6 +9073,7 @@ Usage:
   swctl snapshot <issue> [<name>|--list|--delete <name>]
   swctl restore <issue> <name>
   swctl preview <issue> [--stop|--status]
+  swctl preview <issue> --named [--stop|--status]
   swctl preview list | stop-all
   swctl resolve [--select] [--jobs N] <issue...>
   swctl resolve resume <issue>

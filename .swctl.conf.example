@@ -61,3 +61,12 @@ SW_SHARED_DB_INSTALL_ARGS="--basic-setup --force --no-interaction"
 # GitHub auth: run 'swctl auth login' (token stored in state dir)
 # GitHub organization for fetching issues/PRs (default: shopware)
 # SWCTL_GITHUB_ORG="shopware"
+
+# --- Named preview tunnels (swctl preview <issue> --named) -------------------
+# Stable per-instance domain: sw-<issue>.$SW_PREVIEW_DOMAIN, served by one
+# shared cloudflared container. Set up once:
+#   cloudflared tunnel create swctl-preview
+#   cloudflared tunnel route dns swctl-preview '*.example.dev'   # wildcard
+#   cloudflared tunnel token --cred-file ~/.cloudflared/<UUID>.json swctl-preview
+# SW_PREVIEW_DOMAIN="example.dev"
+# SW_PREVIEW_TUNNEL_ID="<cloudflared tunnel UUID>"

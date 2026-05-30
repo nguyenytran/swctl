@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import { getTunnels, stopTunnel, type Tunnel } from '@/api'
+import { getTunnels, stopTunnel, stopNamedPreview, type Tunnel } from '@/api'
 
 /**
  * /#/tunnels — fleet-wide Cloudflare tunnel management.
@@ -37,8 +37,12 @@ async function stop(t: Tunnel) {
   busy.value = { ...busy.value, [t.container]: true }
   message.value = ''
   try {
-    const r = await stopTunnel(t.container)
-    message.value = r.ok ? `Stopped ${t.container}.` : `Failed: ${r.error || r.output || 'unknown error'}`
+    // Named previews share one container per project — stop them per-issue so
+    // sibling instances on the same shared tunnel keep running.
+    const r = (t.type === 'named' && t.container.startsWith('swctl-tunnel-') && t.issue)
+      ? await stopNamedPreview(t.issue)
+      : await stopTunnel(t.container)
+    message.value = r.ok ? `Stopped ${t.issue ? 'sw-' + t.issue : t.container}.` : `Failed: ${(r as any).error || (r as any).output || 'unknown error'}`
     await load()
   } catch (e: any) {
     message.value = `Failed: ${e?.message || String(e)}`

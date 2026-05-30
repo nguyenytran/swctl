@@ -1293,6 +1293,27 @@ app.delete('/api/instances/:issueId/preview', async (c) => {
   return c.json({ ok: result.ok, output: result.output })
 })
 
+// Named preview (stable sw-<issue>.<domain> via the shared tunnel).
+app.get('/api/instances/:issueId/named-preview', async (c) => {
+  const issueId = c.req.param('issueId')
+  const result = await spawnSwctl(['preview', issueId, '--named', '--status'])
+  const match = result.output.match(/https:\/\/[^\s]+/)
+  return c.json({ ok: result.ok, running: /running/i.test(result.output), url: match ? match[0] : null, output: result.output })
+})
+
+app.post('/api/instances/:issueId/named-preview', async (c) => {
+  const issueId = c.req.param('issueId')
+  const result = await spawnSwctl(['preview', issueId, '--named'])
+  const match = result.output.match(/https:\/\/[^\s]+/)
+  return c.json({ ok: result.ok, url: match ? match[0] : null, output: result.output })
+})
+
+app.delete('/api/instances/:issueId/named-preview', async (c) => {
+  const issueId = c.req.param('issueId')
+  const result = await spawnSwctl(['preview', issueId, '--named', '--stop'])
+  return c.json({ ok: result.ok, output: result.output })
+})
+
 // ---------------------------------------------------------------------------
 // Fleet-wide tunnel management — powers the UI Tunnels panel.
 //   GET    /api/tunnels            → every tunnel (quick + named) as JSON
