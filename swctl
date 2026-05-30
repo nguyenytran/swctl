@@ -6336,6 +6336,8 @@ _snapshot_mtime_human() {
 #   swctl preview <issue>            → start tunnel, print URL
 #   swctl preview <issue> --stop     → tear down tunnel (instance keeps running)
 #   swctl preview <issue> --status   → show current tunnel URL / state
+#   swctl preview list               → table of ALL tunnels (quick + named)
+#   swctl preview stop-all           → stop every swctl quick tunnel
 #
 # Cleanup: `swctl clean` automatically stops the tunnel via _preview_stop.
 #
@@ -6344,8 +6346,20 @@ _snapshot_mtime_human() {
 # can resolve the app's container DNS directly.  Atomic naming + pre-emptive
 # `docker rm -f` of any orphan (matches the v0.6.22 populate pattern).
 cmd_preview() {
+    # Fleet-wide subcommands (no <issue> argument).
+    case "${1:-}" in
+        list|ls|--list)
+            _preview_list
+            return
+            ;;
+        stop-all|--stop-all)
+            _preview_stop_all
+            return
+            ;;
+    esac
+
     local issue_input="${1:-}"
-    [ -n "$issue_input" ] || die "Usage: swctl preview <issue> [--stop|--status]"
+    [ -n "$issue_input" ] || die "Usage: swctl preview <issue> [--stop|--status]  |  swctl preview list  |  swctl preview stop-all"
 
     maybe_load_project_config >/dev/null 2>&1 || true
     local meta_file
@@ -6447,6 +6461,7 @@ _preview_start() {
             --network "$network" \
             --label "swctl-preview=${ISSUE_ID}" \
             --label "swctl-preview-project=${SW_PROJECT_SLUG}" \
+            --label "swctl-preview-type=quick" \
             cloudflare/cloudflared:latest \
             tunnel --no-autoupdate --url "$target" \
             >/dev/null 2>&1; then
@@ -6521,6 +6536,65 @@ _preview_status() {
     else
         info "No preview tunnel for issue '${ISSUE_ID}'."
     fi
+}
+
+# List every preview tunnel across all instances — both swctl quick tunnels
+# (labeled `swctl-preview`) and any named cloudflared tunnels (same image,
+# no swctl label, e.g. a hand-rolled `shopware.y-tn.dev` tunnel).  Read-only;
+# pure docker queries so it works without project context.
+_preview_list() {
+    require_cmd docker
+
+    local fmt='%-10s %-6s %-26s %-10s %s\n'
+    # shellcheck disable=SC2059
+    printf "$fmt" "ISSUE" "TYPE" "CONTAINER" "STATUS" "URL"
+    printf '%s\n' "------------------------------------------------------------------------------"
+
+    local found=0
+
+    # Quick tunnels: identified by the swctl-preview=<issue> label.
+    local line issue name state
+    while IFS='|' read -r issue name state; do
+        [ -n "$name" ] || continue
+        found=1
+        local url
+        url="$(docker logs "$name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        # shellcheck disable=SC2059
+        printf "$fmt" "${issue:--}" "quick" "$(truncate_text 26 "$name")" "$state" "${url:--}"
+    done < <(docker ps -a --filter 'label=swctl-preview' \
+        --format '{{.Label "swctl-preview"}}|{{.Names}}|{{.State}}' 2>/dev/null)
+
+    # Named tunnels: cloudflared containers WITHOUT the swctl-preview label.
+    while IFS='|' read -r name state lbl; do
+        [ -n "$name" ] || continue
+        [ -n "$lbl" ] && continue   # already listed as a quick tunnel
+        found=1
+        # shellcheck disable=SC2059
+        printf "$fmt" "-" "named" "$(truncate_text 26 "$name")" "$state" "(named - see ~/.cloudflared)"
+    done < <(docker ps -a --filter 'ancestor=cloudflare/cloudflared:latest' \
+        --format '{{.Names}}|{{.State}}|{{.Label "swctl-preview"}}' 2>/dev/null)
+
+    if [ "$found" -eq 0 ]; then
+        info "No preview tunnels are running."
+        info "Start one with: swctl preview <issue>"
+    fi
+}
+
+# Stop & remove every swctl-managed quick tunnel in one shot.  Named tunnels
+# are left alone (they are not swctl-owned); remove those by container name.
+_preview_stop_all() {
+    require_cmd docker
+    local ids
+    ids="$(docker ps -aq --filter 'label=swctl-preview' 2>/dev/null)"
+    if [ -z "$ids" ]; then
+        info "No swctl preview tunnels to stop."
+        return 0
+    fi
+    info "Stopping all swctl preview tunnels…"
+    # shellcheck disable=SC2086
+    docker rm -f $ids >/dev/null 2>&1 \
+        && ok "Stopped $(printf '%s\n' "$ids" | grep -c .) preview tunnel(s)." \
+        || warn "Some tunnels could not be removed; check 'docker ps -a'."
 }
 
 cmd_refresh() {
@@ -8809,6 +8883,7 @@ Usage:
   swctl snapshot <issue> [<name>|--list|--delete <name>]
   swctl restore <issue> <name>
   swctl preview <issue> [--stop|--status]
+  swctl preview list | stop-all
   swctl resolve [--select] [--jobs N] <issue...>
   swctl resolve resume <issue>
   swctl resolve status
