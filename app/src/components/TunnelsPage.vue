@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import { getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig, type Tunnel } from '@/api'
+import { getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig, listCloudflaredTunnels, type Tunnel, type CloudflaredTunnel } from '@/api'
 import ConfirmDialog from './ConfirmDialog.vue'
 
 /**
@@ -29,12 +29,36 @@ const cfgTunnelId = ref('')
 const cfgSaving = ref(false)
 const cfgMessage = ref('')
 
+// Available Cloudflare tunnels (for the dropdown).
+const cfTunnels = ref<CloudflaredTunnel[]>([])
+const cfLoading = ref(false)
+const cfError = ref('')
+
 async function loadConfig() {
   try {
     const c = await getTunnelConfig()
     cfgDomain.value = c.domain || ''
     cfgTunnelId.value = c.tunnelId || ''
   } catch { /* ignore */ }
+}
+
+function toggleConfig() {
+  showConfig.value = !showConfig.value
+  if (showConfig.value && cfTunnels.value.length === 0) loadCfTunnels()
+}
+
+async function loadCfTunnels() {
+  cfLoading.value = true
+  cfError.value = ''
+  try {
+    const r = await listCloudflaredTunnels()
+    cfTunnels.value = r.tunnels || []
+    if (!r.ok) cfError.value = r.error || 'Could not list tunnels (is cloudflared logged in?).'
+  } catch (e: any) {
+    cfError.value = e?.message || 'Failed to list tunnels.'
+  } finally {
+    cfLoading.value = false
+  }
 }
 
 async function saveConfig() {
@@ -125,7 +149,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
     <div class="mb-4 rounded border border-white/10 bg-white/[0.02]">
       <button
         class="w-full flex items-center justify-between px-3 py-2 text-sm text-gray-300 hover:text-white"
-        @click="showConfig = !showConfig"
+        @click="toggleConfig"
       >
         <span class="flex items-center gap-2">
           <span class="text-gray-500">{{ showConfig ? '▾' : '▸' }}</span>
@@ -152,14 +176,39 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
             />
           </label>
           <label class="block">
-            <span class="text-xs text-gray-400">Tunnel ID (UUID)</span>
+            <span class="text-xs text-gray-400 flex items-center gap-2">
+              Tunnel
+              <span v-if="cfLoading" class="inline-block w-3 h-3 border-2 border-gray-500 border-t-transparent rounded-full animate-spin" />
+              <button type="button" class="text-gray-500 hover:text-gray-300" title="Reload tunnels" @click="loadCfTunnels">↻</button>
+            </span>
+            <!-- Dropdown when tunnels are discoverable; manual UUID fallback otherwise. -->
+            <select
+              v-if="cfTunnels.length"
+              v-model="cfgTunnelId"
+              class="mt-1 w-full bg-surface border border-border rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500"
+            >
+              <option value="" disabled>Select a tunnel…</option>
+              <option v-for="t in cfTunnels" :key="t.id" :value="t.id">
+                {{ t.name }}{{ t.hasCreds ? '' : ' — no local creds' }}
+              </option>
+              <option
+                v-if="cfgTunnelId && !cfTunnels.some(t => t.id === cfgTunnelId)"
+                :value="cfgTunnelId"
+              >{{ cfgTunnelId }} (current)</option>
+            </select>
             <input
+              v-else
               v-model="cfgTunnelId"
               type="text"
-              placeholder="502a0836-…"
+              placeholder="502a0836-…  (tunnel UUID)"
               spellcheck="false"
               class="mt-1 w-full bg-surface border border-border rounded px-2 py-1 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
             />
+            <span v-if="cfError" class="mt-1 block text-xs text-amber-400/80">{{ cfError }}</span>
+            <span
+              v-else-if="cfgTunnelId && cfTunnels.length && !cfTunnels.find(t => t.id === cfgTunnelId)?.hasCreds"
+              class="mt-1 block text-xs text-amber-400/80"
+            >No local credentials for this tunnel — run: cloudflared tunnel token --cred-file ~/.cloudflared/{{ cfgTunnelId }}.json &lt;name&gt;</span>
           </label>
         </div>
         <div class="flex items-center gap-3">

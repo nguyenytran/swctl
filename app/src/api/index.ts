@@ -155,6 +155,13 @@ export async function stopPreview(issueId: string): Promise<{ ok: boolean; outpu
 // Named-preview tunnel configuration (project .swctl.conf).
 export interface TunnelConfig { domain: string; tunnelId: string }
 
+export interface CloudflaredTunnel { id: string; name: string; hasCreds: boolean }
+
+export async function listCloudflaredTunnels(): Promise<{ ok: boolean; tunnels: CloudflaredTunnel[]; error?: string }> {
+  const res = await fetch(`${BASE}/cloudflared/tunnels`)
+  return res.json()
+}
+
 export async function getTunnelConfig(): Promise<TunnelConfig> {
   const res = await fetch(`${BASE}/tunnel-config`)
   return res.json()

@@ -1293,6 +1293,31 @@ app.delete('/api/instances/:issueId/preview', async (c) => {
   return c.json({ ok: result.ok, output: result.output })
 })
 
+// Enumerate Cloudflare named tunnels (for the config dropdown). cloudflared
+// isn't installed in this container, so run it via its docker image with the
+// host's ~/.cloudflared mounted (origin cert). Runs as root so the 0600 cert
+// is readable regardless of the cert's owner.
+app.get('/api/cloudflared/tunnels', (c) => {
+  const home = process.env.HOME || ''
+  try {
+    const out = execSync(
+      `docker run --rm --user 0:0 -e TUNNEL_ORIGIN_CERT=/etc/cloudflared/cert.pem ` +
+      `-v ${home}/.cloudflared:/etc/cloudflared:ro cloudflare/cloudflared:latest ` +
+      `tunnel list --output json`,
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 25_000 },
+    ).toString()
+    const list = JSON.parse(out)
+    const tunnels = (Array.isArray(list) ? list : []).map((t: any) => ({
+      id: t.id,
+      name: t.name,
+      hasCreds: !!(t.id && fs.existsSync(`${home}/.cloudflared/${t.id}.json`)),
+    }))
+    return c.json({ ok: true, tunnels })
+  } catch (e: any) {
+    return c.json({ ok: false, tunnels: [], error: (e?.stderr?.toString?.() || e?.message || String(e)).slice(0, 300) })
+  }
+})
+
 // Named-preview tunnel configuration (SW_PREVIEW_* in the project's .swctl.conf).
 app.get('/api/tunnel-config', (c) => {
   const cfg = readProjectConfig()
