@@ -162,6 +162,22 @@ export async function listCloudflaredTunnels(): Promise<{ ok: boolean; tunnels: 
   return res.json()
 }
 
+// Interactive Cloudflare login (browser auth, driven from the UI).
+export async function startCloudflaredLogin(): Promise<{ ok: boolean; url?: string; error?: string }> {
+  const res = await fetch(`${BASE}/cloudflared/login`, { method: 'POST' })
+  return res.json()
+}
+
+export async function cloudflaredLoginStatus(): Promise<{ state: 'idle' | 'waiting' | 'done' | 'error'; error?: string }> {
+  const res = await fetch(`${BASE}/cloudflared/login/status`)
+  return res.json()
+}
+
+export async function cancelCloudflaredLogin(): Promise<{ ok: boolean }> {
+  const res = await fetch(`${BASE}/cloudflared/login`, { method: 'DELETE' })
+  return res.json()
+}
+
 export async function getTunnelConfig(): Promise<TunnelConfig> {
   const res = await fetch(`${BASE}/tunnel-config`)
   return res.json()

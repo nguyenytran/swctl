@@ -1318,6 +1318,67 @@ app.get('/api/cloudflared/tunnels', (c) => {
   }
 })
 
+// Cloudflare login — interactive browser flow, driven from the UI.
+// `cloudflared tunnel login` prints an authorize URL and then polls Cloudflare
+// (no local callback), so we run it detached via the docker image, surface the
+// URL, and detect completion. Runs as root (writes cert to the mounted dir);
+// on success we chown the cert back to the dir's owner so the host CLI keeps working.
+const CF_LOGIN_CONTAINER = 'swctl-cf-login'
+const cfHome = () => process.env.HOME || ''
+
+app.post('/api/cloudflared/login', async (c) => {
+  const home = cfHome()
+  try { execSync(`docker rm -f ${CF_LOGIN_CONTAINER}`, { stdio: 'ignore' }) } catch {}
+  try {
+    execSync(
+      `docker run -d --name ${CF_LOGIN_CONTAINER} --user 0:0 -e TUNNEL_ORIGIN_CERT=/etc/cloudflared/cert.pem ` +
+      `-v ${home}/.cloudflared:/etc/cloudflared cloudflare/cloudflared:latest tunnel login`,
+      { stdio: 'ignore', timeout: 20_000 },
+    )
+  } catch (e: any) {
+    return c.json({ ok: false, error: (e?.message || String(e)).slice(0, 300) }, 500)
+  }
+  let url = ''
+  for (let i = 0; i < 15; i++) {
+    await new Promise((r) => setTimeout(r, 1000))
+    try {
+      const logs = execSync(`docker logs ${CF_LOGIN_CONTAINER} 2>&1`, { stdio: ['ignore', 'pipe', 'pipe'] }).toString()
+      const m = logs.match(/https:\/\/dash\.cloudflare\.com\/argotunnel\S*/)
+      if (m) { url = m[0]; break }
+    } catch { break }
+  }
+  if (!url) return c.json({ ok: false, error: 'No authorize URL produced (is the cloudflared image present?)' }, 500)
+  return c.json({ ok: true, url })
+})
+
+app.get('/api/cloudflared/login/status', (c) => {
+  const home = cfHome()
+  let running: boolean, code: string
+  try {
+    const out = execSync(`docker inspect -f '{{.State.Running}}|{{.State.ExitCode}}' ${CF_LOGIN_CONTAINER}`,
+      { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+    ;[running, code] = [out.split('|')[0] === 'true', out.split('|')[1]]
+  } catch {
+    return c.json({ state: 'idle' })   // no login in progress
+  }
+  if (running) return c.json({ state: 'waiting' })
+  const certPath = `${home}/.cloudflared/cert.pem`
+  if (code === '0' && fs.existsSync(certPath)) {
+    try { const st = fs.statSync(`${home}/.cloudflared`); fs.chownSync(certPath, st.uid, st.gid) } catch {}
+    try { execSync(`docker rm -f ${CF_LOGIN_CONTAINER}`, { stdio: 'ignore' }) } catch {}
+    return c.json({ state: 'done' })
+  }
+  let log = ''
+  try { log = execSync(`docker logs ${CF_LOGIN_CONTAINER} 2>&1`, { stdio: ['ignore', 'pipe', 'pipe'] }).toString().slice(-300) } catch {}
+  try { execSync(`docker rm -f ${CF_LOGIN_CONTAINER}`, { stdio: 'ignore' }) } catch {}
+  return c.json({ state: 'error', error: log || `exited ${code}` })
+})
+
+app.delete('/api/cloudflared/login', (c) => {
+  try { execSync(`docker rm -f ${CF_LOGIN_CONTAINER}`, { stdio: 'ignore' }) } catch {}
+  return c.json({ ok: true })
+})
+
 // Named-preview tunnel configuration (SW_PREVIEW_* in the project's .swctl.conf).
 app.get('/api/tunnel-config', (c) => {
   const cfg = readProjectConfig()

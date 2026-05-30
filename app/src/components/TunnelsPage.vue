@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import { getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig, listCloudflaredTunnels, type Tunnel, type CloudflaredTunnel } from '@/api'
+import {
+  getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig,
+  listCloudflaredTunnels, startCloudflaredLogin, cloudflaredLoginStatus, cancelCloudflaredLogin,
+  type Tunnel, type CloudflaredTunnel,
+} from '@/api'
 import ConfirmDialog from './ConfirmDialog.vue'
 
 /**
@@ -45,6 +49,52 @@ async function loadConfig() {
 function toggleConfig() {
   showConfig.value = !showConfig.value
   if (showConfig.value && cfTunnels.value.length === 0) loadCfTunnels()
+}
+
+// Interactive Cloudflare login (browser auth from the UI).
+const loginState = ref<'idle' | 'starting' | 'waiting' | 'done' | 'error'>('idle')
+const loginUrl = ref('')
+const loginError = ref('')
+let loginTimer: ReturnType<typeof setInterval> | null = null
+
+async function doLogin() {
+  loginState.value = 'starting'
+  loginError.value = ''
+  loginUrl.value = ''
+  try {
+    const r = await startCloudflaredLogin()
+    if (!r.ok || !r.url) { loginState.value = 'error'; loginError.value = r.error || 'Could not start login.'; return }
+    loginUrl.value = r.url
+    loginState.value = 'waiting'
+    window.open(r.url, '_blank', 'noopener')
+    loginTimer = setInterval(pollLogin, 2500)
+  } catch (e: any) {
+    loginState.value = 'error'; loginError.value = e?.message || String(e)
+  }
+}
+
+async function pollLogin() {
+  try {
+    const s = await cloudflaredLoginStatus()
+    if (s.state === 'done') {
+      stopLoginPoll()
+      loginState.value = 'done'
+      await loadCfTunnels()
+    } else if (s.state === 'error' || s.state === 'idle') {
+      stopLoginPoll()
+      loginState.value = 'error'
+      loginError.value = s.error || 'Login did not complete.'
+    }
+  } catch { /* keep polling */ }
+}
+
+function stopLoginPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = null } }
+
+async function cancelLogin() {
+  stopLoginPoll()
+  try { await cancelCloudflaredLogin() } catch {}
+  loginState.value = 'idle'
+  loginUrl.value = ''
 }
 
 async function loadCfTunnels() {
@@ -125,7 +175,7 @@ async function copy(url: string) {
 }
 
 onMounted(() => { load(); loadConfig(); timer = setInterval(() => load(true), 10_000) })
-onUnmounted(() => { if (timer) clearInterval(timer) })
+onUnmounted(() => { if (timer) clearInterval(timer); stopLoginPoll() })
 </script>
 
 <template>
@@ -163,14 +213,39 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 
         <!-- Login / setup help: cloudflared login is an interactive browser
              flow, so it can't run from the UI — show the exact terminal steps. -->
+        <!-- Log in to Cloudflare straight from the UI. -->
+        <div class="flex items-center gap-3 flex-wrap">
+          <button
+            type="button"
+            class="px-3 py-1.5 text-sm rounded font-medium bg-sky-700 hover:bg-sky-600 text-white disabled:opacity-60 inline-flex items-center gap-2"
+            :disabled="loginState === 'starting' || loginState === 'waiting'"
+            @click="doLogin"
+          >
+            <span v-if="loginState === 'starting' || loginState === 'waiting'" class="inline-block w-3 h-3 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
+            {{ loginState === 'waiting' ? 'Waiting for authorization…' : 'Log in to Cloudflare' }}
+          </button>
+          <button
+            v-if="loginState === 'waiting'"
+            type="button"
+            class="px-2 py-1 text-xs rounded text-gray-400 hover:text-white"
+            @click="cancelLogin"
+          >Cancel</button>
+          <span v-if="loginState === 'done'" class="text-xs text-green-400">✓ Logged in — tunnel list refreshed.</span>
+          <span v-if="loginState === 'error'" class="text-xs text-red-400">{{ loginError }}</span>
+        </div>
+        <p v-if="loginState === 'waiting'" class="text-xs text-gray-500">
+          A browser tab opened to authorize. If it didn't,
+          <a :href="loginUrl" target="_blank" rel="noopener" class="text-sky-400 hover:underline">click here</a>,
+          pick the <span class="font-mono">{{ cfgDomain || 'your' }}</span> zone, and this updates automatically.
+        </p>
+
         <details class="text-xs text-gray-500 bg-black/20 rounded border border-white/5">
-          <summary class="cursor-pointer px-2 py-1.5 hover:text-gray-300">How do I log in / set up a tunnel?</summary>
+          <summary class="cursor-pointer px-2 py-1.5 hover:text-gray-300">Or set it up from the terminal</summary>
           <div class="px-2 pb-2 space-y-1 text-gray-400">
-            <p>Run these in your terminal (login opens a browser — it can't be done from here):</p>
             <pre class="whitespace-pre-wrap font-mono text-[11px] text-gray-300 bg-black/30 rounded p-2 leading-relaxed">cloudflared tunnel login                       # pick the {{ cfgDomain || 'your-domain' }} zone
 cloudflared tunnel create swctl-preview         # creates the tunnel + creds
 cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}'   # wildcard DNS</pre>
-            <p>Then hit <span class="font-mono">↻</span> next to “Tunnel” to refresh the list and pick it.</p>
+            <p>Then hit <span class="font-mono">↻</span> next to “Tunnel” to refresh the list.</p>
           </div>
         </details>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
