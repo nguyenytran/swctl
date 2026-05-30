@@ -34,6 +34,7 @@ import {
   writeUserConfig,
   configFilePath,
   isResolveEnabled,
+  isTunnelsEnabled,
   validateAiConfig,
   resolveEnabledBackends,
   resolveDefaultBackend,
@@ -445,6 +446,7 @@ app.get('/api/config', (c) => {
 app.get('/api/features', (c) => {
   return c.json({
     resolveEnabled: isResolveEnabled(),
+    tunnelsEnabled: isTunnelsEnabled(),
   })
 })
 
@@ -486,7 +488,7 @@ app.put('/api/user-config', async (c) => {
     }
     // Type-validate the shape before writing — reject junk.
     const incoming = body.config as {
-      features?: { resolveEnabled?: unknown }
+      features?: { resolveEnabled?: unknown; tunnelsEnabled?: unknown }
       ai?: {
         defaultBackend?: unknown
         enabledBackends?: unknown
@@ -513,9 +515,10 @@ app.put('/api/user-config', async (c) => {
     const clean: NonNullable<Cleanable> = {}
 
     if (incoming.features && typeof incoming.features === 'object') {
-      if (typeof incoming.features.resolveEnabled === 'boolean') {
-        clean.features = { resolveEnabled: incoming.features.resolveEnabled }
-      }
+      const f: NonNullable<Cleanable>['features'] = {}
+      if (typeof incoming.features.resolveEnabled === 'boolean') f.resolveEnabled = incoming.features.resolveEnabled
+      if (typeof incoming.features.tunnelsEnabled === 'boolean') f.tunnelsEnabled = incoming.features.tunnelsEnabled
+      if (Object.keys(f).length > 0) clean.features = f
     }
 
     if (incoming.ai && typeof incoming.ai === 'object') {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
+import { useFeatures } from '@/composables/useFeatures'
 import {
   fetchConfig, saveConfig, testCli, testSkill,
   KNOWN_BACKENDS,
@@ -102,6 +103,31 @@ onMounted(async () => {
 })
 
 const resolveEnabled = computed<boolean>(() => draft.value.features.resolveEnabled === true)
+
+// Tunnels feature — writable. Persists immediately and refreshes the shared
+// feature flags so the nav + /tunnels route gate update live.
+const { loadFeatures } = useFeatures()
+const tunnelsEnabled = computed<boolean>(() => draft.value.features.tunnelsEnabled === true)
+const savingTunnels = ref(false)
+const tunnelsMsg = ref('')
+
+async function toggleTunnels(e: Event) {
+  const val = (e.target as HTMLInputElement).checked
+  const prev = draft.value.features.tunnelsEnabled === true
+  savingTunnels.value = true
+  tunnelsMsg.value = ''
+  draft.value.features = { ...draft.value.features, tunnelsEnabled: val }
+  try {
+    await saveConfig({ ...draft.value, features: { ...draft.value.features } })
+    await loadFeatures(true)
+    tunnelsMsg.value = val ? 'Enabled — “Tunnels” is now in the nav.' : 'Disabled.'
+  } catch (err: any) {
+    draft.value.features = { ...draft.value.features, tunnelsEnabled: prev }   // revert
+    tunnelsMsg.value = err?.message || 'Save failed.'
+  } finally {
+    savingTunnels.value = false
+  }
+}
 
 /**
  * Two-way binding for "is backend X enabled?".  Toggling this updates
@@ -243,14 +269,9 @@ function strOrUndef(v?: string): string | undefined {
     >{{ error }}</div>
 
     <template v-if="!loading && draft && draft.ai && draft.ai.claude && draft.ai.codex">
-      <!-- Features (read-only) -->
+      <!-- Features -->
       <section class="border border-border rounded-lg bg-surface p-4 space-y-3">
-        <div class="flex items-center gap-2">
-          <h3 class="text-sm font-semibold text-white">Features</h3>
-          <span class="text-[10px] uppercase tracking-wider text-gray-500 border border-border rounded px-1.5 py-0.5">
-            read-only
-          </span>
-        </div>
+        <h3 class="text-sm font-semibold text-white">Features</h3>
 
         <div>
           <label class="flex items-center gap-2.5 cursor-not-allowed select-none opacity-80">
@@ -262,11 +283,31 @@ function strOrUndef(v?: string): string | undefined {
                 ? 'text-emerald-300 bg-emerald-500/10 border border-emerald-500/30'
                 : 'text-gray-500 bg-surface-dark border border-border'"
             >{{ resolveEnabled ? 'enabled' : 'disabled' }}</span>
+            <span class="text-[10px] uppercase tracking-wider text-gray-500 border border-border rounded px-1.5 py-0.5">read-only</span>
           </label>
           <p class="text-[11px] text-gray-500 mt-1 ml-[1.625rem] leading-relaxed">
             Exposes the <code>/resolve</code> route, the dashboard resolve widget,
             the Submit-Review action on the Diff tab, and the
             <code>swctl resolve …</code> CLI.
+          </p>
+        </div>
+
+        <div>
+          <label class="flex items-center gap-2.5 cursor-pointer select-none">
+            <input :checked="tunnelsEnabled" type="checkbox" class="swctl-checkbox" :disabled="savingTunnels" @change="toggleTunnels" />
+            <span class="text-sm text-gray-300">Tunnels</span>
+            <span
+              class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded"
+              :class="tunnelsEnabled
+                ? 'text-emerald-300 bg-emerald-500/10 border border-emerald-500/30'
+                : 'text-gray-500 bg-surface-dark border border-border'"
+            >{{ tunnelsEnabled ? 'enabled' : 'disabled' }}</span>
+            <span v-if="savingTunnels" class="inline-block w-3 h-3 border-2 border-gray-500 border-t-transparent rounded-full animate-spin" />
+            <span v-if="tunnelsMsg" class="text-[11px] text-gray-400">{{ tunnelsMsg }}</span>
+          </label>
+          <p class="text-[11px] text-gray-500 mt-1 ml-[1.625rem] leading-relaxed">
+            Adds the <code>/tunnels</code> page for managing Cloudflare preview tunnels
+            (quick + named <code>sw-&lt;issue&gt;</code> domains). Hidden by default.
           </p>
         </div>
       </section>

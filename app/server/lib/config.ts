@@ -37,6 +37,11 @@ export interface UserConfig {
      */
     resolveEnabled?: boolean
     /**
+     * Whether the Tunnels page + tunnel APIs are enabled. Hidden by default;
+     * toggled from the Config page. Env override: SWCTL_TUNNELS_ENABLED=1.
+     */
+    tunnelsEnabled?: boolean
+    /**
      * Per-resolve hard cap on total tokens consumed (input + cached +
      * output + reasoning, summed across every model turn the agent
      * makes during one run).  When the running total exceeds this
@@ -433,6 +438,15 @@ export function isResolveEnabled(): boolean {
   if (process.env.SWCTL_RESOLVE_ENABLED === '1') return true
   try {
     return readUserConfig().features.resolveEnabled === true
+  } catch {
+    return false
+  }
+}
+
+export function isTunnelsEnabled(): boolean {
+  if (process.env.SWCTL_TUNNELS_ENABLED === '1') return true
+  try {
+    return readUserConfig().features.tunnelsEnabled === true
   } catch {
     return false
   }

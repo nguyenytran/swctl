@@ -10,9 +10,10 @@ import { ref } from 'vue'
  */
 export interface Features {
   resolveEnabled: boolean
+  tunnelsEnabled: boolean
 }
 
-const features = ref<Features>({ resolveEnabled: false })
+const features = ref<Features>({ resolveEnabled: false, tunnelsEnabled: false })
 let loaded = false
 let inflight: Promise<void> | null = null
 
@@ -31,6 +32,7 @@ async function load(force = false): Promise<void> {
         const json = (await res.json()) as Partial<Features>
         features.value = {
           resolveEnabled: !!json.resolveEnabled,
+          tunnelsEnabled: !!json.tunnelsEnabled,
         }
       }
     } catch {

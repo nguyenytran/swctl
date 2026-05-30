@@ -10,6 +10,7 @@ export const KNOWN_BACKENDS: readonly KnownBackend[] = ['claude', 'codex'] as co
 export interface UserConfig {
   features: {
     resolveEnabled?: boolean
+    tunnelsEnabled?: boolean
   }
   ai: {
     /** Default backend — must be one of `enabledBackends`. */

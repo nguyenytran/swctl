@@ -1,4 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import { useFeatures } from '@/composables/useFeatures'
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -15,8 +16,17 @@ const router = createRouter({
     { path: '/worktrees', name: 'worktrees', component: () => import('@/components/WorktreeOverview.vue') },
     { path: '/worktrees/batch-create', name: 'worktrees-batch-create', component: () => import('@/components/WorktreeOverview.vue'), meta: { modal: 'batch-create' } },
 
-    // Tunnels — fleet-wide Cloudflare preview tunnel management
-    { path: '/tunnels', name: 'tunnels', component: () => import('@/components/TunnelsPage.vue') },
+    // Tunnels — fleet-wide Cloudflare preview tunnel management (feature-gated)
+    {
+      path: '/tunnels',
+      name: 'tunnels',
+      component: () => import('@/components/TunnelsPage.vue'),
+      beforeEnter: async () => {
+        const { features, loadFeatures } = useFeatures()
+        await loadFeatures()
+        return features.value.tunnelsEnabled ? true : { path: '/dashboard' }
+      },
+    },
 
     // Config (~/.swctl/config.json) — AI backend, feature flags, CLI paths
     { path: '/config', name: 'config', component: () => import('@/components/ConfigPage.vue') },

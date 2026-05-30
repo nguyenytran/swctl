@@ -7,12 +7,14 @@ import { useInstances } from '@/composables/useInstances'
 import { useProjects } from '@/composables/useProjects'
 import { useActiveProject } from '@/composables/useActiveProject'
 import { usePlugins } from '@/composables/usePlugins'
+import { useFeatures } from '@/composables/useFeatures'
 
 const route = useRoute()
 const { refresh: refreshInstances } = useInstances()
 const { refresh: refreshProjects } = useProjects()
 const { activeProjectName, setProject, ensureSelection, projects } = useActiveProject()
 const plugins = usePlugins()
+const { features } = useFeatures()
 
 onMounted(async () => {
   await refreshProjects()
@@ -48,6 +50,7 @@ function routePath(p: string): string {
               : 'text-gray-500 hover:text-gray-300'"
           >Worktrees</router-link>
           <router-link
+            v-if="features.tunnelsEnabled"
             to="/tunnels"
             class="px-3 py-1 text-sm rounded transition-colors"
             :class="route.path.startsWith('/tunnels')
