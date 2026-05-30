@@ -1293,6 +1293,46 @@ app.delete('/api/instances/:issueId/preview', async (c) => {
   return c.json({ ok: result.ok, output: result.output })
 })
 
+// ---------------------------------------------------------------------------
+// Fleet-wide tunnel management — powers the UI Tunnels panel.
+//   GET    /api/tunnels            → every tunnel (quick + named) as JSON
+//   DELETE /api/tunnels/:container → stop/remove one tunnel
+// The CLI (`swctl preview list --json`) is the single source of truth so the
+// table never drifts from the terminal.
+app.get('/api/tunnels', async (c) => {
+  const result = await spawnSwctl(['preview', 'list', '--json'])
+  let tunnels: Array<{ issue: string; type: string; container: string; status: string; url: string }> = []
+  // Be defensive: slice out the JSON array in case any stray log line leaks in.
+  const out = result.output ?? ''
+  const start = out.indexOf('[')
+  const end = out.lastIndexOf(']')
+  if (start >= 0 && end >= start) {
+    try { tunnels = JSON.parse(out.slice(start, end + 1)) } catch { tunnels = [] }
+  }
+  return c.json({ ok: result.ok, tunnels })
+})
+
+app.delete('/api/tunnels/:container', async (c) => {
+  const container = c.req.param('container')
+  // Whitelist container names — these flow into a docker command.
+  if (!/^[A-Za-z0-9._-]+$/.test(container)) {
+    return c.json({ ok: false, error: 'Invalid container name' }, 400)
+  }
+  // swctl quick tunnels: stop via the CLI so instance metadata stays consistent.
+  const m = container.match(/^swctl-preview-(.+)$/)
+  if (m) {
+    const result = await spawnSwctl(['preview', m[1], '--stop'])
+    return c.json({ ok: result.ok, output: result.output })
+  }
+  // Named / other cloudflared tunnels: remove the container directly.
+  try {
+    execSync(`docker rm -f ${container}`, { stdio: 'pipe' })
+    return c.json({ ok: true })
+  } catch (e: any) {
+    return c.json({ ok: false, error: e?.message || String(e) }, 500)
+  }
+})
+
 app.get('/api/stream/logs', (c) => {
   const issueId = c.req.query('issueId') || ''
   if (!issueId) return c.json({ error: 'Missing issueId' }, 400)

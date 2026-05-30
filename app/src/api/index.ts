@@ -152,6 +152,25 @@ export async function stopPreview(issueId: string): Promise<{ ok: boolean; outpu
   return res.json()
 }
 
+// Fleet-wide tunnel management (quick + named) for the Tunnels panel.
+export interface Tunnel {
+  issue: string
+  type: 'quick' | 'named' | string
+  container: string
+  status: string
+  url: string
+}
+
+export async function getTunnels(): Promise<{ ok: boolean; tunnels: Tunnel[] }> {
+  const res = await fetch(`${BASE}/tunnels`)
+  return res.json()
+}
+
+export async function stopTunnel(container: string): Promise<{ ok: boolean; output?: string; error?: string }> {
+  const res = await fetch(`${BASE}/tunnels/${encodeURIComponent(container)}`, { method: 'DELETE' })
+  return res.json()
+}
+
 export async function fetchDirectories(dirPath?: string): Promise<{
   current: string
   parent: string
