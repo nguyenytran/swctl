@@ -6250,11 +6250,18 @@ _snapshot_restore() {
 
     warn "Restoring snapshot '${name}' will OVERWRITE database '${DB_NAME}' on instance '${ISSUE_ID}'."
     warn "All current data in that database will be replaced."
-    local confirm
-    confirm="$(prompt_text "Type 'yes' to confirm")"
-    if [ "$confirm" != "yes" ]; then
-        info "Aborted."
-        return 1
+    # SWCTL_AUTO_CONFIRM=1 lets the UI / scripted callers bypass the
+    # interactive prompt.  The UI shows its own modal before this point,
+    # so re-prompting on the CLI side would just hang the request.
+    if [ "${SWCTL_AUTO_CONFIRM:-0}" = "1" ]; then
+        info "SWCTL_AUTO_CONFIRM=1 → skipping interactive confirm."
+    else
+        local confirm
+        confirm="$(prompt_text "Type 'yes' to confirm")"
+        if [ "$confirm" != "yes" ]; then
+            info "Aborted."
+            return 1
+        fi
     fi
 
     info "Restoring '${name}' → '${DB_NAME}'..."

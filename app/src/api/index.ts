@@ -92,6 +92,66 @@ export async function startInstance(issueId: string): Promise<{ ok: boolean }> {
   return res.json()
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot / restore
+// ---------------------------------------------------------------------------
+
+export interface Snapshot {
+  name: string
+  size: string
+  created: string
+}
+
+export async function listSnapshots(issueId: string): Promise<{ ok: boolean; snapshots: Snapshot[]; error?: string }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/snapshots`)
+  return res.json()
+}
+
+export async function createSnapshot(issueId: string, name?: string): Promise<{ ok: boolean; output: string; error?: string }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/snapshots`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(name ? { name } : {}),
+  })
+  return res.json()
+}
+
+export async function deleteSnapshot(issueId: string, name: string): Promise<{ ok: boolean; output: string }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/snapshots/${encodeURIComponent(name)}`, { method: 'DELETE' })
+  return res.json()
+}
+
+export async function restoreSnapshot(issueId: string, name: string): Promise<{ ok: boolean; output: string }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/snapshots/${encodeURIComponent(name)}/restore`, { method: 'POST' })
+  return res.json()
+}
+
+// ---------------------------------------------------------------------------
+// Preview (Cloudflare quick-tunnel)
+// ---------------------------------------------------------------------------
+
+export interface PreviewStatus {
+  ok: boolean
+  running: boolean
+  url: string | null
+  output?: string
+}
+
+export async function getPreviewStatus(issueId: string): Promise<PreviewStatus> {
+  const res = await fetch(`${BASE}/instances/${issueId}/preview`)
+  return res.json()
+}
+
+export async function startPreview(issueId: string): Promise<{ ok: boolean; url: string | null; output: string }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/preview`, { method: 'POST' })
+  return res.json()
+}
+
+export async function stopPreview(issueId: string): Promise<{ ok: boolean; output: string }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/preview`, { method: 'DELETE' })
+  return res.json()
+}
+
 export async function fetchDirectories(dirPath?: string): Promise<{
   current: string
   parent: string

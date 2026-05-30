@@ -1180,6 +1180,119 @@ app.post('/api/instances/:issueId/start', async (c) => {
   return c.json({ ok: result.ok })
 })
 
+// ---------------------------------------------------------------------------
+// Snapshot / restore
+// ---------------------------------------------------------------------------
+// Per-instance MariaDB snapshots taken via `swctl snapshot`.  We shell out
+// to the same command the CLI uses so semantics, validation, and on-disk
+// layout stay consistent between surfaces.
+
+app.get('/api/instances/:issueId/snapshots', async (c) => {
+  const issueId = c.req.param('issueId')
+  const result = await spawnSwctl(['snapshot', issueId, '--list'])
+  if (!result.ok) {
+    return c.json({ ok: false, error: result.output, snapshots: [] }, 500)
+  }
+  // `swctl snapshot --list` prints a header + N rows.  Parse out the
+  // name/size/created columns (3 fields per row, space-separated).
+  // Tolerate the "No snapshots for issue 'X'." path by returning [].
+  const lines = result.output.split('\n').filter((l) => l.trim() !== '')
+  const dataLines = lines.filter((l) =>
+    !/^(NAME|----)/.test(l.trim()) && !/^No snapshots for issue/.test(l.trim())
+  )
+  const snapshots = dataLines.map((line) => {
+    const parts = line.trim().split(/\s{2,}/)
+    return {
+      name: parts[0] ?? '',
+      size: parts[1] ?? '',
+      created: parts[2] ?? '',
+    }
+  })
+  return c.json({ ok: true, snapshots })
+})
+
+app.post('/api/instances/:issueId/snapshots', async (c) => {
+  const issueId = c.req.param('issueId')
+  const body = await c.req.json<{ name?: string }>().catch(() => ({} as { name?: string }))
+  const name = (body.name ?? '').trim()
+  // Same character allowlist as cmd_snapshot in swctl — keep them in sync
+  // so the UI rejects bad names *before* round-tripping to swctl die().
+  if (name && !/^[A-Za-z0-9._-]+$/.test(name)) {
+    return c.json({ ok: false, error: 'Name may only contain [A-Za-z0-9._-].' }, 400)
+  }
+  const args = name ? ['snapshot', issueId, name] : ['snapshot', issueId]
+  const result = await spawnSwctl(args)
+  return c.json({ ok: result.ok, output: result.output })
+})
+
+app.delete('/api/instances/:issueId/snapshots/:name', async (c) => {
+  const issueId = c.req.param('issueId')
+  const name = c.req.param('name')
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+    return c.json({ ok: false, error: 'Invalid snapshot name.' }, 400)
+  }
+  const result = await spawnSwctl(['snapshot', issueId, '--delete', name])
+  return c.json({ ok: result.ok, output: result.output })
+})
+
+app.post('/api/instances/:issueId/snapshots/:name/restore', async (c) => {
+  const issueId = c.req.param('issueId')
+  const name = c.req.param('name')
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+    return c.json({ ok: false, error: 'Invalid snapshot name.' }, 400)
+  }
+  // cmd_restore on the CLI prompts "Type 'yes' to confirm" before
+  // overwriting the DB.  The UI shows its own confirmation modal *before*
+  // calling this endpoint, so we set SWCTL_AUTO_CONFIRM=1 to bypass the
+  // CLI prompt (otherwise the request would hang forever waiting for
+  // stdin that never comes).
+  const result = await spawnSwctl(['restore', issueId, name], { SWCTL_AUTO_CONFIRM: '1' })
+  return c.json({ ok: result.ok, output: result.output })
+})
+
+// ---------------------------------------------------------------------------
+// Preview (Cloudflare quick-tunnel)
+// ---------------------------------------------------------------------------
+// Three actions:
+//   GET   → current status (URL if up, null if down)
+//   POST  → start tunnel (returns URL once cloudflared publishes it)
+//   DELETE → stop tunnel
+//
+// `swctl preview <id>` blocks up to ~30s waiting for the URL — so do
+// the POST clients.  The cache invalidator clears the `instances` tag
+// so the next GET /api/instances reflects PREVIEW_URL in metadata.
+
+app.get('/api/instances/:issueId/preview', async (c) => {
+  const issueId = c.req.param('issueId')
+  const result = await spawnSwctl(['preview', issueId, '--status'])
+  // Extract the URL if present in the output (the CLI prints it
+  // as "URL: https://..." or "Preview running ... URL: https://...").
+  const match = result.output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/)
+  return c.json({
+    ok: result.ok,
+    running: result.ok && !!match,
+    url: match ? match[0] : null,
+    output: result.output,
+  })
+})
+
+app.post('/api/instances/:issueId/preview', async (c) => {
+  const issueId = c.req.param('issueId')
+  const result = await spawnSwctl(['preview', issueId])
+  const match = result.output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/)
+  return c.json({
+    ok: result.ok,
+    url: match ? match[0] : null,
+    output: result.output,
+  })
+})
+
+app.delete('/api/instances/:issueId/preview', async (c) => {
+  const issueId = c.req.param('issueId')
+  const result = await spawnSwctl(['preview', issueId, '--stop'])
+  return c.json({ ok: result.ok, output: result.output })
+})
+
 app.get('/api/stream/logs', (c) => {
   const issueId = c.req.query('issueId') || ''
   if (!issueId) return c.json({ error: 'Missing issueId' }, 400)
