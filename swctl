@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.23"
+SWCTL_VERSION="0.6.24"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -2139,7 +2139,8 @@ _compute_source_key() {
         vendor)
             # `$src` is the host's vendor/ dir.  Its sibling `composer.lock`
             # lives in the parent (the project root).
-            local lock="$(dirname "$src")/composer.lock"
+            local lock
+            lock="$(dirname "$src")/composer.lock"
             [ -f "$lock" ] || return 0
             shasum -a 256 "$lock" 2>/dev/null | awk '{print $1}' \
                 || sha256sum "$lock" 2>/dev/null | awk '{print $1}' \
@@ -2986,6 +2987,7 @@ _composer_update_missing() {
 # Returns 1 = drift detected OR check could not run (be safe → install).
 _vendor_satisfies_lockfile() {
     local compose_project="$1"
+    # shellcheck disable=SC2016  # $vars are meant to expand INSIDE the container shell, not on the host.
     run_app_command "$compose_project" '
         set -e
         [ -f composer.lock ] || exit 1
@@ -4352,6 +4354,7 @@ _run_preflight_checks() {
             | awk '{printf "%d", $1}')"
         if [ -n "$load_1m" ] && [ "$load_1m" -gt "$max_load" ]; then
             printf '[preflight] ✗ host load too high (1-min avg: %s, threshold: %s)\n' "$load_1m" "$max_load" >&2
+            # shellcheck disable=SC2016  # The backticks are literal output, not command substitution.
             printf '            └─ Wait until load <%s (run `uptime`), or close heavy apps (Claude Desktop / Chrome / Telegram / antivirus), or set SWCTL_MAX_LOAD=999 to skip.\n' "$max_load" >&2
             failed=1
         else
@@ -8599,8 +8602,8 @@ Usage:
 Commands:
   init        Idempotent setup of Traefik, MariaDB, Redis, and the swctl Docker network.
   create      Create a worktree. --qa: auto-build everything needed (vendor from trunk). --dev: writable vendor (default).
-              --enable-es / --no-enable-es overrides the auto-detect: when the issue has a `component/search`,
-              `component/elasticsearch`, or `domain/search` label, swctl writes SHOPWARE_ES_* into .env.local
+              --enable-es / --no-enable-es overrides the auto-detect: when the issue has a \`component/search\`,
+              \`component/elasticsearch\`, or \`domain/search\` label, swctl writes SHOPWARE_ES_* into .env.local
               and runs es:index in post-provision.  Useful when the resolver wants ES live before testing.
   batch       Batch create worktrees from CLI pairs, a file, or GitLab/GitHub MRs.
   status      Show tracked worktrees, routed domains, container state, and DB mode.
