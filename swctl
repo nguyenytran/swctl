@@ -6413,7 +6413,7 @@ _preview_start() {
     # still recover the URL (idempotent).
     if container_running "$container_name"; then
         local current_url
-        current_url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        current_url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1 || true)"
         if [ -n "$current_url" ]; then
             PREVIEW_URL="$current_url"
             PREVIEW_CONTAINER="$container_name"
@@ -6482,7 +6482,7 @@ _preview_start() {
     local attempt
     for attempt in 1 2 3 4 5 6; do
         sleep 5
-        url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1 || true)"
         [ -n "$url" ] && break
         # If the container died, fail fast instead of waiting out the budget.
         if ! container_running "$container_name"; then
@@ -6532,7 +6532,7 @@ _preview_status() {
 
     if container_running "$container_name"; then
         local url
-        url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1 || true)"
         ok "Preview running for '${ISSUE_ID}':"
         info "  URL:       ${url:-${PREVIEW_URL:-(URL not yet emitted)}}"
         info "  Container: ${container_name}"
@@ -6569,7 +6569,7 @@ _preview_list() {
         if [ "$type" = "named" ]; then
             url="$urllabel"
         else
-            url="$(docker logs "$name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+            url="$(docker logs "$name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1 || true)"
         fi
         records+=("${issue}|${type}|${name}|${state}|${url}")
     done < <(docker ps -a --filter 'label=swctl-preview' \
