@@ -251,6 +251,15 @@ export async function stopTunnel(container: string): Promise<{ ok: boolean; outp
   return res.json()
 }
 
+export async function reapTunnels(hours: number): Promise<{ ok: boolean; stopped?: string[]; error?: string }> {
+  const res = await fetch(`${BASE}/tunnels/reap`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hours }),
+  })
+  return res.json()
+}
+
 export async function fetchDirectories(dirPath?: string): Promise<{
   current: string
   parent: string

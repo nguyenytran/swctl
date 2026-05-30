@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
+import QRCode from 'qrcode'
 import {
-  getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig,
+  getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig, reapTunnels,
   listCloudflaredTunnels, startCloudflaredLogin, cloudflaredLoginStatus, cancelCloudflaredLogin, getCloudflaredAccount, createCloudflaredTunnel,
   type Tunnel, type CloudflaredTunnel, type CloudflaredAccount,
 } from '@/api'
@@ -214,6 +215,39 @@ async function copy(url: string) {
   catch { message.value = 'Clipboard unavailable — copy manually.' }
 }
 
+// Share: QR code (great for opening a preview on a phone).
+const share = ref<{ url: string; dataUrl: string } | null>(null)
+async function openShare(url: string) {
+  try {
+    const dataUrl = await QRCode.toDataURL(url, { margin: 1, width: 220 })
+    share.value = { url, dataUrl }
+  } catch { message.value = 'Could not generate QR.' }
+}
+
+// Stop idle: reap previews older than N hours.
+const reapHours = ref(8)
+const reaping = ref(false)
+function requestReap() {
+  confirmAction.value = {
+    title: 'Stop idle previews',
+    message: `Stop all preview tunnels older than ${reapHours.value}h? Instances keep running — only their tunnels stop.`,
+    onConfirm: () => { confirmAction.value = null; void doReap() },
+  }
+}
+async function doReap() {
+  reaping.value = true
+  message.value = ''
+  try {
+    const r = await reapTunnels(reapHours.value)
+    message.value = r.ok ? `Stopped ${r.stopped?.length ?? 0} idle tunnel(s).` : `Failed: ${r.error || 'unknown error'}`
+    await load(true)
+  } catch (e: any) {
+    message.value = `Failed: ${e?.message || String(e)}`
+  } finally {
+    reaping.value = false
+  }
+}
+
 onMounted(() => { load(); loadConfig(); timer = setInterval(() => load(true), 10_000) })
 onUnmounted(() => { if (timer) clearInterval(timer); stopLoginPoll() })
 </script>
@@ -225,14 +259,30 @@ onUnmounted(() => { if (timer) clearInterval(timer); stopLoginPoll() })
         <h1 class="text-lg text-white font-medium">Tunnels</h1>
         <p class="text-sm text-gray-500">Cloudflare preview tunnels across all instances.</p>
       </div>
-      <button
-        class="px-3 py-1 text-sm rounded bg-surface text-gray-300 hover:text-white transition-colors inline-flex items-center gap-2 disabled:opacity-60"
-        :disabled="loading || refreshing"
-        @click="load(true)"
-      >
-        <span v-if="refreshing" class="inline-block w-3 h-3 border-2 border-gray-500 border-t-transparent rounded-full animate-spin" />
-        {{ refreshing ? 'Refreshing…' : 'Refresh' }}
-      </button>
+      <div class="flex items-center gap-2">
+        <!-- Stop idle previews older than N hours -->
+        <div class="flex items-center gap-1 text-xs text-gray-500">
+          <span>Stop idle &gt;</span>
+          <input v-model.number="reapHours" type="number" min="1" class="w-12 h-7 box-border bg-surface border border-border rounded px-1 text-center text-white focus:outline-none focus:border-blue-500" />
+          <span>h</span>
+          <button
+            class="px-2 py-1 rounded text-amber-300 hover:text-amber-200 disabled:opacity-50 inline-flex items-center gap-1"
+            :disabled="reaping || !reapHours"
+            @click="requestReap"
+          >
+            <span v-if="reaping" class="inline-block w-3 h-3 border-2 border-amber-300 border-t-transparent rounded-full animate-spin" />
+            Stop idle
+          </button>
+        </div>
+        <button
+          class="px-3 py-1 text-sm rounded bg-surface text-gray-300 hover:text-white transition-colors inline-flex items-center gap-2 disabled:opacity-60"
+          :disabled="loading || refreshing"
+          @click="load(true)"
+        >
+          <span v-if="refreshing" class="inline-block w-3 h-3 border-2 border-gray-500 border-t-transparent rounded-full animate-spin" />
+          {{ refreshing ? 'Refreshing…' : 'Refresh' }}
+        </button>
+      </div>
     </div>
 
     <!-- Named-preview configuration (.swctl.conf) -->
@@ -440,6 +490,12 @@ cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}' 
               @click="copy(t.url)"
             >Copy</button>
             <button
+              v-if="t.url"
+              class="px-2 py-0.5 text-xs rounded text-gray-400 hover:text-white disabled:opacity-50"
+              :disabled="busy[t.container]"
+              @click="openShare(t.url)"
+            >Share</button>
+            <button
               class="px-2 py-0.5 text-xs rounded text-red-400 hover:text-red-300 disabled:opacity-50 inline-flex items-center gap-1"
               :disabled="busy[t.container]"
               @click="requestStop(t)"
@@ -453,5 +509,20 @@ cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}' 
     </table>
 
     <ConfirmDialog v-if="confirmAction" v-bind="confirmAction" @cancel="confirmAction = null" />
+
+    <!-- Share: QR code for opening the preview on a phone -->
+    <Teleport to="body">
+      <div v-if="share" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50" @click.self="share = null">
+        <div class="bg-surface border border-border rounded-lg p-6 shadow-2xl text-center">
+          <h3 class="text-sm font-bold text-white mb-3">Scan to open the preview</h3>
+          <img :src="share.dataUrl" alt="QR code" class="mx-auto rounded bg-white p-2" width="220" height="220" />
+          <p class="mt-3 text-xs text-gray-400 font-mono break-all max-w-[240px]">{{ share.url }}</p>
+          <div class="mt-4 flex justify-center gap-3">
+            <button class="px-3 py-1.5 text-sm rounded bg-surface-dark text-gray-300 hover:text-white border border-border" @click="copy(share.url)">Copy URL</button>
+            <button class="px-3 py-1.5 text-sm rounded bg-surface-dark text-gray-300 hover:text-white border border-border" @click="share = null">Close</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>

@@ -1590,6 +1590,52 @@ app.delete('/api/tunnels/:container', async (c) => {
   }
 })
 
+// Stop preview tunnels idle longer than `hours`. Quick tunnels age by container
+// start time; named previews age by their ingress-file mtime. Stops are routed
+// through swctl so metadata + the shared tunnel stay consistent.
+app.post('/api/tunnels/reap', async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const hours = Number(body.hours)
+  if (!Number.isFinite(hours) || hours <= 0) return c.json({ ok: false, error: 'hours must be > 0' }, 400)
+  const cutoff = Date.now() - hours * 3600_000
+  const stopped: string[] = []
+
+  // Quick tunnels — by container StartedAt.
+  try {
+    const lines = execSync(`docker ps --filter 'label=swctl-preview-type=quick' --format '{{.Names}}|{{.Label "swctl-preview"}}'`,
+      { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split('\n').filter(Boolean)
+    for (const line of lines) {
+      const [name, issue] = line.split('|')
+      if (!name) continue
+      const started = Date.parse(execSync(`docker inspect -f '{{.State.StartedAt}}' ${name}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim())
+      if (started && started < cutoff) {
+        if (issue) await spawnSwctl(['preview', issue, '--stop'])
+        else { try { execSync(`docker rm -f ${name}`, { stdio: 'ignore' }) } catch {} }
+        stopped.push(`quick:${issue || name}`)
+      }
+    }
+  } catch { /* best-effort */ }
+
+  // Named previews — by ingress-file mtime.
+  try {
+    const base = `${cfHome()}/.cloudflared/swctl-ingress.d`
+    if (fs.existsSync(base)) {
+      for (const proj of fs.readdirSync(base)) {
+        const dir = `${base}/${proj}`
+        if (!fs.statSync(dir).isDirectory()) continue
+        for (const file of fs.readdirSync(dir)) {
+          if (!file.endsWith('.yml')) continue
+          if (fs.statSync(`${dir}/${file}`).mtimeMs >= cutoff) continue
+          const issue = file.replace(/^sw-/, '').split('.')[0]
+          if (issue) { await spawnSwctl(['preview', issue, '--named', '--stop']); stopped.push(`named:${issue}`) }
+        }
+      }
+    }
+  } catch { /* best-effort */ }
+
+  return c.json({ ok: true, stopped })
+})
+
 app.get('/api/stream/logs', (c) => {
   const issueId = c.req.query('issueId') || ''
   if (!issueId) return c.json({ error: 'Missing issueId' }, 400)
