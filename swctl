@@ -4492,6 +4492,87 @@ _run_preflight_checks() {
     fi
 }
 
+# Create an instance directly from a GitHub PR (URL or number).
+#
+# Resolves the PR's head branch via `gh`, derives a stable issue id, then
+# hands off to cmd_create --qa <issue> <branch>.  This is the "paste a PR
+# link, get a running instance" shortcut.
+#
+# Usage:
+#   swctl create-pr <pr-url-or-number> [owner/repo]
+#   swctl create-pr --resolve-only <ref> [owner/repo]   # print JSON, no create
+#
+# --resolve-only emits a single JSON line ({issue,branch,title,state,repo,...})
+# and exits.  The UI uses it to pre-fill the create form, so the PR-parsing
+# logic lives in exactly one place (here) rather than being duplicated in TS.
+#
+# Fork (cross-repository) PRs are rejected: their head branch isn't on origin,
+# so the QA worktree checkout would fail.
+cmd_create_from_pr() {
+    local resolve_only=0
+    if [ "${1:-}" = "--resolve-only" ]; then
+        resolve_only=1
+        shift
+    fi
+
+    local input="${1:-}"
+    [ -n "$input" ] || die "Usage: swctl create-pr [--resolve-only] <pr-url-or-number> [owner/repo]"
+    local repo="${2:-}"
+    local pr_num=""
+
+    case "$input" in
+        http*://*/pull/*)
+            # https://github.com/<owner>/<repo>/pull/<num>[/files|#...]
+            repo="$(printf '%s' "$input" | sed -E 's#^https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#')"
+            pr_num="$(printf '%s' "$input" | sed -E 's#.*/pull/([0-9]+).*#\1#')"
+            ;;
+        ''|*[!0-9]*)
+            die "Unrecognized PR reference: '$input' (expected a PR URL or number)"
+            ;;
+        *)
+            pr_num="$input"
+            ;;
+    esac
+    [ -n "$repo" ] || repo="shopware/shopware"
+    [ -n "$pr_num" ] || die "Could not parse a PR number from: '$input'"
+
+    require_cmd gh
+    require_cmd jq
+
+    [ "$resolve_only" -eq 1 ] || info "[create-pr] Fetching PR #$pr_num from $repo..."
+    local pr_json
+    pr_json="$(gh pr view "$pr_num" --repo "$repo" --json headRefName,title,state,isCrossRepository 2>&1)" \
+        || die "Failed to fetch PR #$pr_num from $repo: $pr_json"
+
+    local branch state cross title
+    branch="$(printf '%s' "$pr_json" | jq -r '.headRefName // empty')"
+    state="$(printf '%s' "$pr_json" | jq -r '.state // empty')"
+    cross="$(printf '%s' "$pr_json" | jq -r '.isCrossRepository // false')"
+    title="$(printf '%s' "$pr_json" | jq -r '.title // empty')"
+
+    [ -n "$branch" ] || die "PR #$pr_num has no head branch."
+    [ "$cross" = "true" ] && die "PR #$pr_num is from a fork (cross-repository); its branch isn't on origin, so it can't be checked out. Fork PRs aren't supported yet."
+
+    # Derive a stable issue id: prefer the first 3+ digit group in the branch
+    # (e.g. NEXT-12345, fix/12345-foo → 12345), else fall back to the PR number.
+    local issue=""
+    issue="$(printf '%s' "$branch" | grep -oE '[0-9]{3,}' | head -1 || true)"
+    [ -n "$issue" ] || issue="$pr_num"
+
+    if [ "$resolve_only" -eq 1 ]; then
+        jq -cn --arg issue "$issue" --arg branch "$branch" --arg title "$title" \
+            --arg state "$state" --arg repo "$repo" --arg pr "$pr_num" \
+            '{ok:true, issue:$issue, branch:$branch, title:$title, state:$state, repo:$repo, pr:($pr|tonumber)}'
+        return 0
+    fi
+
+    [ "$state" = "OPEN" ] || warn "PR #$pr_num is $state (not open) — creating anyway."
+    info "[create-pr] PR #$pr_num: \"$title\""
+    info "[create-pr] branch: $branch → issue: $issue"
+
+    cmd_create --qa "$issue" "$branch"
+}
+
 cmd_create() {
     SWCTL_MODE="${SWCTL_MODE:-dev}"
     local selected_project=""
@@ -9108,6 +9189,7 @@ swctl ${SWCTL_VERSION}
 Usage:
   swctl init
   swctl create [--qa|--dev] [--enable-es|--no-enable-es] <issue> [<branch>]
+  swctl create-pr <pr-url-or-number> [owner/repo]
   swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]
   swctl status
   swctl exec <issue> '<cmd>'
@@ -11167,6 +11249,11 @@ main() {
             ensure_state_dirs
             shift
             cmd_create "$@"
+            ;;
+        create-pr)
+            ensure_state_dirs
+            shift
+            cmd_create_from_pr "$@"
             ;;
         batch)
             ensure_state_dirs

@@ -4,7 +4,7 @@ import { useProjects } from '@/composables/useProjects'
 import { useActiveProject } from '@/composables/useActiveProject'
 import { useBatchCreate } from '@/composables/useBatchCreate'
 import { useInstances } from '@/composables/useInstances'
-import { fetchPlugins, fetchGitHubIssues, fetchGitHubStatus, githubLogout, requestDeviceCode, pollDeviceAuth } from '@/api'
+import { fetchPlugins, fetchGitHubIssues, fetchGitHubStatus, githubLogout, requestDeviceCode, pollDeviceAuth, resolvePr } from '@/api'
 import type { GitHubItem, GitHubAuthStatus } from '@/types'
 
 const emit = defineEmits<{ close: []; refresh: [] }>()
@@ -269,6 +269,32 @@ function addFromTextarea() {
     batch.addJob(e.issue, e.branch, selectedPlugin.value, depsString.value)
   }
   quickAddText.value = ''
+}
+
+// Paste-a-PR-link shortcut: resolve the PR's head branch and queue it.
+// Forces QA mode (we're testing an existing PR branch, not starting fresh).
+const prUrl = ref('')
+const prLoading = ref(false)
+const prError = ref('')
+async function addFromPr() {
+  const ref_ = prUrl.value.trim()
+  if (!ref_ || prLoading.value) return
+  prLoading.value = true
+  prError.value = ''
+  try {
+    const r = await resolvePr(ref_)
+    if (!r.ok || !r.issue || !r.branch) {
+      prError.value = r.error || 'Could not resolve that PR.'
+      return
+    }
+    mode.value = 'qa'
+    batch.addJob(r.issue, r.branch, selectedPlugin.value, depsString.value)
+    prUrl.value = ''
+  } catch (e: any) {
+    prError.value = e?.message || String(e)
+  } finally {
+    prLoading.value = false
+  }
 }
 
 function addManual() {
@@ -639,6 +665,27 @@ function handleNewBatch() {
         <div v-if="!batch.isRunning.value" class="flex-1 overflow-y-auto border-b border-border">
             <!-- Manual input -->
             <div v-if="inputMode === 'manual'" class="p-4 space-y-3">
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">From PR — paste a GitHub PR link</label>
+                <form @submit.prevent="addFromPr" class="flex gap-2">
+                  <input
+                    v-model="prUrl"
+                    :disabled="prLoading"
+                    class="flex-1 bg-surface-dark border border-border rounded px-3 py-1.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-colors disabled:opacity-50"
+                    placeholder="https://github.com/shopware/shopware/pull/12345"
+                  />
+                  <button
+                    type="submit"
+                    :disabled="!prUrl.trim() || prLoading"
+                    class="px-3 bg-surface hover:bg-surface-hover text-gray-300 text-sm rounded border border-border transition-colors disabled:opacity-40 inline-flex items-center gap-2"
+                  >
+                    <span v-if="prLoading" class="inline-block w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin" />
+                    {{ prLoading ? 'Resolving…' : 'Add PR' }}
+                  </button>
+                </form>
+                <p v-if="prError" class="mt-1 text-xs text-rose-400">{{ prError }}</p>
+                <p v-else class="mt-1 text-[11px] text-gray-600">Resolves the PR's branch and queues it in QA mode.</p>
+              </div>
               <div>
                 <label class="block text-xs text-gray-400 mb-1">Quick Add — paste issue IDs</label>
                 <div class="flex gap-2">

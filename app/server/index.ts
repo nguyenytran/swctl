@@ -1161,6 +1161,29 @@ app.get('/api/stream/create', (c) => {
   return streamSwctl(c, args, `create:${issue}`, undefined, getSource(c))
 })
 
+// Resolve a GitHub PR (URL or number) → { issue, branch, title, state, repo }.
+// Parsing/branch-derivation lives in `swctl create-pr --resolve-only` so the
+// logic isn't duplicated here; the UI uses this to pre-fill the create form.
+app.get('/api/pr/resolve', async (c) => {
+  const ref = (c.req.query('ref') || '').trim()
+  const repo = (c.req.query('repo') || '').trim()
+  if (!ref) return c.json({ ok: false, error: 'Missing ref parameter' }, 400)
+
+  const args = ['create-pr', '--resolve-only', ref]
+  if (repo) args.push(repo)
+  const result = await spawnSwctl(args)
+  if (!result.ok) {
+    return c.json({ ok: false, error: (result.output || 'Failed to resolve PR').trim() })
+  }
+  // swctl prints a single JSON line on success; tolerate leading log noise.
+  const line = (result.output || '').trim().split('\n').filter(Boolean).pop() || ''
+  try {
+    return c.json(JSON.parse(line))
+  } catch {
+    return c.json({ ok: false, error: `Could not parse PR resolution: ${line.slice(0, 200)}` })
+  }
+})
+
 app.get('/api/stream/clean', (c) => {
   const issueId = c.req.query('issueId') || ''
   const force = c.req.query('force') === '1'

@@ -433,6 +433,25 @@ export function buildCreateUrl(params: {
   return u.pathname + u.search
 }
 
+export interface PrResolution {
+  ok: boolean
+  issue?: string
+  branch?: string
+  title?: string
+  state?: string
+  repo?: string
+  pr?: number
+  error?: string
+}
+
+export async function resolvePr(ref: string, repo?: string): Promise<PrResolution> {
+  const u = new URL(`${BASE}/pr/resolve`, window.location.origin)
+  u.searchParams.set('ref', ref)
+  if (repo) u.searchParams.set('repo', repo)
+  const res = await fetch(u.pathname + u.search)
+  return res.json()
+}
+
 export function buildStreamUrl(action: string, params: Record<string, string>): string {
   const u = new URL(`${BASE}/stream/${action}`, window.location.origin)
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v)
