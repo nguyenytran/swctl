@@ -241,6 +241,12 @@ export async function stopNamedPreview(issueId: string): Promise<{ ok: boolean; 
   return res.json()
 }
 
+// Reset an instance to a clean DB (re-clone the base). Destructive.
+export async function resetInstanceDb(issueId: string): Promise<{ ok: boolean; output: string }> {
+  const res = await fetch(`${BASE}/instances/${issueId}/reset`, { method: 'POST' })
+  return res.json()
+}
+
 // Fleet-wide tunnel management (quick + named) for the Tunnels panel.
 export interface Tunnel {
   issue: string

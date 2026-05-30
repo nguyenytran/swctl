@@ -1345,6 +1345,14 @@ app.delete('/api/instances/:issueId/preview', async (c) => {
   return c.json({ ok: result.ok, output: result.output })
 })
 
+// Reset an instance to a clean database (re-clone the base DB). Destructive —
+// the UI confirms first; swctl's interactive guard is skipped (non-tty).
+app.post('/api/instances/:issueId/reset', async (c) => {
+  const issueId = c.req.param('issueId')
+  const result = await spawnSwctl(['reset', issueId])
+  return c.json({ ok: result.ok, output: result.output })
+})
+
 // Enumerate Cloudflare named tunnels (for the config dropdown). cloudflared
 // isn't installed in this container, so run it via its docker image with the
 // host's ~/.cloudflared mounted (origin cert). Runs as root so the 0600 cert

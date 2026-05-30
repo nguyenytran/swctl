@@ -6192,6 +6192,36 @@ cmd_restore() {
     _snapshot_restore "$snap_dir" "$name"
 }
 
+# Reset an instance to a clean database by re-cloning the shared base DB into
+# the instance's DB. Worktree, containers and code are untouched — only the DB
+# is wiped + reloaded (fast way to undo polluted test data without recreate).
+cmd_reset() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl reset <issue>  (wipes the instance DB and re-clones the base)"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" \
+        || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+    SWCTL_ACTIVE_META_FILE="$meta_file"
+    [ -n "${DB_NAME:-}" ] || die "Instance '${ISSUE_ID:-$issue_input}' has no DB_NAME in metadata."
+
+    local source_db
+    source_db="$(sanitize_db_identifier "$SW_DB_SHARED_NAME")"
+    warn "Reset DROPS and re-clones the database for '${ISSUE_ID}' from base '${source_db}'."
+    warn "All data in '${DB_NAME}' is lost; the worktree, containers and code stay untouched."
+    # Interactive guard for CLI use; the UI does its own confirm (non-tty → skip).
+    if [ -t 0 ]; then
+        printf "Type the issue id (%s) to confirm: " "$ISSUE_ID" >&2
+        local ans; read -r ans
+        [ "$ans" = "$ISSUE_ID" ] || die "Aborted."
+    fi
+    clone_database "$source_db" "$DB_NAME"
+    run_app_command "$COMPOSE_PROJECT" "bin/console cache:clear" >/dev/null 2>&1 || true
+    ok "Instance '${ISSUE_ID}' reset to a clean database (from '${source_db}')."
+}
+
 # Resolve the snapshots directory for the currently-loaded instance.
 # Caller must have populated SW_PROJECT_SLUG and ISSUE_ID via
 # load_instance_metadata first.
@@ -9090,6 +9120,7 @@ Usage:
   swctl clean <issue>
   swctl snapshot <issue> [<name>|--list|--delete <name>]
   swctl restore <issue> <name>
+  swctl reset <issue>
   swctl preview <issue> [--stop|--status]
   swctl preview <issue> --named [--stop|--status]
   swctl preview list | stop-all
@@ -11209,6 +11240,10 @@ main() {
             ensure_state_dirs
             shift
             cmd_restore "$@"
+            ;;
+        reset)
+            shift
+            cmd_reset "$@"
             ;;
         preview)
             ensure_state_dirs

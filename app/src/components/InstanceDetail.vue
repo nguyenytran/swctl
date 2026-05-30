@@ -6,7 +6,7 @@ import { stopInstance, startInstance, restartInstance, buildStreamUrl, killExec,
 import {
   listSnapshots, createSnapshot, deleteSnapshot, restoreSnapshot,
   getPreviewStatus, startPreview, stopPreview,
-  getNamedPreview, startNamedPreview, stopNamedPreview,
+  getNamedPreview, startNamedPreview, stopNamedPreview, resetInstanceDb,
   type Snapshot,
 } from '@/api'
 import { usePlugins } from '@/composables/usePlugins'
@@ -368,6 +368,24 @@ async function copyNamedUrl() {
   if (!namedUrl.value) return
   try { await navigator.clipboard.writeText(namedUrl.value); namedMessage.value = 'URL copied to clipboard.' }
   catch { namedMessage.value = 'Clipboard unavailable — copy manually.' }
+}
+
+// Reset DB to a clean base (destructive). Inline two-step confirm — no browser dialog.
+const resetArmed = ref(false)
+const resetting = ref(false)
+const resetMessage = ref('')
+async function doReset() {
+  resetting.value = true
+  resetMessage.value = ''
+  try {
+    const r = await resetInstanceDb(props.instance.issueId)
+    resetMessage.value = r.ok ? 'Database reset to a clean base.' : `Reset failed: ${r.output}`
+  } catch (e: any) {
+    resetMessage.value = `Reset failed: ${e?.message || String(e)}`
+  } finally {
+    resetting.value = false
+    resetArmed.value = false
+  }
 }
 
 async function loadPreview() {
@@ -1322,6 +1340,38 @@ function formatDate(iso: string) {
           </table>
 
           <p v-if="snapshotMessage" class="mt-3 text-xs text-gray-400">{{ snapshotMessage }}</p>
+        </section>
+
+        <!-- Danger zone: reset DB to a clean base -->
+        <section class="rounded border border-rose-800/50 bg-rose-900/10 p-4">
+          <header class="mb-2">
+            <h3 class="text-base font-semibold text-rose-300">Reset database</h3>
+          </header>
+          <p class="text-xs text-gray-400 mb-3">
+            Re-clones the base database into this instance — a fast way to undo polluted test data.
+            The worktree, containers and code are untouched, but <strong>all data in the instance DB is lost</strong>.
+          </p>
+          <div class="flex items-center gap-3">
+            <template v-if="!resetArmed">
+              <button
+                class="px-3 py-1.5 text-sm rounded font-medium bg-rose-800 hover:bg-rose-700 text-white"
+                @click="resetArmed = true"
+              >Reset database…</button>
+            </template>
+            <template v-else>
+              <span class="text-xs text-rose-300">This wipes the DB. Sure?</span>
+              <button
+                :disabled="resetting"
+                class="px-3 py-1.5 text-sm rounded font-medium bg-rose-700 hover:bg-rose-600 text-white disabled:opacity-60 inline-flex items-center gap-2"
+                @click="doReset"
+              >
+                <span v-if="resetting" class="inline-block w-3 h-3 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
+                {{ resetting ? 'Resetting…' : 'Yes, reset' }}
+              </button>
+              <button class="px-2 py-1 text-xs rounded text-gray-400 hover:text-white" :disabled="resetting" @click="resetArmed = false">Cancel</button>
+            </template>
+            <span v-if="resetMessage" class="text-xs text-gray-400">{{ resetMessage }}</span>
+          </div>
         </section>
       </div>
 
