@@ -152,6 +152,23 @@ export async function stopPreview(issueId: string): Promise<{ ok: boolean; outpu
   return res.json()
 }
 
+// Named-preview tunnel configuration (project .swctl.conf).
+export interface TunnelConfig { domain: string; tunnelId: string }
+
+export async function getTunnelConfig(): Promise<TunnelConfig> {
+  const res = await fetch(`${BASE}/tunnel-config`)
+  return res.json()
+}
+
+export async function saveTunnelConfig(cfg: TunnelConfig): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${BASE}/tunnel-config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cfg),
+  })
+  return res.json()
+}
+
 // Named preview (stable sw-<issue>.<domain>) — per instance.
 export async function getNamedPreview(issueId: string): Promise<{ ok: boolean; running: boolean; url: string | null }> {
   const res = await fetch(`${BASE}/instances/${issueId}/named-preview`)

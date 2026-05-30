@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import { getTunnels, stopTunnel, stopNamedPreview, type Tunnel } from '@/api'
+import { getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig, type Tunnel } from '@/api'
 import ConfirmDialog from './ConfirmDialog.vue'
 
 /**
@@ -21,6 +21,34 @@ const busy = ref<Record<string, boolean>>({})
 const message = ref('')
 const confirmAction = ref<{ title: string; message: string; onConfirm: () => void } | null>(null)
 let timer: ReturnType<typeof setInterval> | null = null
+
+// Named-preview config (SW_PREVIEW_* in .swctl.conf)
+const showConfig = ref(false)
+const cfgDomain = ref('')
+const cfgTunnelId = ref('')
+const cfgSaving = ref(false)
+const cfgMessage = ref('')
+
+async function loadConfig() {
+  try {
+    const c = await getTunnelConfig()
+    cfgDomain.value = c.domain || ''
+    cfgTunnelId.value = c.tunnelId || ''
+  } catch { /* ignore */ }
+}
+
+async function saveConfig() {
+  cfgSaving.value = true
+  cfgMessage.value = ''
+  try {
+    const r = await saveTunnelConfig({ domain: cfgDomain.value.trim(), tunnelId: cfgTunnelId.value.trim() })
+    cfgMessage.value = r.ok ? 'Saved to .swctl.conf.' : `Failed: ${r.error || 'unknown error'}`
+  } catch (e: any) {
+    cfgMessage.value = `Failed: ${e?.message || String(e)}`
+  } finally {
+    cfgSaving.value = false
+  }
+}
 
 async function load(isRefresh = false) {
   if (isRefresh) refreshing.value = true
@@ -72,7 +100,7 @@ async function copy(url: string) {
   catch { message.value = 'Clipboard unavailable — copy manually.' }
 }
 
-onMounted(() => { load(); timer = setInterval(() => load(true), 10_000) })
+onMounted(() => { load(); loadConfig(); timer = setInterval(() => load(true), 10_000) })
 onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>
 
@@ -91,6 +119,61 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
         <span v-if="refreshing" class="inline-block w-3 h-3 border-2 border-gray-500 border-t-transparent rounded-full animate-spin" />
         {{ refreshing ? 'Refreshing…' : 'Refresh' }}
       </button>
+    </div>
+
+    <!-- Named-preview configuration (.swctl.conf) -->
+    <div class="mb-4 rounded border border-white/10 bg-white/[0.02]">
+      <button
+        class="w-full flex items-center justify-between px-3 py-2 text-sm text-gray-300 hover:text-white"
+        @click="showConfig = !showConfig"
+      >
+        <span class="flex items-center gap-2">
+          <span class="text-gray-500">{{ showConfig ? '▾' : '▸' }}</span>
+          Configuration
+          <span v-if="!cfgDomain || !cfgTunnelId" class="text-xs text-amber-400/80">(named previews need a domain + tunnel)</span>
+        </span>
+        <span v-if="cfgDomain" class="text-xs text-gray-500 font-mono">sw-&lt;issue&gt;.{{ cfgDomain }}</span>
+      </button>
+      <div v-if="showConfig" class="px-3 pb-3 space-y-3 border-t border-white/5 pt-3">
+        <p class="text-xs text-gray-500">
+          Saved to the project's <code class="font-mono">.swctl.conf</code>. The tunnel must have a wildcard
+          <code class="font-mono">*.&lt;domain&gt;</code> DNS record and credentials at
+          <code class="font-mono">~/.cloudflared/&lt;tunnel-id&gt;.json</code>.
+        </p>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <label class="block">
+            <span class="text-xs text-gray-400">Preview domain</span>
+            <input
+              v-model="cfgDomain"
+              type="text"
+              placeholder="y-tn.dev"
+              spellcheck="false"
+              class="mt-1 w-full bg-surface border border-border rounded px-2 py-1 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
+            />
+          </label>
+          <label class="block">
+            <span class="text-xs text-gray-400">Tunnel ID (UUID)</span>
+            <input
+              v-model="cfgTunnelId"
+              type="text"
+              placeholder="502a0836-…"
+              spellcheck="false"
+              class="mt-1 w-full bg-surface border border-border rounded px-2 py-1 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
+            />
+          </label>
+        </div>
+        <div class="flex items-center gap-3">
+          <button
+            class="px-3 py-1.5 text-sm rounded font-medium bg-emerald-700 hover:bg-emerald-600 text-white disabled:opacity-60 inline-flex items-center gap-2"
+            :disabled="cfgSaving"
+            @click="saveConfig"
+          >
+            <span v-if="cfgSaving" class="inline-block w-3 h-3 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
+            {{ cfgSaving ? 'Saving…' : 'Save' }}
+          </button>
+          <span v-if="cfgMessage" class="text-xs text-gray-400">{{ cfgMessage }}</span>
+        </div>
+      </div>
     </div>
 
     <p v-if="message" class="text-sm text-gray-400 mb-3">{{ message }}</p>

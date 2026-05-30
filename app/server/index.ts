@@ -11,7 +11,7 @@ import path from 'path'
 import { readAllInstances } from './lib/metadata.js'
 import { computeCleanupState, computeCleanupStateBatch } from './lib/worktree-state.js'
 import { getContainerStatuses } from './lib/docker.js'
-import { readProjects, readProjectConfig, addProjectEntry, removeProjectEntry } from './lib/projects.js'
+import { readProjects, readProjectConfig, setProjectConfigKeys, addProjectEntry, removeProjectEntry } from './lib/projects.js'
 import { listWorkflows } from './lib/workflows.js'
 import { streamSwctl, spawnSwctl, isStreamActive, cancelStream, streamCommand, listActiveOperations } from './lib/stream.js'
 import { subscribe } from './lib/events.js'
@@ -1291,6 +1291,30 @@ app.delete('/api/instances/:issueId/preview', async (c) => {
   const issueId = c.req.param('issueId')
   const result = await spawnSwctl(['preview', issueId, '--stop'])
   return c.json({ ok: result.ok, output: result.output })
+})
+
+// Named-preview tunnel configuration (SW_PREVIEW_* in the project's .swctl.conf).
+app.get('/api/tunnel-config', (c) => {
+  const cfg = readProjectConfig()
+  return c.json({
+    domain: cfg['SW_PREVIEW_DOMAIN'] || '',
+    tunnelId: cfg['SW_PREVIEW_TUNNEL_ID'] || '',
+  })
+})
+
+app.post('/api/tunnel-config', async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const domain = String(body.domain ?? '').trim()
+  const tunnelId = String(body.tunnelId ?? '').trim()
+  // Light validation — empty is allowed (clears the value).
+  if (domain && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(domain)) {
+    return c.json({ ok: false, error: 'Invalid domain (e.g. example.dev)' }, 400)
+  }
+  if (tunnelId && !/^[A-Za-z0-9-]+$/.test(tunnelId)) {
+    return c.json({ ok: false, error: 'Invalid tunnel ID' }, 400)
+  }
+  const res = setProjectConfigKeys({ SW_PREVIEW_DOMAIN: domain, SW_PREVIEW_TUNNEL_ID: tunnelId })
+  return c.json(res, res.ok ? 200 : 400)
 })
 
 // Named preview (stable sw-<issue>.<domain> via the shared tunnel).

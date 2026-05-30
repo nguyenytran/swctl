@@ -83,6 +83,29 @@ export function removeProjectEntry(name: string): { ok: boolean; error?: string 
   return { ok: true }
 }
 
+// Update or insert specific keys in the project's .swctl.conf, preserving all
+// other lines/comments. Values are written double-quoted. Used by the UI to
+// edit settings like SW_PREVIEW_DOMAIN / SW_PREVIEW_TUNNEL_ID.
+export function setProjectConfigKeys(updates: Record<string, string>): { ok: boolean; error?: string } {
+  const PROJECT_ROOT = process.env.PROJECT_ROOT || '/project'
+  const confPath = path.join(PROJECT_ROOT, '.swctl.conf')
+  if (!fs.existsSync(confPath)) return { ok: false, error: `.swctl.conf not found at ${confPath}` }
+  try {
+    const lines = fs.readFileSync(confPath, 'utf8').split('\n')
+    for (const [key, rawVal] of Object.entries(updates)) {
+      const val = String(rawVal).replace(/["\n]/g, '')
+      const entry = `${key}="${val}"`
+      const idx = lines.findIndex((l) => l.trim().startsWith(`${key}=`))
+      if (idx >= 0) lines[idx] = entry
+      else lines.push(entry)
+    }
+    fs.writeFileSync(confPath, lines.join('\n'))
+    return { ok: true }
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) }
+  }
+}
+
 export function readProjectConfig(): Record<string, string> {
   const PROJECT_ROOT = process.env.PROJECT_ROOT || '/project'
   const confPath = path.join(PROJECT_ROOT, '.swctl.conf')
