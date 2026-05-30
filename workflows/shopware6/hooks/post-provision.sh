@@ -78,7 +78,94 @@ EOF
         2>/dev/null \
         || warn "[es] messenger:consume drain timed out / failed — index may still be filling in the background."
 
-    ok "[es] Elasticsearch enabled and indexed for ${COMPOSE_PROJECT}."
+    # Smoke test: verify search-suggest actually returns results.  This
+    # catches the "everything looked successful but search is empty"
+    # class of bug (the one the 2026-05-30 dal:refresh:index addition
+    # was meant to prevent) by failing LOUDLY at create time instead of
+    # the user discovering it 30 min later when they open the storefront.
+    _swctl_smoke_test_search
+}
+
+# Hit /store-api/search-suggest against the running instance and warn
+# loudly when total=0.  Gracefully no-ops when prerequisites (curl, jq,
+# access key, APP_URL) aren't available so it never blocks the create.
+#
+# Why store-api (not storefront /search): the storefront route renders
+# HTML — fragile to parse, theme-dependent.  The store-api JSON has a
+# stable `total` field that means exactly what it says.  Cost: we need
+# the sales-channel access key from the DB.  We extract it via
+# bin/console dbal:run-sql, which ships with the doctrine bundle that
+# Shopware already depends on.
+_swctl_smoke_test_search() {
+    [ "${SWCTL_ENABLE_ES:-0}" = "1" ] || return 0
+
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "[es-smoke] curl not installed on host — skipping smoke test."
+        return 0
+    fi
+    if [ -z "${APP_URL:-}" ]; then
+        warn "[es-smoke] APP_URL not set — skipping smoke test."
+        return 0
+    fi
+
+    local access_key
+    access_key="$(_smoke_fetch_sales_channel_access_key)"
+    if [ -z "$access_key" ]; then
+        warn "[es-smoke] could not extract sales-channel access key — skipping search smoke test."
+        warn "[es-smoke]   (override the term via SWCTL_SEARCH_SMOKE_TERM, or test manually:"
+        warn "[es-smoke]    curl -H 'sw-access-key: <KEY>' '${APP_URL}/store-api/search-suggest?search=A')"
+        return 0
+    fi
+
+    # Single uppercase 'A' is a deliberately broad term — matches at least
+    # one product in every Shopware demo dataset we've seen.  Override via
+    # .swctl.conf if your fixtures use a different language / charset.
+    local sample_term="${SWCTL_SEARCH_SMOKE_TERM:-A}"
+    local total
+    total="$(_smoke_search_suggest_total "$access_key" "$sample_term")"
+
+    if [ -n "$total" ] && [ "$total" -gt 0 ] 2>/dev/null; then
+        ok "[es-smoke] /store-api/search-suggest returned ${total} result(s) for '${sample_term}'."
+    else
+        warn "[es-smoke] /store-api/search-suggest returned 0 results for '${sample_term}' — search is likely broken."
+        warn "[es-smoke]   Diagnose: curl -H 'sw-access-key: ${access_key}' '${APP_URL}/store-api/search-suggest?search=${sample_term}&limit=1'"
+        warn "[es-smoke]   Likely fixes:"
+        warn "[es-smoke]     1. bin/console messenger:consume async --time-limit=60   (drain remaining indexing jobs)"
+        warn "[es-smoke]     2. bin/console dal:refresh:index                          (rebuild DAL search keywords)"
+        warn "[es-smoke]     3. bin/console es:index                                   (rebuild ES documents)"
+    fi
+}
+
+# Returns the first sales-channel access key on stdout, empty if not retrievable.
+# Pulls via bin/console dbal:run-sql so we don't have to know which DB
+# container alias/name the compose project uses (a moving target across
+# orbstack / standalone compose / future workflow templates).
+_smoke_fetch_sales_channel_access_key() {
+    local raw
+    raw="$(run_app_command "$COMPOSE_PROJECT" \
+        "bin/console dbal:run-sql --no-interaction --no-ansi 'SELECT access_key FROM sales_channel LIMIT 1' 2>/dev/null" \
+        2>/dev/null)" || return 0
+    # Shopware access keys are 32 uppercase alphanumerics, typically prefixed "SW".
+    # Tolerate other formats by accepting any 24+ uppercase alphanumeric token.
+    printf '%s' "$raw" | grep -oE '[A-Z0-9]{24,}' | head -1
+}
+
+# Curl the suggest endpoint, return its `total` field on stdout.
+# Empty string when curl fails or JSON can't be parsed.
+_smoke_search_suggest_total() {
+    local access_key="$1" term="$2"
+    local body
+    body="$(curl --max-time 15 -fsS \
+        -H "sw-access-key: ${access_key}" \
+        "${APP_URL}/store-api/search-suggest?search=${term}&limit=1" 2>/dev/null)" || return 0
+
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$body" | jq -r '.total // 0' 2>/dev/null
+    else
+        # Fallback: regex `"total":N` from raw JSON.  Good enough for the smoke
+        # check — we just need to distinguish 0 vs >0, not exact counts.
+        printf '%s' "$body" | grep -oE '"total":[0-9]+' | head -1 | grep -oE '[0-9]+'
+    fi
 }
 
 # QA mode: skip theme:refresh (the synced theme is fine) but still run
