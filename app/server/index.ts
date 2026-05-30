@@ -1326,8 +1326,52 @@ app.get('/api/cloudflared/tunnels', (c) => {
 const CF_LOGIN_CONTAINER = 'swctl-cf-login'
 const cfHome = () => process.env.HOME || ''
 
+// Parse ~/.cloudflared/cert.pem (origin cert) for the logged-in account/zone.
+// The ARGO TUNNEL TOKEN block base64-decodes to { zoneID, accountID, apiToken }.
+function readCfAccount(): { loggedIn: boolean; accountId?: string; zoneId?: string; token?: string } {
+  const certPath = `${cfHome()}/.cloudflared/cert.pem`
+  if (!fs.existsSync(certPath)) return { loggedIn: false }
+  try {
+    const pem = fs.readFileSync(certPath, 'utf8')
+    const m = pem.match(/-----BEGIN ARGO TUNNEL TOKEN-----([\s\S]*?)-----END ARGO TUNNEL TOKEN-----/)
+    if (!m) return { loggedIn: true }
+    const json = JSON.parse(Buffer.from(m[1].replace(/\s/g, ''), 'base64').toString('utf8'))
+    return { loggedIn: true, accountId: json.accountID, zoneId: json.zoneID, token: json.apiToken }
+  } catch { return { loggedIn: true } }
+}
+
+// Logged-in status for the UI (resolves the zone's human name, best-effort).
+app.get('/api/cloudflared/account', async (c) => {
+  const a = readCfAccount()
+  if (!a.loggedIn) return c.json({ loggedIn: false })
+  let zone = a.zoneId
+  if (a.token && a.zoneId) {
+    try {
+      const ctrl = new AbortController()
+      const t = setTimeout(() => ctrl.abort(), 6000)
+      const r = await fetch(`https://api.cloudflare.com/client/v4/zones/${a.zoneId}`, {
+        headers: { Authorization: `Bearer ${a.token}` },
+        signal: ctrl.signal,
+      })
+      clearTimeout(t)
+      const j: any = await r.json()
+      if (j?.success && j?.result?.name) zone = j.result.name
+    } catch { /* fall back to zoneId */ }
+  }
+  // Never leak the token to the client.
+  return c.json({ loggedIn: true, accountId: a.accountId, zoneId: a.zoneId, zone })
+})
+
 app.post('/api/cloudflared/login', async (c) => {
   const home = cfHome()
+  // Preserve the current account's cert so logging in with a different account
+  // is non-destructive (cloudflared login overwrites cert.pem on success).
+  const certPath = `${home}/.cloudflared/cert.pem`
+  if (fs.existsSync(certPath)) {
+    const prev = readCfAccount()
+    const tag = prev.accountId ? prev.accountId.slice(0, 8) : 'prev'
+    try { fs.copyFileSync(certPath, `${home}/.cloudflared/cert-${tag}.pem`) } catch {}
+  }
   try { execSync(`docker rm -f ${CF_LOGIN_CONTAINER}`, { stdio: 'ignore' }) } catch {}
   try {
     execSync(

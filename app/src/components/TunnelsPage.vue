@@ -2,8 +2,8 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import {
   getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig,
-  listCloudflaredTunnels, startCloudflaredLogin, cloudflaredLoginStatus, cancelCloudflaredLogin,
-  type Tunnel, type CloudflaredTunnel,
+  listCloudflaredTunnels, startCloudflaredLogin, cloudflaredLoginStatus, cancelCloudflaredLogin, getCloudflaredAccount,
+  type Tunnel, type CloudflaredTunnel, type CloudflaredAccount,
 } from '@/api'
 import ConfirmDialog from './ConfirmDialog.vue'
 
@@ -46,9 +46,21 @@ async function loadConfig() {
   } catch { /* ignore */ }
 }
 
+// Cloudflare login/account status
+const account = ref<CloudflaredAccount>({ loggedIn: false })
+const accountLoading = ref(false)
+
+async function loadAccount() {
+  accountLoading.value = true
+  try { account.value = await getCloudflaredAccount() } catch { /* ignore */ } finally { accountLoading.value = false }
+}
+
 function toggleConfig() {
   showConfig.value = !showConfig.value
-  if (showConfig.value && cfTunnels.value.length === 0) loadCfTunnels()
+  if (showConfig.value) {
+    if (cfTunnels.value.length === 0) loadCfTunnels()
+    loadAccount()
+  }
 }
 
 // Interactive Cloudflare login (browser auth from the UI).
@@ -79,7 +91,7 @@ async function pollLogin() {
     if (s.state === 'done') {
       stopLoginPoll()
       loginState.value = 'done'
-      await loadCfTunnels()
+      await Promise.all([loadCfTunnels(), loadAccount()])
     } else if (s.state === 'error' || s.state === 'idle') {
       stopLoginPoll()
       loginState.value = 'error'
@@ -213,6 +225,20 @@ onUnmounted(() => { if (timer) clearInterval(timer); stopLoginPoll() })
 
         <!-- Login / setup help: cloudflared login is an interactive browser
              flow, so it can't run from the UI — show the exact terminal steps. -->
+        <!-- Cloudflare login status -->
+        <div class="flex items-center gap-2 text-xs">
+          <span v-if="accountLoading" class="inline-block w-3 h-3 border-2 border-gray-500 border-t-transparent rounded-full animate-spin" />
+          <template v-else-if="account.loggedIn">
+            <span class="w-2 h-2 rounded-full bg-green-500 inline-block" />
+            <span class="text-gray-300">Logged in to Cloudflare</span>
+            <span v-if="account.zone" class="text-gray-500 font-mono">· {{ account.zone }}</span>
+          </template>
+          <template v-else>
+            <span class="w-2 h-2 rounded-full bg-amber-500 inline-block" />
+            <span class="text-amber-400/90">Not logged in to Cloudflare</span>
+          </template>
+        </div>
+
         <!-- Log in to Cloudflare straight from the UI. -->
         <div class="flex items-center gap-3 flex-wrap">
           <button
@@ -222,7 +248,9 @@ onUnmounted(() => { if (timer) clearInterval(timer); stopLoginPoll() })
             @click="doLogin"
           >
             <span v-if="loginState === 'starting' || loginState === 'waiting'" class="inline-block w-3 h-3 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
-            {{ loginState === 'waiting' ? 'Waiting for authorization…' : 'Log in to Cloudflare' }}
+            {{ loginState === 'waiting'
+              ? 'Waiting for authorization…'
+              : (account.loggedIn ? 'Log in with a different account' : 'Log in to Cloudflare') }}
           </button>
           <button
             v-if="loginState === 'waiting'"

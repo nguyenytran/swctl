@@ -162,6 +162,13 @@ export async function listCloudflaredTunnels(): Promise<{ ok: boolean; tunnels: 
   return res.json()
 }
 
+export interface CloudflaredAccount { loggedIn: boolean; accountId?: string; zoneId?: string; zone?: string }
+
+export async function getCloudflaredAccount(): Promise<CloudflaredAccount> {
+  const res = await fetch(`${BASE}/cloudflared/account`)
+  return res.json()
+}
+
 // Interactive Cloudflare login (browser auth, driven from the UI).
 export async function startCloudflaredLogin(): Promise<{ ok: boolean; url?: string; error?: string }> {
   const res = await fetch(`${BASE}/cloudflared/login`, { method: 'POST' })
