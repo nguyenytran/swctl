@@ -6349,7 +6349,7 @@ cmd_preview() {
     # Fleet-wide subcommands (no <issue> argument).
     case "${1:-}" in
         list|ls|--list)
-            _preview_list
+            _preview_list "${2:-}"
             return
             ;;
         stop-all|--stop-all)
@@ -6544,40 +6544,64 @@ _preview_status() {
 # pure docker queries so it works without project context.
 _preview_list() {
     require_cmd docker
+    local json=0
+    [ "${1:-}" = "--json" ] && json=1
+
+    # Collect records as TSV-ish "issue|type|container|status|url".
+    #
+    # A tunnel is linked to an instance via container labels:
+    #   swctl-preview=<issue>        (required to link)
+    #   swctl-preview-type=quick|named
+    #   swctl-preview-url=<hostname> (named tunnels — for display)
+    # Quick tunnels derive their URL from the cloudflared logs; named tunnels
+    # carry it in the url label (their hostname is fixed/known up front).
+    local records=() issue type urllabel name state url lbl
+    while IFS='|' read -r issue type urllabel name state; do
+        [ -n "$name" ] || continue
+        [ -z "$type" ] && type="quick"
+        if [ "$type" = "named" ]; then
+            url="$urllabel"
+        else
+            url="$(docker logs "$name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        fi
+        records+=("${issue}|${type}|${name}|${state}|${url}")
+    done < <(docker ps -a --filter 'label=swctl-preview' \
+        --format '{{.Label "swctl-preview"}}|{{.Label "swctl-preview-type"}}|{{.Label "swctl-preview-url"}}|{{.Names}}|{{.State}}' 2>/dev/null)
+
+    # Unlinked named tunnels: cloudflared containers with no swctl-preview label.
+    while IFS='|' read -r name state lbl; do
+        [ -n "$name" ] || continue
+        [ -n "$lbl" ] && continue   # already listed above (linked)
+        records+=("|named|${name}|${state}|")
+    done < <(docker ps -a --filter 'ancestor=cloudflare/cloudflared:latest' \
+        --format '{{.Names}}|{{.State}}|{{.Label "swctl-preview"}}' 2>/dev/null)
+
+    if [ "$json" -eq 1 ]; then
+        # jq is a hard dependency — build well-formed JSON safely.
+        if [ "${#records[@]}" -eq 0 ]; then printf '[]\n'; return 0; fi
+        printf '%s\n' "${records[@]}" | jq -R -s '
+            split("\n") | map(select(length > 0) | split("|"))
+            | map({issue: .[0], type: .[1], container: .[2], status: .[3], url: .[4]})'
+        return 0
+    fi
 
     local fmt='%-10s %-6s %-26s %-10s %s\n'
     # shellcheck disable=SC2059
     printf "$fmt" "ISSUE" "TYPE" "CONTAINER" "STATUS" "URL"
     printf '%s\n' "------------------------------------------------------------------------------"
-
-    local found=0
-
-    # Quick tunnels: identified by the swctl-preview=<issue> label.
-    local line issue name state
-    while IFS='|' read -r issue name state; do
-        [ -n "$name" ] || continue
-        found=1
-        local url
-        url="$(docker logs "$name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
-        # shellcheck disable=SC2059
-        printf "$fmt" "${issue:--}" "quick" "$(truncate_text 26 "$name")" "$state" "${url:--}"
-    done < <(docker ps -a --filter 'label=swctl-preview' \
-        --format '{{.Label "swctl-preview"}}|{{.Names}}|{{.State}}' 2>/dev/null)
-
-    # Named tunnels: cloudflared containers WITHOUT the swctl-preview label.
-    while IFS='|' read -r name state lbl; do
-        [ -n "$name" ] || continue
-        [ -n "$lbl" ] && continue   # already listed as a quick tunnel
-        found=1
-        # shellcheck disable=SC2059
-        printf "$fmt" "-" "named" "$(truncate_text 26 "$name")" "$state" "(named - see ~/.cloudflared)"
-    done < <(docker ps -a --filter 'ancestor=cloudflare/cloudflared:latest' \
-        --format '{{.Names}}|{{.State}}|{{.Label "swctl-preview"}}' 2>/dev/null)
-
-    if [ "$found" -eq 0 ]; then
+    if [ "${#records[@]}" -eq 0 ]; then
         info "No preview tunnels are running."
         info "Start one with: swctl preview <issue>"
+        return 0
     fi
+    local rec type
+    for rec in "${records[@]}"; do
+        IFS='|' read -r issue type name state url <<<"$rec"
+        local url_disp="$url"
+        [ -z "$url_disp" ] && [ "$type" = "named" ] && url_disp="(unlinked - see ~/.cloudflared)"
+        # shellcheck disable=SC2059
+        printf "$fmt" "${issue:--}" "$type" "$(truncate_text 26 "$name")" "$state" "${url_disp:--}"
+    done
 }
 
 # Stop & remove every swctl-managed quick tunnel in one shot.  Named tunnels
