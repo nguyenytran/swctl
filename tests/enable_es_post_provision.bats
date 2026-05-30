@@ -70,12 +70,22 @@ teardown() {
 # Source the hook into the current shell so `_swctl_enable_es_if_requested`
 # is callable from each test.  The hook body's QA-mode return short-
 # circuits BEFORE the function call, but we just need the function
-# definition — so we strip the runtime invocation off the top.
+# definitions — so we strip the runtime invocation off the top.
+#
+# We extract ALL helper functions the hook defines so that callers like
+# `_swctl_enable_es_if_requested` (which now invokes `_swctl_smoke_test_search`)
+# don't trip "command not found" / status 127 errors.  The sed runs one
+# pass per known function name; extraction is order-independent because
+# bash builds the function table at source-time.
 _load_hook_function() {
-    # `set +e` because the hook body has `set -euo pipefail` and a
-    # `return` at the QA-mode branch; sourcing it would exit the bats
-    # shell.  Extract the function body only.
-    sed -n '/^_swctl_enable_es_if_requested()/,/^}$/p' "$HOOK" > "$SW_TMP/hook-fn.sh"
+    : > "$SW_TMP/hook-fn.sh"
+    local fn
+    for fn in _swctl_enable_es_if_requested \
+              _swctl_smoke_test_search \
+              _smoke_fetch_sales_channel_access_key \
+              _smoke_search_suggest_total; do
+        sed -n "/^${fn}()/,/^}\$/p" "$HOOK" >> "$SW_TMP/hook-fn.sh"
+    done
     . "$SW_TMP/hook-fn.sh"
 }
 
@@ -96,8 +106,10 @@ _load_hook_function() {
     grep -q '^SHOPWARE_ES_HOSTS=http://opensearch:9200' "$WORKTREE_PATH/.env.local"
     grep -q '^SHOPWARE_ES_THROW_EXCEPTION=1' "$WORKTREE_PATH/.env.local"
 
-    # cache:clear + es:index chained under one docker exec
-    grep -q 'cache:clear && console es:index --no-interaction' "$CALL_LOG"
+    # cache:clear + dal:refresh:index + es:index chained under one docker exec.
+    # The dal:refresh:index step (added 2026-05-30) rebuilds product_search_keyword
+    # so es:index reads from fresh DAL data — see post-provision.sh header.
+    grep -q 'cache:clear && console dal:refresh:index --no-interaction && console es:index --no-interaction' "$CALL_LOG"
     # messenger:consume drains the queue
     grep -q 'messenger:consume async' "$CALL_LOG"
 }
