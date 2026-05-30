@@ -751,6 +751,10 @@ write_metadata() {
         # Defaults to claude for backwards compat with pre-v0.5.7 metadata —
         # any instance without RESOLVE_BACKEND is assumed claude at load time.
         printf 'RESOLVE_BACKEND=%q\n' "${RESOLVE_BACKEND:-claude}"
+        # Cloudflare quick-tunnel state (set by `swctl preview`).  Empty
+        # means no tunnel was ever started, OR the user ran --stop.
+        printf 'PREVIEW_URL=%q\n' "${PREVIEW_URL:-}"
+        printf 'PREVIEW_CONTAINER=%q\n' "${PREVIEW_CONTAINER:-}"
     } >"$meta_file"
 }
 
@@ -6316,6 +6320,202 @@ _snapshot_mtime_human() {
         || stat -c '%y' "$1" 2>/dev/null | cut -d. -f1
 }
 
+# Start a public Cloudflare quick-tunnel to the instance's web container
+# so reviewers/PMs/QA can hit it without VPN.  Quick-tunnels require NO
+# Cloudflare account — they issue a random https://<name>.trycloudflare.com
+# URL that lives as long as the cloudflared process runs.
+#
+# Subcommands:
+#   swctl preview <issue>            → start tunnel, print URL
+#   swctl preview <issue> --stop     → tear down tunnel (instance keeps running)
+#   swctl preview <issue> --status   → show current tunnel URL / state
+#
+# Cleanup: `swctl clean` automatically stops the tunnel via _preview_stop.
+#
+# Implementation: cloudflared runs in a sidecar container named
+# `swctl-preview-<issue>` on the same compose network as the app, so it
+# can resolve the app's container DNS directly.  Atomic naming + pre-emptive
+# `docker rm -f` of any orphan (matches the v0.6.22 populate pattern).
+cmd_preview() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl preview <issue> [--stop|--status]"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" \
+        || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+    SWCTL_ACTIVE_META_FILE="$meta_file"
+
+    case "${2:-}" in
+        --stop|stop)
+            _preview_stop
+            return
+            ;;
+        --status|status)
+            _preview_status
+            return
+            ;;
+        "")
+            _preview_start
+            return
+            ;;
+        *)
+            die "Usage: swctl preview <issue> [--stop|--status]"
+            ;;
+    esac
+}
+
+# Deterministic container name → docker enforces uniqueness atomically.
+# Sanitize the issue id with the same slug rules as compose project names
+# so `docker run --name` never refuses our payload.
+_preview_container_name() {
+    printf 'swctl-preview-%s' "$(sanitize_slug "$ISSUE_ID")"
+}
+
+_preview_start() {
+    [ -n "${COMPOSE_PROJECT:-}" ] || die "Instance has no COMPOSE_PROJECT in metadata."
+    require_cmd docker
+
+    local container_name
+    container_name="$(_preview_container_name)"
+
+    # Already-running fast path.  Refresh the stored URL from the
+    # container's logs so a previous swctl run that died mid-write can
+    # still recover the URL (idempotent).
+    if container_running "$container_name"; then
+        local current_url
+        current_url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        if [ -n "$current_url" ]; then
+            PREVIEW_URL="$current_url"
+            PREVIEW_CONTAINER="$container_name"
+            write_metadata "$SWCTL_ACTIVE_META_FILE"
+            ok "Preview already running: ${PREVIEW_URL}"
+            return 0
+        fi
+        # Container is up but the URL line never appeared — kill it and
+        # try again cleanly.
+        warn "Existing tunnel container has no URL — restarting."
+        docker rm -f "$container_name" >/dev/null 2>&1 || true
+    fi
+
+    # Orphan cleanup (e.g. cloudflared exited but Docker hasn't removed
+    # the container yet because we passed --rm AND it never started).
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
+
+    # Locate the app container + its compose network.  Without the
+    # network attachment, cloudflared can't resolve the app hostname.
+    local app_id
+    app_id="$(app_container_id "$COMPOSE_PROJECT")"
+    [ -n "$app_id" ] \
+        || die "App container for '${COMPOSE_PROJECT}' is not running. Start with 'swctl start ${ISSUE_ID}' or 'swctl refresh ${ISSUE_ID}'."
+
+    local network
+    network="$(docker inspect "$app_id" \
+        --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null \
+        | grep -E "^${COMPOSE_PROJECT}" | head -1)"
+    if [ -z "$network" ]; then
+        # Fallback: any network on the app container — covers projects
+        # that name their network without the compose-project prefix.
+        network="$(docker inspect "$app_id" \
+            --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null \
+            | head -1)"
+    fi
+    [ -n "$network" ] || die "Could not determine docker network for '${COMPOSE_PROJECT}'."
+
+    # App's container name (without the leading slash docker inspect adds).
+    local app_hostname
+    app_hostname="$(docker inspect "$app_id" --format '{{.Name}}' | sed 's|^/||')"
+
+    # Caddy in the Shopware dev container listens on :8000 by default.
+    # SW_INTERNAL_PORT lets the user override for non-standard compose
+    # templates (e.g. nginx on :80 inside a different runtime image).
+    local target_port="${SW_INTERNAL_PORT:-8000}"
+    local target="http://${app_hostname}:${target_port}"
+
+    info "Starting Cloudflare quick-tunnel → ${target} (network '${network}')"
+
+    if ! docker run -d \
+            --name "$container_name" \
+            --network "$network" \
+            --label "swctl-preview=${ISSUE_ID}" \
+            --label "swctl-preview-project=${SW_PROJECT_SLUG}" \
+            cloudflare/cloudflared:latest \
+            tunnel --no-autoupdate --url "$target" \
+            >/dev/null 2>&1; then
+        die "Failed to start cloudflared container.  Image pull blocked?  Try 'docker pull cloudflare/cloudflared:latest'."
+    fi
+
+    # Tail logs until the trycloudflare URL appears or the budget expires.
+    # cloudflared usually prints the URL within 5-10 s; budget for 30.
+    info "Waiting for tunnel URL (up to 30s)…"
+    local url=""
+    local attempt
+    for attempt in 1 2 3 4 5 6; do
+        sleep 5
+        url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        [ -n "$url" ] && break
+        # If the container died, fail fast instead of waiting out the budget.
+        if ! container_running "$container_name"; then
+            warn "cloudflared container exited before publishing a URL.  Logs:"
+            docker logs "$container_name" 2>&1 | sed 's/^/  /' >&2
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            die "Tunnel startup failed."
+        fi
+    done
+
+    if [ -z "$url" ]; then
+        warn "Could not capture trycloudflare URL after 30s. Tunnel may still be establishing."
+        warn "Tail manually: docker logs -f ${container_name}"
+        return 1
+    fi
+
+    PREVIEW_URL="$url"
+    PREVIEW_CONTAINER="$container_name"
+    write_metadata "$SWCTL_ACTIVE_META_FILE"
+
+    ok "Preview tunnel live: ${PREVIEW_URL}"
+    info "  Internal target: ${target}"
+    info "  Stop with: swctl preview ${ISSUE_ID} --stop"
+}
+
+_preview_stop() {
+    local container_name
+    container_name="$(_preview_container_name)"
+
+    if container_running "$container_name"; then
+        info "Stopping preview tunnel '${container_name}'…"
+        docker rm -f "$container_name" >/dev/null 2>&1 \
+            || warn "Failed to remove preview container; check 'docker ps -a'."
+    else
+        info "No running preview tunnel for issue '${ISSUE_ID}'."
+    fi
+
+    PREVIEW_URL=""
+    PREVIEW_CONTAINER=""
+    [ -n "${SWCTL_ACTIVE_META_FILE:-}" ] && write_metadata "$SWCTL_ACTIVE_META_FILE"
+    ok "Preview tunnel cleared for '${ISSUE_ID}'."
+}
+
+_preview_status() {
+    local container_name
+    container_name="$(_preview_container_name)"
+
+    if container_running "$container_name"; then
+        local url
+        url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        ok "Preview running for '${ISSUE_ID}':"
+        info "  URL:       ${url:-${PREVIEW_URL:-(URL not yet emitted)}}"
+        info "  Container: ${container_name}"
+    elif [ -n "${PREVIEW_URL:-}" ]; then
+        warn "Metadata has PREVIEW_URL but container '${container_name}' is not running."
+        info "  Last URL: ${PREVIEW_URL}"
+        info "  Restart with: swctl preview ${ISSUE_ID}"
+    else
+        info "No preview tunnel for issue '${ISSUE_ID}'."
+    fi
+}
+
 cmd_refresh() {
     local issue_input="${1:-}"
     SWCTL_ACTIVE_META_FILE=""
@@ -7026,6 +7226,19 @@ cmd_clean() {
     trap "rm -f '$meta_file' 2>/dev/null || true" EXIT
 
     load_instance_metadata "$meta_file"
+
+    # Stop the preview tunnel (if any) BEFORE we tear down the app
+    # container.  cloudflared loses its target seconds later anyway, but
+    # killing it explicitly avoids leaving an orphan container behind
+    # (the sidecar runs detached, not via compose, so `docker compose
+    # down` later won't sweep it).  No metadata write — we're about to
+    # rm the file anyway.
+    if [ -n "${PREVIEW_CONTAINER:-}" ]; then
+        docker rm -f "$PREVIEW_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    # Belt-and-braces: also try the deterministic name in case metadata
+    # was lost but the sidecar is still up.
+    docker rm -f "swctl-preview-$(sanitize_slug "$ISSUE_ID")" >/dev/null 2>&1 || true
 
     # Plugin-aware cleanup: remove nested plugin worktrees before trunk cleanup
     # In the new flow, plugin-external instances ARE trunk worktrees with a
@@ -8588,6 +8801,7 @@ Usage:
   swctl clean <issue>
   swctl snapshot <issue> [<name>|--list|--delete <name>]
   swctl restore <issue> <name>
+  swctl preview <issue> [--stop|--status]
   swctl resolve [--select] [--jobs N] <issue...>
   swctl resolve resume <issue>
   swctl resolve status
@@ -10704,6 +10918,11 @@ main() {
             ensure_state_dirs
             shift
             cmd_restore "$@"
+            ;;
+        preview)
+            ensure_state_dirs
+            shift
+            cmd_preview "$@"
             ;;
         refresh)
             ensure_state_dirs
