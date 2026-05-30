@@ -15,7 +15,7 @@ import InstanceDetail from './InstanceDetail.vue'
 import PluginSlot from './PluginSlot.vue'
 import { usePlugins } from '@/composables/usePlugins'
 import { useFeatures } from '@/composables/useFeatures'
-import { buildStreamUrl, buildCreateUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject, getTunnels, getInstanceObservability, type InstanceObservability } from '@/api'
+import { buildStreamUrl, buildCreateUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject, getTunnels, getInstanceObservability, getInstancePrs, type InstanceObservability, type PrInfo } from '@/api'
 import type { Instance, ExternalWorktree } from '@/types'
 
 const route = useRoute()
@@ -253,6 +253,7 @@ watch(lastEvent, (event) => {
 const { features } = useFeatures()
 const tunnelByIssue = ref<Record<string, string>>({})
 let tunnelTimer: ReturnType<typeof setInterval> | null = null
+let prTimer: ReturnType<typeof setInterval> | null = null
 
 async function loadTunnels() {
   if (!features.value.tunnelsEnabled) { tunnelByIssue.value = {}; return }
@@ -272,13 +273,26 @@ async function loadObs() {
   try { obsByProject.value = await getInstanceObservability() } catch { /* ignore */ }
 }
 
-onMounted(() => {
-  refresh()
+// GitHub PR status per instance (by issue id).
+const prByIssue = ref<Record<string, PrInfo | null>>({})
+async function loadPrs() {
+  const ids = instances.value.map(i => i.issueId).filter(Boolean)
+  if (!ids.length) return
+  try { prByIssue.value = await getInstancePrs(ids) } catch { /* ignore */ }
+}
+
+onMounted(async () => {
+  await refresh()
   loadTunnels()
   loadObs()
+  loadPrs()   // after refresh so instance issue ids are available
   tunnelTimer = setInterval(() => { loadTunnels(); loadObs() }, 10_000)
+  prTimer = setInterval(loadPrs, 30_000)
 })
-onUnmounted(() => { if (tunnelTimer) clearInterval(tunnelTimer) })
+onUnmounted(() => {
+  if (tunnelTimer) clearInterval(tunnelTimer)
+  if (prTimer) clearInterval(prTimer)
+})
 
 // If the user lands on /dashboard/instance/<id> for an instance we haven't
 // loaded yet (e.g. just-created), refresh so the detail view can render it.
@@ -390,6 +404,7 @@ watch(() => route.params.issueId, (id) => {
               :loading-action="pendingAction.get(inst.issueId) || null"
               :tunnel-url="tunnelByIssue[inst.issueId]"
               :obs="obsByProject[inst.composeProject]"
+              :pr="prByIssue[inst.issueId]"
               @toggle-select="toggleSelect(inst.issueId)"
               @delete="handleDelete(inst.issueId, inst.linkedPlugins.length > 0)"
               @retry="handleRetry(inst.issueId)"

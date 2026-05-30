@@ -183,6 +183,18 @@ app.get('/api/instances', cacheGet({ ttlMs: 5_000, tag: 'instances' }), async (c
   return c.json([...instances, ...fromRegistered, ...pluginFiltered, ...toolFiltered])
 })
 
+// PR status for the given instance issue ids (?ids=a,b,c). Reuses the resolve
+// PR lookup (one cached /pulls call per repo). Returns { [issueId]: PrInfo|null }.
+app.get('/api/instances/prs', async (c) => {
+  const ids = (c.req.query('ids') || '').split(',').map(s => s.trim()).filter(Boolean)
+  if (!ids.length) return c.json({})
+  try {
+    return c.json(await getPrsForIssues(ids))
+  } catch {
+    return c.json({})
+  }
+})
+
 // Per-instance observability: CPU/RAM (docker stats) + an HTTP health probe of
 // the web container. Keyed by compose project so the UI can match instances.
 app.get('/api/instances/observability', (c) => {

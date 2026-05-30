@@ -18,6 +18,8 @@ const props = defineProps<{
   tunnelUrl?: string
   /** Live CPU/RAM + HTTP health for this instance (by compose project). */
   obs?: { cpu: string; mem: string; healthy: boolean | null }
+  /** GitHub PR for this instance's branch, if any. */
+  pr?: { number?: number; state?: string; url?: string; draft?: boolean } | null
 }>()
 const emit = defineEmits<{
   delete: []
@@ -109,6 +111,20 @@ function provisionBadge(status: string) {
     <td class="px-4 py-3 text-gray-400 max-w-[200px] truncate" :title="instance.branch">
       {{ instance.branch || '—' }}
       <span v-if="instance.checkedOut" class="ml-1 text-[10px] px-1.5 py-0.5 rounded border border-orange-500/40 text-orange-400 bg-orange-500/10">checked out</span>
+      <a
+        v-if="pr && pr.number"
+        :href="pr.url"
+        target="_blank"
+        rel="noopener"
+        class="ml-1 text-[10px] px-1.5 py-0.5 rounded border"
+        :class="{
+          'border-emerald-500/40 text-emerald-300 bg-emerald-500/10': pr.state === 'OPEN' && !pr.draft,
+          'border-gray-500/40 text-gray-400 bg-gray-500/10': pr.draft || pr.state === 'CLOSED',
+          'border-purple-500/40 text-purple-300 bg-purple-500/10': pr.state === 'MERGED',
+        }"
+        :title="`PR #${pr.number} — ${pr.draft ? 'draft' : (pr.state || '').toLowerCase()}`"
+        @click.stop
+      >PR #{{ pr.number }}{{ pr.state === 'MERGED' ? ' ✓' : pr.draft ? ' ◌' : '' }}</a>
     </td>
     <td class="px-4 py-3">
       <button

@@ -152,6 +152,15 @@ export async function stopPreview(issueId: string): Promise<{ ok: boolean; outpu
   return res.json()
 }
 
+// PR status per instance issue id.
+export interface PrInfo { number?: number; title?: string; state?: string; url?: string; draft?: boolean; repo?: string }
+
+export async function getInstancePrs(ids: string[]): Promise<Record<string, PrInfo | null>> {
+  if (!ids.length) return {}
+  const res = await fetch(`${BASE}/instances/prs?ids=${encodeURIComponent(ids.join(','))}`)
+  return res.json()
+}
+
 // Per-instance observability (CPU/RAM + HTTP health), keyed by compose project.
 export interface InstanceObservability { cpu: string; mem: string; healthy: boolean | null }
 
