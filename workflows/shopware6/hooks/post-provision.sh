@@ -12,16 +12,24 @@ set -euo pipefail
 
 # Enable ES on the instance when the caller (swctl create) decided
 # this is a search-related issue.  Writes the four ES env vars
-# idempotently into .env.local, then runs es:create-aliases (if
-# needed), es:index, and drains the async queue so the index is
-# warm by the time the user opens the storefront.
+# idempotently into .env.local, then runs dal:refresh:index (rebuilds
+# product_search_keyword and other DAL indexes that the cloned DB
+# inherited stale from trunk), es:index, and drains the async queue
+# so the index is warm by the time the user opens the storefront.
+#
+# Why dal:refresh:index (added 2026-05-30):
+# - Cloned/synced DBs carry over trunk's product_search_keyword rows.
+# - Admin search (DAL) AND es:index (which reads from DAL) both see
+#   stale data → /admin and /store-api/search-suggest return wrong
+#   results until the user manually runs dal:refresh:index.
+# - Running it before es:index ensures ES is built from fresh DAL data.
 #
 # Idempotent: if SHOPWARE_ES_ENABLED is already set in .env.local,
 # the env-write is skipped (no duplicate stanza on `swctl refresh`).
 #
-# Failure mode: any individual ES step failing emits a `warn` but
+# Failure mode: any individual step failing emits a `warn` but
 # does NOT abort the post-provision.  The instance is still usable
-# with the MySQL fallback; user can re-run `es:index` manually.
+# with the MySQL fallback; user can re-run the commands manually.
 _swctl_enable_es_if_requested() {
     if [ "${SWCTL_ENABLE_ES:-0}" != "1" ]; then
         return 0
@@ -52,11 +60,13 @@ EOF
     fi
 
     # Cache clear so the kernel picks up the new env on the next
-    # console call.  Chain the next two console invocations under
-    # one docker exec to save ~3 s of PHP kernel boot each.
+    # console call.  Then refresh DAL indexes (DB-side, including
+    # product_search_keyword) BEFORE es:index so the ES rebuild reads
+    # from fresh DAL data.  Chained under one docker exec to save
+    # ~3 s of PHP kernel boot each.
     run_app_command "$COMPOSE_PROJECT" \
-        "$WORKFLOW_CONSOLE cache:clear && $WORKFLOW_CONSOLE es:index --no-interaction" \
-        || warn "[es] cache:clear / es:index failed."
+        "$WORKFLOW_CONSOLE cache:clear && $WORKFLOW_CONSOLE dal:refresh:index --no-interaction && $WORKFLOW_CONSOLE es:index --no-interaction" \
+        || warn "[es] cache:clear / dal:refresh:index / es:index failed."
 
     # Drain the async queue so the storefront sees freshly-indexed
     # documents immediately.  --time-limit caps the work so we don't
