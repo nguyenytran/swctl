@@ -152,6 +152,14 @@ export async function stopPreview(issueId: string): Promise<{ ok: boolean; outpu
   return res.json()
 }
 
+// Per-instance observability (CPU/RAM + HTTP health), keyed by compose project.
+export interface InstanceObservability { cpu: string; mem: string; healthy: boolean | null }
+
+export async function getInstanceObservability(): Promise<Record<string, InstanceObservability>> {
+  const res = await fetch(`${BASE}/instances/observability`)
+  return res.json()
+}
+
 // Named-preview tunnel configuration (project .swctl.conf).
 export interface TunnelConfig { domain: string; tunnelId: string }
 

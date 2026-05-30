@@ -16,6 +16,8 @@ const props = defineProps<{
   loadingAction?: 'stop' | 'start' | null
   /** Public preview URL for this instance, if a tunnel is running (feature-gated). */
   tunnelUrl?: string
+  /** Live CPU/RAM + HTTP health for this instance (by compose project). */
+  obs?: { cpu: string; mem: string; healthy: boolean | null }
 }>()
 const emit = defineEmits<{
   delete: []
@@ -135,6 +137,22 @@ function provisionBadge(status: string) {
           }"></span>
           {{ instance.containerStatus }}
         </span>
+        <!-- HTTP health + resource usage -->
+        <div v-if="obs && instance.containerStatus === 'running'" class="mt-1 flex items-center gap-2 text-[10px] text-gray-500">
+          <span
+            class="inline-flex items-center gap-1"
+            :title="obs.healthy === null ? 'health unknown' : obs.healthy ? 'storefront responds (HTTP 2xx)' : 'not responding'"
+          >
+            <span class="w-1.5 h-1.5 rounded-full" :class="{
+              'bg-emerald-400': obs.healthy === true,
+              'bg-red-400': obs.healthy === false,
+              'bg-gray-600': obs.healthy === null,
+            }"></span>
+            {{ obs.healthy === false ? 'down' : 'up' }}
+          </span>
+          <span :title="'CPU'">{{ obs.cpu }}</span>
+          <span :title="'memory'">{{ obs.mem }}</span>
+        </div>
       </template>
       <span v-else class="text-xs text-gray-600">—</span>
     </td>

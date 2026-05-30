@@ -15,7 +15,7 @@ import InstanceDetail from './InstanceDetail.vue'
 import PluginSlot from './PluginSlot.vue'
 import { usePlugins } from '@/composables/usePlugins'
 import { useFeatures } from '@/composables/useFeatures'
-import { buildStreamUrl, buildCreateUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject, getTunnels } from '@/api'
+import { buildStreamUrl, buildCreateUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject, getTunnels, getInstanceObservability, type InstanceObservability } from '@/api'
 import type { Instance, ExternalWorktree } from '@/types'
 
 const route = useRoute()
@@ -266,10 +266,17 @@ async function loadTunnels() {
   } catch { /* ignore */ }
 }
 
+// Live CPU/RAM + HTTP health per instance, keyed by compose project.
+const obsByProject = ref<Record<string, InstanceObservability>>({})
+async function loadObs() {
+  try { obsByProject.value = await getInstanceObservability() } catch { /* ignore */ }
+}
+
 onMounted(() => {
   refresh()
   loadTunnels()
-  tunnelTimer = setInterval(loadTunnels, 10_000)
+  loadObs()
+  tunnelTimer = setInterval(() => { loadTunnels(); loadObs() }, 10_000)
 })
 onUnmounted(() => { if (tunnelTimer) clearInterval(tunnelTimer) })
 
@@ -382,6 +389,7 @@ watch(() => route.params.issueId, (id) => {
               :selected="selected.has(inst.issueId)"
               :loading-action="pendingAction.get(inst.issueId) || null"
               :tunnel-url="tunnelByIssue[inst.issueId]"
+              :obs="obsByProject[inst.composeProject]"
               @toggle-select="toggleSelect(inst.issueId)"
               @delete="handleDelete(inst.issueId, inst.linkedPlugins.length > 0)"
               @retry="handleRetry(inst.issueId)"

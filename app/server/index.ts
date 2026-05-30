@@ -183,6 +183,43 @@ app.get('/api/instances', cacheGet({ ttlMs: 5_000, tag: 'instances' }), async (c
   return c.json([...instances, ...fromRegistered, ...pluginFiltered, ...toolFiltered])
 })
 
+// Per-instance observability: CPU/RAM (docker stats) + an HTTP health probe of
+// the web container. Keyed by compose project so the UI can match instances.
+app.get('/api/instances/observability', (c) => {
+  const out: Record<string, { cpu: string; mem: string; healthy: boolean | null }> = {}
+  try {
+    // name → compose project, and project → web container name
+    const projectOf: Record<string, string> = {}
+    const webOf: Record<string, string> = {}
+    for (const line of execSync(`docker ps --format '{{.Names}}|{{.Label "com.docker.compose.project"}}'`,
+      { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split('\n')) {
+      const [name, project] = line.split('|')
+      if (!name || !project) continue
+      projectOf[name] = project
+      if (/-(web|app)-\d+$/.test(name)) webOf[project] = name
+    }
+    // stats per container → attach to its project's web container
+    const statsOf: Record<string, { cpu: string; mem: string }> = {}
+    for (const line of execSync(`docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}'`,
+      { stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000 }).toString().trim().split('\n')) {
+      const [name, cpu, mem] = line.split('|')
+      if (name) statsOf[name] = { cpu: cpu || '–', mem: (mem || '').split(' / ')[0] || '–' }
+    }
+    for (const [project, web] of Object.entries(webOf)) {
+      const s = statsOf[web] || { cpu: '–', mem: '–' }
+      let healthy: boolean | null = null
+      try {
+        const code = execSync(
+          `docker exec ${web} sh -c "curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:8000/admin"`,
+          { stdio: ['ignore', 'pipe', 'ignore'], timeout: 6_000 }).toString().trim()
+        healthy = /^[23]\d\d$/.test(code)
+      } catch { healthy = false }
+      out[project] = { cpu: s.cpu, mem: s.mem, healthy }
+    }
+  } catch { /* return whatever we have */ }
+  return c.json(out)
+})
+
 // --- Pre-flight validation ---
 app.get('/api/preflight', async (c) => {
   const issue = c.req.query('issue') || ''
