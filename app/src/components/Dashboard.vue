@@ -281,6 +281,24 @@ async function loadPrs() {
   try { prByIssue.value = await getInstancePrs(ids) } catch { /* ignore */ }
 }
 
+// Instances whose PR has merged — safe to clean up. Drives the cleanup banner.
+const mergedPrInstances = computed(() =>
+  filteredInstances.value.filter(i => prByIssue.value[i.issueId]?.state === 'MERGED'),
+)
+function cleanMerged() {
+  const toDelete = mergedPrInstances.value
+  if (!toDelete.length) return
+  confirmAction.value = {
+    title: 'Clean merged-PR instances',
+    message: `Clean ${toDelete.length} instance(s) whose PR is merged? This removes each worktree, its database, and its tunnel. Cannot be undone.`,
+    onConfirm: () => {
+      batchDeleteInstances.value = toDelete
+      showBatchDelete.value = true
+      confirmAction.value = null
+    },
+  }
+}
+
 onMounted(async () => {
   await refresh()
   loadTunnels()
@@ -356,6 +374,20 @@ watch(() => route.params.issueId, (id) => {
         class="text-xs text-gray-500 hover:text-gray-300 ml-auto transition-colors"
         @click="selected = new Set()"
       >Clear</button>
+    </div>
+
+    <!-- Merged-PR cleanup banner (independent of the skeleton/table chain) -->
+    <div
+      v-if="mergedPrInstances.length > 0"
+      class="mb-3 flex items-center justify-between gap-3 rounded-lg border border-purple-500/30 bg-purple-500/10 px-4 py-2.5"
+    >
+      <span class="text-sm text-purple-200">
+        {{ mergedPrInstances.length }} instance(s) have a <strong>merged PR</strong> — safe to clean up.
+      </span>
+      <button
+        class="px-3 py-1 text-sm rounded bg-purple-600 hover:bg-purple-500 text-white font-medium"
+        @click="cleanMerged"
+      >Review &amp; clean</button>
     </div>
 
     <!-- Instances area — render a reserved-space skeleton while the
