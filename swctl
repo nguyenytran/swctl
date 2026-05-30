@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.6.1"
+SWCTL_VERSION="0.6.26"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -607,6 +607,88 @@ load_instance_metadata() {
     RESOLVE_BACKEND="${RESOLVE_BACKEND:-claude}"
 }
 
+# Cleanup hook fired by cmd_create's EXIT trap.
+#
+# Semantics: when create fails before any real artifact exists on disk
+# (typical for an early git-worktree-add or preflight failure), DELETE
+# the registry .env so the next create doesn't see a "phantom"
+# instance and refuse with "worktree already exists".  When create
+# fails AFTER artifacts exist (worktree dir / docker volumes / DB),
+# keep the .env and mark status=failed so the user can `swctl clean`
+# the leftovers.
+#
+# Decision signal: existence of WORKTREE_PATH on disk.  Cheap and
+# unambiguous — present means there's something for the next clean to
+# do, absent means there isn't.
+_create_failure_finalize() {
+    local meta_file="${SWCTL_ACTIVE_META_FILE:-}"
+    [ -n "$meta_file" ] || return 0
+
+    if [ -n "${WORKTREE_PATH:-}" ] && [ -d "$WORKTREE_PATH" ]; then
+        # Real artifacts exist → leave metadata so user can clean.
+        STATUS=failed
+        FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"
+        write_metadata "$meta_file" 2>/dev/null || true
+    else
+        # Nothing on disk → registry .env is the only artifact.
+        # Unlink it so subsequent `swctl create <same-issue>` can
+        # proceed without a manual `rm` from ~/.local/state.
+        rm -f "$meta_file" 2>/dev/null || true
+    fi
+}
+
+# Decide whether the freshly-created instance should have Elasticsearch
+# enabled (writes SHOPWARE_ES_* env, runs `es:index`, drains the queue
+# in post-provision).  Resolution precedence:
+#
+#   1. SWCTL_ENABLE_ES_OVERRIDE="1"  → force on  (`--enable-es`)
+#   2. SWCTL_ENABLE_ES_OVERRIDE="0"  → force off (`--no-enable-es`)
+#   3. Auto-detect from the issue's GitHub labels: any of
+#      `component/search`, `component/elasticsearch`, `domain/search`
+#      → on.  This catches the exact ~5 % of issues where the user
+#      tested an ES-dependent flow and got mysterious empty results
+#      because the worktree defaulted to MySQL fallback (the case
+#      that prompted this feature on 2026-05-11).
+#   4. Otherwise → off.  Skipping ES on non-search issues keeps the
+#      create path ~30–60 s faster (no es:index, no queue drain).
+#
+# Returns 0 when ES should be enabled, 1 otherwise.  Stdout receives
+# a one-line human-readable reason for the decision; the caller logs
+# it via `info "$(_decide_enable_es)"` so the audit trail is visible.
+_decide_enable_es() {
+    case "${SWCTL_ENABLE_ES_OVERRIDE:-}" in
+        1) printf 'forced on via --enable-es\n'; return 0 ;;
+        0) printf 'forced off via --no-enable-es\n'; return 1 ;;
+    esac
+
+    # Best-effort label fetch.  Quiet failures (no token, no network,
+    # plugin/external issue) fall through to "off" — never block the
+    # create on a 3rd-party API call.
+    local labels=""
+    local issue_id="${ISSUE_ID:-}"
+    if [ -z "$issue_id" ] || ! command -v gh >/dev/null 2>&1; then
+        printf 'auto-detect skipped (no gh CLI or ISSUE_ID)\n'
+        return 1
+    fi
+
+    # Default to shopware/shopware; let SWCTL_GITHUB_ORG/REPO override
+    # for plugin-issue scopes (the resolve path already populates the
+    # right repo into SWCTL_LABEL_FETCH_REPO when available).
+    local repo="${SWCTL_LABEL_FETCH_REPO:-${SWCTL_GITHUB_ORG:-shopware}/${SWCTL_GITHUB_REPO:-shopware}}"
+    labels="$(gh api "repos/${repo}/issues/${issue_id}" --jq '.labels[].name' 2>/dev/null || true)"
+    if [ -z "$labels" ]; then
+        printf 'auto-detect: no labels fetched for #%s (off)\n' "$issue_id"
+        return 1
+    fi
+
+    if printf '%s\n' "$labels" | grep -qiE '^(component/(search|elasticsearch)|domain/search)$'; then
+        printf 'auto-detect: matched ES-related label on #%s\n' "$issue_id"
+        return 0
+    fi
+    printf 'auto-detect: no ES-related label on #%s (off)\n' "$issue_id"
+    return 1
+}
+
 write_metadata() {
     local meta_file="$1"
 
@@ -669,6 +751,10 @@ write_metadata() {
         # Defaults to claude for backwards compat with pre-v0.5.7 metadata —
         # any instance without RESOLVE_BACKEND is assumed claude at load time.
         printf 'RESOLVE_BACKEND=%q\n' "${RESOLVE_BACKEND:-claude}"
+        # Cloudflare quick-tunnel state (set by `swctl preview`).  Empty
+        # means no tunnel was ever started, OR the user ran --stop.
+        printf 'PREVIEW_URL=%q\n' "${PREVIEW_URL:-}"
+        printf 'PREVIEW_CONTAINER=%q\n' "${PREVIEW_CONTAINER:-}"
     } >"$meta_file"
 }
 
@@ -1362,35 +1448,107 @@ check_branch_staleness() {
 
     if [ "$commits_behind" -gt 0 ]; then
         info "Branch '$BRANCH' is ${commits_behind} commits behind '${SW_BASE_BRANCH}'. Rebasing..."
-        if git -C "$WORKTREE_PATH" rebase "$BASE_REF" 2>&1; then
+
+        # Pass an explicit committer identity to the rebase.  Without
+        # this, when swctl runs inside the swctl-ui Docker container
+        # (no global git config; HOME=/root), the FIRST rebased commit
+        # bombs with:
+        #
+        #   Committer identity unknown
+        #   *** Please tell me who you are.
+        #   fatal: unable to auto-detect email address (got 'root@<id>.(none)')
+        #
+        # Two-tier fallback so we honor an existing identity when one
+        # is set (most host invocations) and only synthesize one inside
+        # the container.  The author of each commit is preserved either
+        # way — only the committer (whoever ran the rebase) changes.
+        local _git_id_args=()
+        local _user_email _user_name
+        _user_email="$(git -C "$WORKTREE_PATH" config --get user.email 2>/dev/null || true)"
+        _user_name="$(git -C "$WORKTREE_PATH" config --get user.name 2>/dev/null || true)"
+        if [ -z "$_user_email" ] || [ -z "$_user_name" ]; then
+            _git_id_args=(
+                -c "user.email=${_user_email:-swctl@local}"
+                -c "user.name=${_user_name:-swctl}"
+            )
+        fi
+
+        # Capture rebase output so we can distinguish failure modes.
+        # Real conflicts are common and warrant the long recovery
+        # message; other errors (config missing, network, corrupt
+        # repo) shouldn't be reported as "conflicts" — that's
+        # misleading and the recovery steps don't apply.
+        #
+        # The `${arr[@]+"${arr[@]}"}` dance is a bash-3.2 compatibility
+        # workaround: under `set -u`, expanding an empty array via
+        # `"${arr[@]}"` triggers "unbound variable" on macOS's stock
+        # bash.  The +"alternate" form expands to nothing when the
+        # array is empty, sidestepping the bug.
+        local _rebase_out _rebase_rc
+        set +e
+        _rebase_out="$(git -C "$WORKTREE_PATH" ${_git_id_args[@]+"${_git_id_args[@]}"} rebase "$BASE_REF" 2>&1)"
+        _rebase_rc=$?
+        set -e
+        if [ $_rebase_rc -eq 0 ]; then
             ok "Rebased '$BRANCH' onto '${SW_BASE_BRANCH}' (was ${commits_behind} commits behind)."
             return 0
         fi
 
-        # Rebase failed — almost always a real merge conflict.  Earlier
-        # behavior was `warn + rebase --abort + continue`, which silently
-        # shipped a non-rebased branch and left the user to discover later
-        # that their fix was tested against a stale base.  That's worse
-        # than failing fast: schema migrations, plugin-platform version
-        # skew, and DI compile breakage all routinely cascade from a
-        # branch that thinks it's against trunk@N but is actually against
-        # trunk@N-100.
-        #
-        # New behavior: abort the rebase to leave the worktree in a
-        # clean (un-rebased) state so the user can resolve manually,
-        # then DIE with explicit recovery instructions.  The trap in
-        # cmd_create marks STATUS=failed, so `swctl refresh <issue>`
-        # picks up where we left off after the user resolves.
+        # Always abort whatever in-progress rebase state remains so the
+        # worktree is clean for the user to inspect / re-rebase manually.
+        # The trap in cmd_create marks STATUS=failed, so `swctl refresh
+        # <issue>` picks up where we left off after the user resolves.
         git -C "$WORKTREE_PATH" rebase --abort 2>/dev/null || true
 
-        # Build a multi-line guidance message.  die() prints whatever we
-        # pass; embed the recovery steps so the user doesn't have to
-        # context-switch to figure out what to do.
-        local _staleness_note=""
-        if [ "$commits_behind" -gt 100 ] || [ "$days_behind" -gt 14 ]; then
-            _staleness_note=$'\n            (Branch is '"${commits_behind}"' commits / '"${days_behind}"' days behind — schema/dep mismatches likely.)'
-        fi
-        die "Rebase of '$BRANCH' onto '$SW_BASE_BRANCH' has conflicts. Stopping create.${_staleness_note}
+        # Branch on what kind of failure we hit.  Each pattern triggers
+        # a different recovery message — telling someone with a missing
+        # git identity to "resolve conflicts in your editor" wastes
+        # their time.
+        local _failure_kind="conflict"
+        case "$_rebase_out" in
+            *"unable to auto-detect email"*|*"Committer identity unknown"*|*"Please tell me who you are"*)
+                _failure_kind="identity"
+                ;;
+            *"could not apply"*|*"CONFLICT (content)"*|*"merge conflict"*|*"Merge conflict"*)
+                _failure_kind="conflict"
+                ;;
+            *)
+                # Anything else — print the raw output verbatim so the
+                # user has at least the original error to debug from.
+                _failure_kind="other"
+                ;;
+        esac
+
+        case "$_failure_kind" in
+            identity)
+                die "Rebase of '$BRANCH' onto '$SW_BASE_BRANCH' failed: git can't identify the committer.
+
+  swctl was running inside an environment without a git user.email /
+  user.name set (typically the swctl-ui container).
+
+  Set an identity for the worktree so future rebases work:
+
+    git -C $WORKTREE_PATH config user.email \"you@example.com\"
+    git -C $WORKTREE_PATH config user.name  \"Your Name\"
+
+  Or set a global identity once (recommended):
+
+    git config --global user.email \"you@example.com\"
+    git config --global user.name  \"Your Name\"
+
+  Then: swctl refresh ${ISSUE_ID:-<issue>}
+
+  (Note: swctl already falls back to 'swctl <swctl@local>' when no
+  identity is available.  If you're seeing this anyway, the worktree's
+  local git config disagrees with the host or container — re-check
+  with: git -C $WORKTREE_PATH config --get user.email)"
+                ;;
+            conflict)
+                local _staleness_note=""
+                if [ "$commits_behind" -gt 100 ] || [ "$days_behind" -gt 14 ]; then
+                    _staleness_note=$'\n            (Branch is '"${commits_behind}"' commits / '"${days_behind}"' days behind — schema/dep mismatches likely.)'
+                fi
+                die "Rebase of '$BRANCH' onto '$SW_BASE_BRANCH' has conflicts. Stopping create.${_staleness_note}
 
   Resolve the rebase manually, then resume:
 
@@ -1405,6 +1563,22 @@ check_branch_staleness() {
   Or, if you'd rather skip the rebase and proceed against the stale base:
 
     SWCTL_SKIP_STALENESS_REBASE=1 swctl refresh ${ISSUE_ID:-<issue>}"
+                ;;
+            *)
+                die "Rebase of '$BRANCH' onto '$SW_BASE_BRANCH' failed (not a merge conflict).
+
+  Original git output:
+
+${_rebase_out}
+
+  Fix the underlying issue (often a corrupt repo, missing remote, or
+  detached HEAD), then: swctl refresh ${ISSUE_ID:-<issue>}
+
+  Or skip the auto-rebase entirely:
+
+    SWCTL_SKIP_STALENESS_REBASE=1 swctl refresh ${ISSUE_ID:-<issue>}"
+                ;;
+        esac
     fi
 }
 
@@ -1756,6 +1930,45 @@ print('sync_dirs=\"{}\"'.format(' '.join(dirs)))
     fi
 }
 
+# v0.6.21: detect composer.lock drift between the worktree and trunk
+# (the project root that vendor-base-* was populated from).  Returns 0
+# if a drift is present, 1 if no drift or the check could not run.
+#
+# Why: in projects where composer.lock is gitignored (Shopware does this
+# for trunk + every worktree) the diff-based COMPOSER_CHANGES counter
+# can't see lock drift.  A branch that locked newer flysystem / removed
+# a package will get COMPOSER_CHANGES=0 from `count_changes`, which
+# routes the instance to the shared `vendor-base-trunk` volume — mounted
+# RO.  Bootstrap then sees the lock-vs-installed.json mismatch, tries
+# `composer install` against the RO mount, fails, and tags STATUS=failed
+# every time.  (#6072 incident 2026-05-17 was a textbook example.)
+#
+# Healing here: hash worktree's composer.lock vs the on-host trunk
+# composer.lock that `vendor-base-*` mirrors.  Differ → return 0 →
+# caller bumps COMPOSER_CHANGES so `resolve_vendor_volume` picks a
+# dedicated `vendor-<issue>` volume (cloned from base, writable), and
+# the in-container composer install succeeds.
+#
+# Never throws.  Missing lock on either side, missing hash util, or
+# WORKTREE_PATH=PROJECT_ROOT (trunk refresh) all return 1 (= no drift).
+_composer_lock_drifted_from_trunk() {
+    local wt_root="${WORKTREE_PATH:-}"
+    local trunk_root="${PROJECT_ROOT:-}"
+    [ -n "$wt_root" ] && [ -n "$trunk_root" ] || return 1
+    # Same path → not a worktree refresh; nothing to compare.
+    [ "$wt_root" = "$trunk_root" ] && return 1
+    local wt_lock="$wt_root/composer.lock"
+    local trunk_lock="$trunk_root/composer.lock"
+    [ -f "$wt_lock" ] && [ -f "$trunk_lock" ] || return 1
+    local h_wt h_trunk
+    h_wt="$( { shasum -a 256 "$wt_lock" 2>/dev/null \
+        || sha256sum "$wt_lock" 2>/dev/null; } | awk '{print $1}')"
+    h_trunk="$( { shasum -a 256 "$trunk_lock" 2>/dev/null \
+        || sha256sum "$trunk_lock" 2>/dev/null; } | awk '{print $1}')"
+    [ -n "$h_wt" ] && [ -n "$h_trunk" ] || return 1
+    [ "$h_wt" != "$h_trunk" ]
+}
+
 count_changes() {
     local diff_files="$1"
 
@@ -1795,6 +2008,15 @@ print('pat_backend=\"{}\"'.format(d.get('backend', '\\\\.php\$')))
     BACKEND_CHANGES="$(printf '%s\n' "$diff_files" | grep -E "$pat_backend" | grep -Evc "$pat_migration|$pat_entity" || true)"
     # Backward compat: FRONTEND_CHANGES = ADMIN + STOREFRONT
     FRONTEND_CHANGES="$((ADMIN_CHANGES + STOREFRONT_CHANGES))"
+
+    # v0.6.21: bump COMPOSER_CHANGES on gitignored-composer.lock drift.
+    # Detail in _composer_lock_drifted_from_trunk's header comment.
+    # Quiet on create (no worktree yet) — only fires on refresh of an
+    # existing worktree whose lockfile diverges from trunk's.
+    if _composer_lock_drifted_from_trunk; then
+        info "composer.lock drift detected vs ${SW_BASE_BRANCH:-trunk} — forcing dedicated vendor volume."
+        COMPOSER_CHANGES=$((COMPOSER_CHANGES + 1))
+    fi
 }
 
 sync_worktree_deps() {
@@ -1900,10 +2122,68 @@ _ensure_alpine_image() {
 # $3 sentinel relpath     (a file inside the source that proves population
 #                         succeeded — e.g. composer/installed.json for vendor,
 #                         package-lock.json for node_modules)
+# Compute a portable content key for a source dir.  Used to detect
+# when the host source has advanced past what's in `vendor-base-*`
+# / `*-nm-base-*` docker volumes (added 2026-05-15 after teammates
+# kept hitting "ClassNotFoundError: OpenSearch\\HttpClient\\GuzzleHttpClientFactory"
+# because their cached vendor volume was populated MONTHS ago at an
+# older trunk and there was no signal to invalidate it).
+#
+# For vendor we hash composer.lock — the canonical statement of what
+# versions SHOULD be installed.  For node_modules we hash either
+# package-lock.json or .package-lock.json (the latter is what npm
+# leaves inside node_modules/ after install).  Empty hash means
+# "couldn't compute" — caller treats as "no key" and falls back to
+# the old sentinel-only check.
+_compute_source_key() {
+    local src="$1"
+    local kind="${2:-}"   # 'vendor' | 'node_modules'
+
+    case "$kind" in
+        vendor)
+            # `$src` is the host's vendor/ dir.  Its sibling `composer.lock`
+            # lives in the parent (the project root).
+            local lock
+            lock="$(dirname "$src")/composer.lock"
+            [ -f "$lock" ] || return 0
+            shasum -a 256 "$lock" 2>/dev/null | awk '{print $1}' \
+                || sha256sum "$lock" 2>/dev/null | awk '{print $1}' \
+                || true
+            ;;
+        node_modules)
+            # The .package-lock.json lives INSIDE node_modules and reflects
+            # what npm last installed.  Falling back to ../package-lock.json
+            # (the source of truth for the next install) when missing.
+            local hash_file=""
+            if [ -f "$src/.package-lock.json" ]; then
+                hash_file="$src/.package-lock.json"
+            elif [ -f "$(dirname "$src")/package-lock.json" ]; then
+                hash_file="$(dirname "$src")/package-lock.json"
+            fi
+            [ -n "$hash_file" ] || return 0
+            shasum -a 256 "$hash_file" 2>/dev/null | awk '{print $1}' \
+                || sha256sum "$hash_file" 2>/dev/null | awk '{print $1}' \
+                || true
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
 _ensure_base_volume_populated() {
     local vol="$1"
     local src="$2"
     local sentinel="${3:-.swctl-populated}"
+    # v0.6.16: optional 4th arg — content key from the source.  When
+    # provided, the fast-path additionally compares it against the
+    # stored .swctl-source-key inside the volume; mismatch triggers a
+    # repopulate (overlay via cp -a — readers might briefly see
+    # transitional state but that's strictly better than the OLD
+    # "populated once, stale forever" behaviour that bit teammates
+    # whose vendor volume was provisioned months before the
+    # opensearch-php 2.6.0 bump landed in trunk).
+    local source_key="${4:-}"
 
     docker volume inspect "$vol" >/dev/null 2>&1 || \
         docker volume create "$vol" >/dev/null
@@ -1914,7 +2194,16 @@ _ensure_base_volume_populated() {
     # a stale or partially-empty volume.
     if docker run --rm -v "${vol}:/v" alpine sh -c \
         "test -f /v/.ready && test -f /v/${sentinel}" 2>/dev/null; then
-        return 0
+        if [ -z "$source_key" ]; then
+            return 0
+        fi
+        # Compare stored key to current source key.  Match = fast path.
+        local stored_key
+        stored_key="$(docker run --rm -v "${vol}:/v" alpine cat /v/.swctl-source-key 2>/dev/null || true)"
+        if [ "$stored_key" = "$source_key" ]; then
+            return 0
+        fi
+        info "Shared volume '$vol' source key advanced (${stored_key:0:8}… → ${source_key:0:8}…); refreshing in-place."
     fi
 
     [ -d "$src" ] || { warn "Source '$src' missing; volume '$vol' will stay empty."; return 1; }
@@ -1952,16 +2241,54 @@ _ensure_base_volume_populated() {
     # volume) was invisible.
     local run_err
     run_err="$(mktemp)"
-    if ! docker run --rm \
+    # v0.6.22: name the populate container deterministically and
+    # pre-kill any orphan with the same name.  Background:
+    # `docker run --rm` does NOT tie container lifetime to the parent
+    # shell — if swctl gets SIGKILL'd (UI restart, user Ctrl-C, OOM)
+    # while cp -a is mid-flight, the alpine container keeps running
+    # orphaned.  The next swctl run would then remove the (now-stale)
+    # swctl_lock for this volume and spawn a SECOND `cp -a` concurrent
+    # with the orphan, racing them on the same /dst — partial files,
+    # weird permission states, occasional hangs.  (2026-05-17 incident
+    # surfaced this when `swctl-ui restart` killed an in-flight
+    # populate and the next create's swctl_lock stale-recovery removed
+    # the dead-pid lock without seeing the still-running alpine
+    # container.)
+    #
+    # Fix: name the container `swctl-populate-<vol>` so docker enforces
+    # uniqueness atomically, and `docker rm -f` pre-emptively before
+    # the run so an orphan is terminated and removed.  swctl_lock still
+    # serializes parallel creates of the same project; this is the
+    # belt-and-suspenders cleanup that runs once we hold the lock.
+    local _populate_name="swctl-populate-${vol}"
+    docker rm -f "$_populate_name" >/dev/null 2>&1 || true
+    # Pass the source key through as an env var so the inline shell
+    # can write it AFTER cp -a + touch .ready.  Empty key → no marker
+    # written; subsequent reads fall back to "no key" path which is
+    # backward-compatible with volumes populated by older swctl.
+    if ! docker run --rm --name "$_populate_name" \
         -v "${src}:/src:ro" \
         -v "${vol}:/dst" \
-        alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>"$run_err" >/dev/null; then
+        -e SWCTL_SOURCE_KEY="$source_key" \
+        alpine sh -c '
+            set -e
+            cp -a /src/. /dst/
+            touch /dst/.ready
+            if [ -n "${SWCTL_SOURCE_KEY:-}" ]; then
+                printf "%s" "$SWCTL_SOURCE_KEY" > /dst/.swctl-source-key
+            fi
+            chown -R 1000:1000 /dst
+        ' 2>"$run_err" >/dev/null; then
         err "Failed to populate volume '$vol' from '$src'."
         if [ -s "$run_err" ]; then
             # Indent so it's obviously the docker output, not swctl's own.
             sed 's/^/  /' "$run_err" >&2
         fi
         rm -f "$run_err"
+        # If the docker run failed mid-way the container may have stuck
+        # around in "exited" or "created" state — clear it so the next
+        # invocation isn't blocked by a duplicate-name error.
+        docker rm -f "$_populate_name" >/dev/null 2>&1 || true
         return 1
     fi
     rm -f "$run_err"
@@ -1989,7 +2316,12 @@ _clone_docker_volume() {
 
     local run_err
     run_err="$(mktemp)"
-    if ! docker run --rm \
+    # v0.6.22: name the clone container + pre-kill any orphan.  Same
+    # rationale as in _ensure_base_volume_populated — see that
+    # function's `_populate_name` block for the full explanation.
+    local _clone_name="swctl-clone-${dst}"
+    docker rm -f "$_clone_name" >/dev/null 2>&1 || true
+    if ! docker run --rm --name "$_clone_name" \
         -v "${src}:/src:ro" \
         -v "${dst}:/dst" \
         alpine sh -c 'cp -a /src/. /dst/ && touch /dst/.ready && chown -R 1000:1000 /dst' 2>"$run_err" >/dev/null; then
@@ -1998,6 +2330,7 @@ _clone_docker_volume() {
             sed 's/^/  /' "$run_err" >&2
         fi
         rm -f "$run_err"
+        docker rm -f "$_clone_name" >/dev/null 2>&1 || true
         return 1
     fi
     rm -f "$run_err"
@@ -2227,17 +2560,26 @@ write_compose_volume_override() {
     # All volume ops are locked per-volume to avoid TOCTOU races when
     # multiple creates run in parallel.
     local _trunk_root="${PROJECT_ROOT:-/Users/ytran/Shopware/trunk}"
+    # v0.6.16: compute content-keys for shared volumes so a host-side
+    # composer/package upgrade triggers a transparent re-populate of
+    # the cached vendor/node_modules volume.  Empty when the host
+    # file is missing — _ensure_base_volume_populated falls back to
+    # the sentinel-only check (legacy behaviour).
+    local _vendor_key _admin_nm_key _sf_nm_key
+    _vendor_key="$(_compute_source_key "$_trunk_root/vendor" vendor)"
+    _admin_nm_key="$(_compute_source_key "$_trunk_root/src/Administration/Resources/app/administration/node_modules" node_modules)"
+    _sf_nm_key="$(_compute_source_key "$_trunk_root/src/Storefront/Resources/app/storefront/node_modules" node_modules)"
     # Vendor
     if [ "$vendor_is_shared" -eq 1 ]; then
         swctl_lock "volume-$VENDOR_VOLUME" _ensure_base_volume_populated \
-            "$VENDOR_VOLUME" "$_trunk_root/vendor" "autoload.php"
+            "$VENDOR_VOLUME" "$_trunk_root/vendor" "autoload.php" "$_vendor_key"
     else
         # Dedicated vendor volume — clone from base, then the container's
         # composer install step (triggered by the compose/provision path)
         # applies the lockfile diff.
         local _vendor_base="vendor-base-${SW_PROJECT_SLUG}"
         swctl_lock "volume-$_vendor_base" _ensure_base_volume_populated \
-            "$_vendor_base" "$_trunk_root/vendor" "autoload.php"
+            "$_vendor_base" "$_trunk_root/vendor" "autoload.php" "$_vendor_key"
         swctl_lock "volume-$VENDOR_VOLUME" _clone_docker_volume \
             "$_vendor_base" "$VENDOR_VOLUME" \
             || warn "Failed to clone vendor base → $VENDOR_VOLUME; container will install from scratch."
@@ -2246,11 +2588,11 @@ write_compose_volume_override() {
     local _admin_src="$_trunk_root/src/Administration/Resources/app/administration/node_modules"
     if [ "$admin_nm_is_shared" -eq 1 ]; then
         swctl_lock "volume-$ADMIN_NM_VOLUME" _ensure_base_volume_populated \
-            "$ADMIN_NM_VOLUME" "$_admin_src" ".package-lock.json"
+            "$ADMIN_NM_VOLUME" "$_admin_src" ".package-lock.json" "$_admin_nm_key"
     else
         local _admin_base="admin-nm-base-${SW_PROJECT_SLUG}"
         swctl_lock "volume-$_admin_base" _ensure_base_volume_populated \
-            "$_admin_base" "$_admin_src" ".package-lock.json"
+            "$_admin_base" "$_admin_src" ".package-lock.json" "$_admin_nm_key"
         swctl_lock "volume-$ADMIN_NM_VOLUME" _clone_docker_volume \
             "$_admin_base" "$ADMIN_NM_VOLUME" \
             || warn "Failed to clone admin_nm base → $ADMIN_NM_VOLUME; build may need npm install."
@@ -2259,11 +2601,11 @@ write_compose_volume_override() {
     local _sf_src="$_trunk_root/src/Storefront/Resources/app/storefront/node_modules"
     if [ "$sf_nm_is_shared" -eq 1 ]; then
         swctl_lock "volume-$STOREFRONT_NM_VOLUME" _ensure_base_volume_populated \
-            "$STOREFRONT_NM_VOLUME" "$_sf_src" ".package-lock.json"
+            "$STOREFRONT_NM_VOLUME" "$_sf_src" ".package-lock.json" "$_sf_nm_key"
     else
         local _sf_base="storefront-nm-base-${SW_PROJECT_SLUG}"
         swctl_lock "volume-$_sf_base" _ensure_base_volume_populated \
-            "$_sf_base" "$_sf_src" ".package-lock.json"
+            "$_sf_base" "$_sf_src" ".package-lock.json" "$_sf_nm_key"
         swctl_lock "volume-$STOREFRONT_NM_VOLUME" _clone_docker_volume \
             "$_sf_base" "$STOREFRONT_NM_VOLUME" \
             || warn "Failed to clone storefront_nm base → $STOREFRONT_NM_VOLUME; build may need npm install."
@@ -2553,28 +2895,111 @@ fix_volume_ownership() {
         "chown ${SW_UID}:${SW_GID} /var/www/html/vendor /var/www/html/node_modules 2>/dev/null" || true
 }
 
+# Parse `composer install --dry-run` output for the names of packages
+# the lock file disagrees with composer.json on.  Two patterns we've
+# seen in the wild — both fixed by the same `composer update <pkgs>
+# --with-dependencies` invocation:
+#
+#   pattern A — "is not present in the lock file"
+#       Trigger: composer.json adds a brand-new dependency that
+#       composer.lock has never seen.  Verbatim line:
+#           - Required package "X" is not present in the lock file.
+#
+#   pattern B — "is in the lock file as ... but ... does not satisfy your constraint"
+#       Trigger: composer.json bumps an existing package's version
+#       constraint (e.g. ^2.3.1 → ^2.6.0) without regenerating the
+#       lockfile.  Verbatim line:
+#           - Required package "X" is in the lock file as "Y" but that does not satisfy your constraint "Z".
+#
+# Pattern B was the one biting the search-stack branches
+# (feat/elasticsearch-*) where opensearch-project/opensearch-php went
+# from ^2.3.1 → ^2.6.0, picking up the new
+# OpenSearch\HttpClient\GuzzleHttpClientFactory class.  Without this
+# parser the fallthrough was a full `composer update` (which can
+# remove synced-but-not-in-composer.json plugins like
+# shopware/commercial).
+_composer_extract_drifted_pkgs() {
+    local dry_run_output="$1"
+    # `|| true` on every grep so a no-match (exit 1) under the caller's
+    # `set -e` doesn't kill the whole function before the awk dedupe.
+    # awk is the single point where the two patterns merge + dedupe;
+    # NF guards against empty lines, !seen[]++ collapses duplicates
+    # that composer sometimes prints on retry.
+    {
+        # Pattern A — net-new package missing from the lockfile.
+        printf '%s\n' "$dry_run_output" \
+            | grep 'is not present in the lock file' \
+            | sed -E 's/.*package "([^"]+)".*/\1/' \
+            || true
+        # Pattern B — package present in lock but at a version the new
+        # composer.json constraint rejects (the search-stack case).
+        printf '%s\n' "$dry_run_output" \
+            | grep 'is in the lock file as .* but that does not satisfy your constraint' \
+            | sed -E 's/.*package "([^"]+)".*/\1/' \
+            || true
+    } | awk 'NF && !seen[$0]++' | tr '\n' ' '
+}
+
 _composer_update_missing() {
     # When `composer install` fails because the lock is stale (branch's composer.json
-    # has packages not in the lock), extract the missing package names and update ONLY
-    # those.  A bare `composer update` is dangerous — it resolves everything from
-    # composer.json and can REMOVE packages needed by synced plugins (e.g. shopware/commercial).
+    # has packages not in the lock, OR has bumped constraints the lock doesn't
+    # satisfy), extract the affected package names and update ONLY those.  A bare
+    # `composer update` is dangerous — it resolves everything from composer.json
+    # and can REMOVE packages needed by synced plugins (e.g. shopware/commercial).
+    #
+    # --with-dependencies pulls in transitive bumps (e.g. updating
+    # opensearch-project/opensearch-php to a version that adds a new
+    # subdependency).  Without this flag the install can still fail on
+    # cascading constraint errors a single targeted update misses.
     local compose_project="$1"
     local missing_output
     missing_output="$(run_app_command "$compose_project" \
         "composer install --dry-run --no-interaction 2>&1 || true" 2>/dev/null)" || true
     local missing_pkgs=""
-    missing_pkgs="$(echo "$missing_output" | grep 'is not present in the lock file' \
-        | sed 's/.*package "\([^"]*\)".*/\1/' | tr '\n' ' ')" || true
+    missing_pkgs="$(_composer_extract_drifted_pkgs "$missing_output")" || true
 
     if [ -n "${missing_pkgs// /}" ]; then
-        info "Lock is missing packages: $missing_pkgs— running targeted composer update."
-        run_app_command "$compose_project" "composer update --no-interaction $missing_pkgs" \
+        info "Lock drift detected for: $missing_pkgs— running targeted composer update --with-dependencies."
+        run_app_command "$compose_project" \
+            "composer update --no-interaction --with-dependencies $missing_pkgs" \
             || warn "composer update failed for: $missing_pkgs"
     else
         warn "composer install failed for unknown reason. Trying full composer update."
         run_app_command "$compose_project" "composer update --no-interaction" \
             || warn "composer update failed."
     fi
+}
+
+# Cheap drift check: does the container's vendor satisfy composer.lock?
+#
+# Background: swctl's shared `vendor-base-<project>` Docker volume is
+# populated once per machine on first need.  Trunk's composer.lock
+# advances over time (e.g., when a Shopware/* PR bumps a package and
+# merges).  Without a refresh signal, every NEW instance on that
+# machine clones the stale volume and runs with the OLD vendor —
+# breaking at runtime as soon as someone calls a class that only
+# exists in the new package version.  The opensearch-php 2.3.1 →
+# 2.6.0 bump bit at least two teammates this way on 2026-05-14/15.
+#
+# Compare package versions in composer.lock vs vendor/composer/installed.json.
+# Misses file-level corruption but catches "trunk advanced, vendor lagged" —
+# the only class of drift swctl can heal automatically.  ~50 ms inside
+# the container (pure jq, no composer boot — 100× cheaper than
+# `composer install --dry-run` which spins up the full plugin loader).
+#
+# Returns 0 = vendor matches lockfile (skip install).
+# Returns 1 = drift detected OR check could not run (be safe → install).
+_vendor_satisfies_lockfile() {
+    local compose_project="$1"
+    # shellcheck disable=SC2016  # $vars are meant to expand INSIDE the container shell, not on the host.
+    run_app_command "$compose_project" '
+        set -e
+        [ -f composer.lock ] || exit 1
+        [ -f vendor/composer/installed.json ] || exit 1
+        lock=$(jq -S ".packages | map({name, version}) | sort_by(.name)" composer.lock 2>/dev/null)
+        inst=$(jq -S ".packages | map({name, version}) | sort_by(.name)" vendor/composer/installed.json 2>/dev/null)
+        [ -n "$lock" ] && [ -n "$inst" ] && [ "$lock" = "$inst" ]
+    ' >/dev/null 2>&1
 }
 
 bootstrap_dependencies() {
@@ -2594,6 +3019,13 @@ bootstrap_dependencies() {
         # Shared base volume is empty (first-time populate)
         vendor_needs_install=1
         info "Shared vendor volume is empty. Will populate with composer install."
+    elif ! _vendor_satisfies_lockfile "$compose_project"; then
+        # Shared base volume is populated, but its packages don't match
+        # the current composer.lock — fresh trunk + stale vendor-base.
+        # Heal by running composer install; `_composer_update_missing`
+        # picks up any lock-vs-json mismatch via the v0.6.7 parser.
+        vendor_needs_install=1
+        info "Vendor doesn't satisfy current composer.lock (stale shared volume) — running install to sync."
     else
         info "Reusing existing vendor. Skipping composer install."
     fi
@@ -2880,20 +3312,63 @@ _postflight_instance_ready() {
     fi
     ok "  ✓ container running (${container:0:12})"
 
-    # 2. /admin reachable.  Use a short timeout so a wedged app doesn't
-    # hang the whole provision flow.
-    local http
-    http="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "${app_url}/admin" 2>/dev/null || echo '000')"
+    # 2. /admin reachable — with retry/backoff.
+    #
+    # The old single-shot check (curl --max-time 8) gave too many false
+    # alarms under batch-load: when the host is at load average 15+ from
+    # 3-4 parallel creates, PHP-FPM / Caddy can take >8 s just to answer
+    # the first HTTP request even though the container is technically
+    # "up."  Postflight would then tag STATUS=failed and the user would
+    # find the instance is actually fine 30 s later.  (#4799, #6774 on
+    # 2026-05-15 afternoon both hit this — every postflight check
+    # passed manually but the create flow died on /admin.)
+    #
+    # New: 3 attempts × 8 s timeout × 5 s backoff = up to ~40 s total
+    # budget.  Bails fast on success.  Genuinely-broken containers
+    # still fail clearly with a final HTTP code in the error message.
+    local http=""
+    local attempt
+    for attempt in 1 2 3; do
+        http="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "${app_url}/admin" 2>/dev/null || echo '000')"
+        if [ "$http" = "200" ] || [ "$http" = "302" ] || [ "$http" = "301" ]; then
+            break
+        fi
+        # Don't sleep after the last attempt.
+        [ "$attempt" -lt 3 ] && sleep 5
+    done
     if [ "$http" = "200" ] || [ "$http" = "302" ] || [ "$http" = "301" ]; then
         ok "  ✓ /admin reachable (HTTP ${http})"
     else
-        err "  ✗ /admin not reachable at ${app_url} (HTTP ${http})"
+        err "  ✗ /admin not reachable at ${app_url} after 3 attempts (HTTP ${http})"
         err "    Remedy: check 'docker logs ${container}' for PHP-FPM/Caddy errors, then 'swctl refresh ${ISSUE_ID}'."
         rc=1
     fi
 
+    # Helper: retry a docker-exec check with 2 s backoff before giving up.
+    #
+    # v0.6.20: under heavy host load (load avg > 30), even a trivial
+    # `docker exec test -f path` can return non-zero or hang briefly
+    # because the docker daemon is queuing requests behind the
+    # currently-running compose-up / volume-clone work.  v0.6.13 added
+    # retry to the /admin probe; this generalises the same retry shape
+    # to all the docker-exec file/dir checks below.  Two attempts
+    # with 2 s sleep between is enough to absorb a transient stall
+    # while still failing clearly when the container is genuinely
+    # broken (the genuinely-broken case fails BOTH attempts in <100ms).
+    _postflight_docker_check() {
+        local check_cmd="$1"
+        local attempt
+        for attempt in 1 2; do
+            if docker exec "$container" sh -c "$check_cmd" 2>/dev/null; then
+                return 0
+            fi
+            [ "$attempt" -lt 2 ] && sleep 2
+        done
+        return 1
+    }
+
     # 3. Media dir writable by the container (admin uploads need this).
-    if docker exec "$container" sh -c 'test -w /var/www/html/public/media' 2>/dev/null; then
+    if _postflight_docker_check 'test -w /var/www/html/public/media'; then
         ok "  ✓ public/media is writable"
     else
         err "  ✗ public/media is read-only — admin uploads will fail with mkdir() errors."
@@ -2902,7 +3377,7 @@ _postflight_instance_ready() {
     fi
 
     # 4. Vendor populated (admin/storefront builds depend on autoload.php).
-    if docker exec "$container" test -f /var/www/html/vendor/autoload.php 2>/dev/null; then
+    if _postflight_docker_check 'test -f /var/www/html/vendor/autoload.php'; then
         ok "  ✓ vendor/autoload.php present"
     else
         err "  ✗ vendor/autoload.php missing — Shopware will not boot."
@@ -2911,7 +3386,7 @@ _postflight_instance_ready() {
     fi
 
     # 5. public/index.php must exist for Caddy to route any request.
-    if docker exec "$container" test -f /var/www/html/public/index.php 2>/dev/null; then
+    if _postflight_docker_check 'test -f /var/www/html/public/index.php'; then
         ok "  ✓ public/index.php present"
     else
         err "  ✗ public/index.php missing — worktree is incomplete."
@@ -2921,7 +3396,17 @@ _postflight_instance_ready() {
 
     # 6. DB reachable by the app.  Use the app's own connection so we
     # catch both "db host down" and "app can't see it".
-    if docker exec "$container" sh -c 'bin/console dbal:refresh:index --dry-run >/dev/null 2>&1' 2>/dev/null; then
+    #
+    # Command name fix (v0.6.13): the previous `dbal:refresh:index` is
+    # not a real Shopware command (the namespace was `dal`, not `dbal`),
+    # so this check used to ALWAYS fail and just emit the warn — never
+    # actually verified the DB.  Switched to `debug:container database_connection`
+    # which is a proper DI-container probe: succeeds iff the connection
+    # service can be resolved, and doesn't depend on any optional
+    # console namespace.
+    # Retried: PHP kernel boot is the slowest postflight op (~3-5 s
+    # cold).  Under load it can exceed 10 s — single-shot is brittle.
+    if _postflight_docker_check 'bin/console debug:container database_connection >/dev/null 2>&1'; then
         ok "  ✓ database reachable"
     else
         # Not fatal — some plugin-external setups skip this path.  Warn only.
@@ -3071,6 +3556,19 @@ provision_database_and_app() {
     # them available — not just provision/post-provision.  The old
     # in-function definitions caused 'command not found' errors when
     # `swctl switch` (qa→dev) called the build hook directly.
+
+    # Decide ES-enablement once, log the reason, and export the
+    # boolean for the post-provision hook to act on.  Auto-detect
+    # via issue labels (`component/search` etc.) so the user doesn't
+    # need to remember `--enable-es` for every search PR.
+    local _es_reason
+    if _es_reason="$(_decide_enable_es)"; then
+        export SWCTL_ENABLE_ES=1
+        info "[es] $_es_reason — will enable Elasticsearch + run es:index in post-provision."
+    else
+        export SWCTL_ENABLE_ES=0
+        info "[es] $_es_reason"
+    fi
 
     # Delegate to workflow hooks (provision → post-provision)
     run_workflow_hook "provision"
@@ -3655,14 +4153,71 @@ sync_plugin_gitignored_artifacts() {
     return 0
 }
 
+# Resolve the remote's default branch for a plugin repo (e.g. "trunk"
+# or "main").  Querying `origin/HEAD` is the robust source of truth —
+# it follows whatever the upstream marked as default and is invariant
+# under whatever local branch the user happens to have checked out.
+#
+# Falls back to a small list of conventional names (trunk → main → master)
+# when origin/HEAD isn't set (rare; happens on freshly-cloned repos that
+# never ran `git remote set-head`).  Final fallback: refuse and let the
+# caller bail loudly — way better than silently picking the user's
+# local feature branch (which is how a stray SwagCommercial checkout on
+# `fix/recommended-bundles-cms-migration-backfill` silently broke
+# `--deps SwagCommercial` for issue #6345 on 2026-05-12).
+_resolve_remote_default_branch() {
+    local dep_repo="$1"
+    local resolved=""
+
+    # Path A — origin/HEAD symbolic-ref (the canonical answer).
+    resolved="$(git -C "$dep_repo" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+        | sed 's@^refs/remotes/origin/@@')" || true
+    if [ -n "$resolved" ]; then
+        printf '%s' "$resolved"
+        return 0
+    fi
+
+    # Path B — try to fix it up automatically.  `set-head -a` queries
+    # the remote for its default branch and writes origin/HEAD locally.
+    # Quiet output; failure (no network / no remote / no auth) drops to
+    # the conventional-names fallback.
+    git -C "$dep_repo" remote set-head origin -a >/dev/null 2>&1 || true
+    resolved="$(git -C "$dep_repo" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+        | sed 's@^refs/remotes/origin/@@')" || true
+    if [ -n "$resolved" ]; then
+        printf '%s' "$resolved"
+        return 0
+    fi
+
+    # Path C — try conventional names in order.  Plugins in the
+    # Shopware org settled on `trunk` (commercial, customized-products
+    # …) while open-source third parties usually use `main`.  `master`
+    # is the legacy fallback.
+    local cand
+    for cand in trunk main master; do
+        if git -C "$dep_repo" rev-parse --verify "origin/${cand}" >/dev/null 2>&1; then
+            printf '%s' "$cand"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 create_dep_plugin_worktree() {
-    # Create a git worktree for a dependency plugin at its default branch.
+    # Create a git worktree for a dependency plugin at its REMOTE default
+    # branch (origin/HEAD, not local HEAD — see _resolve_remote_default_branch
+    # for why).  Loud failure: when something goes wrong, return non-zero
+    # AND `err` (not `warn`) so the surrounding create flow can surface
+    # the missing dep at the end of provision instead of letting the admin
+    # silently show 0 plugins later.
     local dep_name="$1"
     local dep_repo="${PROJECT_ROOT}/custom/plugins/${dep_name}"
     local dep_target="${WORKTREE_PATH}/custom/plugins/${dep_name}"
 
     if [ ! -d "$dep_repo/.git" ]; then
-        warn "Dependency plugin repo not found: $dep_repo — skipping."
+        err "Dependency plugin repo not found at $dep_repo — '--deps ${dep_name}' will be ignored."
+        err "    Tip: clone the plugin into custom/plugins/${dep_name} or check the spelling."
         return 1
     fi
 
@@ -3671,18 +4226,26 @@ create_dep_plugin_worktree() {
         return 0
     fi
 
-    # Determine the dep's default branch
-    local dep_default_branch
-    dep_default_branch="$(git -C "$dep_repo" symbolic-ref --short HEAD 2>/dev/null)" || dep_default_branch="main"
+    # Fetch first so origin/HEAD + remote refs are current.  Failure
+    # (offline, auth) is non-fatal — the local clone may still satisfy.
+    git -C "$dep_repo" fetch --all --prune 2>/dev/null || true
 
-    info "Creating dependency worktree: $dep_name (at $dep_default_branch)"
+    local dep_default_branch
+    if ! dep_default_branch="$(_resolve_remote_default_branch "$dep_repo")"; then
+        err "Could not resolve a default branch for dependency '${dep_name}' (no origin/HEAD, no origin/trunk|main|master)."
+        err "    Tip: run 'git -C $dep_repo remote set-head origin -a' or set up the remote and retry."
+        return 1
+    fi
+
+    info "Creating dependency worktree: $dep_name (at origin/$dep_default_branch)"
     mkdir -p "$(dirname "$dep_target")"
     rm -rf "$dep_target" 2>/dev/null || true
 
-    git -C "$dep_repo" fetch --all --prune 2>/dev/null || true
-    git -C "$dep_repo" worktree add --detach "$dep_target" "origin/$dep_default_branch" 2>/dev/null \
-        || git -C "$dep_repo" worktree add --detach "$dep_target" "$dep_default_branch" 2>/dev/null \
-        || { warn "Failed to create worktree for dependency: $dep_name"; return 1; }
+    if ! git -C "$dep_repo" worktree add --detach "$dep_target" "origin/$dep_default_branch" 2>/dev/null; then
+        err "git worktree add failed for dependency '${dep_name}' at origin/${dep_default_branch}."
+        err "    Tip: try 'git -C $dep_repo worktree prune' and 'git fetch origin'."
+        return 1
+    fi
 
     # Bring along the parent's prebuilt frontend artifacts (gitignored, so
     # `git worktree add` doesn't include them).  Without this the dep plugin's
@@ -3690,7 +4253,7 @@ create_dep_plugin_worktree() {
     # the whole admin build.  See sync_plugin_gitignored_artifacts.
     sync_plugin_gitignored_artifacts "$dep_repo" "$dep_target"
 
-    ok "Dependency plugin nested: custom/plugins/${dep_name} (detached at $dep_default_branch)"
+    ok "Dependency plugin nested: custom/plugins/${dep_name} (detached at origin/${dep_default_branch})"
 }
 
 # --- Pre-flight checks for `swctl create` -----------------------------------
@@ -3762,6 +4325,47 @@ _run_preflight_checks() {
         'docker info' \
         'Start Docker Desktop / OrbStack and retry' || failed=1
 
+    # 1b. Host load average sanity (v0.6.19).
+    #
+    # When the host is thrashing, every docker op in this create —
+    # `compose up`, 3× alpine `cp -a` volume clones (~1.5 GB vendor,
+    # ~500 MB-1 GB admin/storefront node_modules each), and the
+    # mariadb-dump DB clone — hits a sluggish daemon and is 10-100×
+    # more likely to hang or SIGTERM mid-flight.  Refusing the create
+    # NOW saves the user from the stale-registry / half-cloned-DB
+    # cascade we hit repeatedly on 2026-05-15 / 16 when load spiked
+    # from 27 to 67 across the day.  (Recovery from those was a
+    # documented multi-step manual heal; preventing the failure is
+    # cheaper.)
+    #
+    # 1-minute load is the right window — it captures "right now" vs
+    # the 5/15-min averages which lag and might already include the
+    # user's earlier failed batch's spike.  Threshold default 10:
+    # modern Macs (M-series, ~8-12 cores) sit around load 1-3 idle;
+    # sustained load > 10 means OrbStack + heavy host apps are
+    # competing for cores.  Override with SWCTL_MAX_LOAD=N to tune
+    # (or 0 to disable).
+    local max_load="${SWCTL_MAX_LOAD:-10}"
+    if [ "$max_load" != "0" ]; then
+        # uptime's load-average line is the same shape on macOS and
+        # Linux modulo "averages" vs "average".  Strip commas (Linux
+        # uses them between values), take the first number (1-min
+        # window), floor to int for shell comparison.
+        local load_1m
+        load_1m="$(uptime 2>/dev/null \
+            | awk -F'load averages?:' '{print $2}' \
+            | tr -d ',' \
+            | awk '{printf "%d", $1}')"
+        if [ -n "$load_1m" ] && [ "$load_1m" -gt "$max_load" ]; then
+            printf '[preflight] ✗ host load too high (1-min avg: %s, threshold: %s)\n' "$load_1m" "$max_load" >&2
+            # shellcheck disable=SC2016  # The backticks are literal output, not command substitution.
+            printf '            └─ Wait until load <%s (run `uptime`), or close heavy apps (Claude Desktop / Chrome / Telegram / antivirus), or set SWCTL_MAX_LOAD=999 to skip.\n' "$max_load" >&2
+            failed=1
+        else
+            printf '[preflight] ✓ host load OK (1-min avg: %s, threshold: %s)\n' "${load_1m:-?}" "$max_load"
+        fi
+    fi
+
     # 2. Compose templates accessible — installed by Homebrew tap into
     #    pkgshare, or read from the project root in dev installs.
     local tpl_dir="${SWCTL_TEMPLATE_DIR:-$PROJECT_ROOT}"
@@ -3771,26 +4375,79 @@ _run_preflight_checks() {
 
     # 3. swctl Docker network (created by `swctl init`).  Without it,
     #    the per-instance Caddy container has nothing to attach to.
-    local net="${SW_TRAEFIK_NETWORK:-swctl-proxy}"
-    _preflight_one "docker network ($net)" \
-        "docker network inspect '$net'" \
-        "Run 'swctl init' to create the shared network + supporting containers" || failed=1
+    #
+    #    Under OrbStack, `swctl init` deliberately skips creating this
+    #    network — OrbStack handles DNS routing differently (every
+    #    container is reachable at `<container>.orb.local` without a
+    #    shared bridge network), so the swctl-proxy network is unused.
+    #    Skip the check there too, otherwise OrbStack users get a
+    #    perpetually-failing preflight that no `swctl init` can fix.
+    if [ "$(detect_runtime)" != "orbstack" ]; then
+        local net="${SW_TRAEFIK_NETWORK:-swctl-proxy}"
+        _preflight_one "docker network ($net)" \
+            "docker network inspect '$net'" \
+            "Run 'swctl init' to create the shared network + supporting containers" || failed=1
+    fi
 
-    # 4. Shared mariadb container running — source for per-instance DB
-    #    clones.  `swctl init` starts it; if it crashed or was manually
-    #    stopped, every clone-based provision will hang.
-    local db_container="${SW_INFRA_DB_CONTAINER:-swctl-mariadb}"
-    _preflight_one "shared mariadb running ($db_container)" \
-        "docker ps --filter 'name=^${db_container}\$' --format '{{.Names}}' | grep -q ." \
-        "Run 'swctl init' to start the shared mariadb (or 'docker start ${db_container}')" || failed=1
+    # 4. Database container running — source for per-instance DB clones,
+    #    and the DNS target every per-instance container resolves via the
+    #    project network.
+    #
+    # Two setups in the wild:
+    #   - Project's own compose provides the `database` alias (e.g.
+    #     `trunk-database-1` aliased as `database` in `trunk_default`).
+    #     This is what shopware/shopware's own docker-compose.yml does
+    #     and what every per-instance container expects.  When the
+    #     project's database container exits (OrbStack restart,
+    #     load-induced kill, etc.), per-instance containers get
+    #     `SQLSTATE[HY000] [2002] getaddrinfo for database failed:
+    #     Name does not resolve` at boot — even though swctl-mariadb
+    #     is still alive.  (Real incident 2026-05-16: thrashing load 67
+    #     killed trunk-database-1 without restart policy; next
+    #     `swctl create` succeeded preflight against swctl-mariadb but
+    #     the instance was DOA on first request.)
+    #   - Legacy/standalone swctl-managed mariadb (`swctl init` setups
+    #     that pre-date project-side compose).
+    #
+    # Detection: look for `<project_slug>-database-1` in ANY state.
+    # If it exists, the project owns its database — preflight must
+    # check THAT and offer a project-side remedy.  Otherwise fall back
+    # to the legacy swctl-mariadb check.
+    local _project_db=""
+    if [ -n "${PROJECT_SLUG:-}" ]; then
+        _project_db="$(docker ps -a --filter "name=^${PROJECT_SLUG}-database-1$" --format '{{.Names}}' 2>/dev/null | head -1)"
+    fi
+    if [ -n "$_project_db" ]; then
+        _preflight_one "project database running ($_project_db)" \
+            "docker ps --filter 'name=^${_project_db}\$' --format '{{.Names}}' | grep -q ." \
+            "Run 'cd ${PROJECT_ROOT:-<project-root>} && docker compose up -d' — project's own database is down" || failed=1
+    else
+        local db_container="${SW_INFRA_DB_CONTAINER:-swctl-mariadb}"
+        _preflight_one "shared mariadb running ($db_container)" \
+            "docker ps --filter 'name=^${db_container}\$' --format '{{.Names}}' | grep -q ." \
+            "Run 'swctl init' to start the shared mariadb (or 'docker start ${db_container}')" || failed=1
+    fi
 
     # 5. Alpine image cached.  populate_volume() spawns alpine to copy
     #    files; a cold pull from a docker config that uses a credential
     #    helper missing inside the container fails opaquely.  Pre-flight
     #    catches it before the populate step trips on it.
+    # Auto-pull alpine on first install instead of forcing the user to
+    # run `docker pull alpine:latest` manually — alpine is a tiny public
+    # image (~3MB compressed), so the convenience win outweighs the
+    # surprise of an unexpected pull.  Falls back to the original
+    # "fix the above and retry" behaviour if the pull fails (network /
+    # daemon issue) so the message stays actionable.
+    if ! docker image inspect alpine:latest >/dev/null 2>&1 \
+        && ! docker image inspect alpine >/dev/null 2>&1; then
+        info "alpine:latest not cached — pulling for first-time setup…"
+        if docker pull alpine:latest >/dev/null 2>&1; then
+            : # fall through to the inspect check below for the green tick.
+        fi
+    fi
     _preflight_one "alpine image cached" \
         'docker image inspect alpine:latest || docker image inspect alpine' \
-        'Run: docker pull alpine:latest' || failed=1
+        'docker pull alpine:latest failed — check network / Docker daemon and retry' || failed=1
 
     # 6. Worktree path doesn't already collide.  We don't try to
     #    distinguish "ours" from "stale" — flagging the collision and
@@ -3844,6 +4501,13 @@ cmd_create() {
     local adopt_worktree_path=""
     local no_provision=0
     local skip_preflight=0
+    # SWCTL_ENABLE_ES is tri-state:
+    #   ""  → auto-detect from issue labels (default).
+    #   "1" → forced on via `--enable-es` flag.
+    #   "0" → forced off via `--no-enable-es` (escape hatch when label
+    #         detection misfires or the user just doesn't want ES on a
+    #         search issue, e.g. they're going to test the SQL fallback).
+    local enable_es_override=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --qa)      SWCTL_MODE="qa"; shift ;;
@@ -3861,11 +4525,18 @@ cmd_create() {
             --adopt-worktree) adopt_worktree_path="$2"; shift 2 ;;
             --no-provision) no_provision=1; shift ;;
             --skip-preflight) skip_preflight=1; shift ;;
+            # Force-enable Elasticsearch on the new instance (writes
+            # SHOPWARE_ES_* into .env.local + runs es:index in
+            # post-provision).  Default is auto-detect from the
+            # issue's GitHub labels — see _detect_enable_es().
+            --enable-es)    enable_es_override="1"; shift ;;
+            --no-enable-es) enable_es_override="0"; shift ;;
             *)         break ;;
         esac
     done
     export SWCTL_MODE
     export SWCTL_NO_PROVISION="$no_provision"
+    export SWCTL_ENABLE_ES_OVERRIDE="$enable_es_override"
     ISSUE="${1:-}"
     BRANCH="${2:-}"
     [ -n "$ISSUE" ] || die "Usage: swctl create [--qa|--dev] [--project <name>] [--plugin <name>] <issue> [<branch>]"
@@ -4043,7 +4714,7 @@ cmd_create() {
             BACKEND_CHANGES=0; FRONTEND_CHANGES=0
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+            trap '[ "${STATUS:-}" = "creating" ] && _create_failure_finalize' EXIT
 
             # Per-create perf log — see _init_perf_log docstring.
             _init_perf_log "$ISSUE_ID"
@@ -4168,14 +4839,22 @@ cmd_create() {
             fi
             if [ -n "$deps" ]; then
                 info "Plugin dependencies declared: $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
+                local _failed_deps=""
                 while IFS= read -r dep_name; do
                     [ -n "$dep_name" ] || continue
                     [ "$dep_name" = "$PLUGIN_NAME" ] && continue  # skip self
                     if create_dep_plugin_worktree "$dep_name"; then
                         dep_plugins="${dep_plugins:+${dep_plugins},}${dep_name}"
                         dep_worktree_paths="${dep_worktree_paths:+${dep_worktree_paths},}${WORKTREE_PATH}/custom/plugins/${dep_name}"
+                    else
+                        _failed_deps="${_failed_deps:+${_failed_deps},}${dep_name}"
                     fi
                 done <<< "$deps"
+                if [ -n "$_failed_deps" ]; then
+                    err "DEPENDENCY LINKING FAILED: ${_failed_deps}"
+                    err "  These plugins were requested but could not be linked."
+                    err "  The instance will continue to provision WITHOUT them; check the err lines above."
+                fi
             fi
 
             # 3. Standard trunk flow: diff, sync, provision
@@ -4381,7 +5060,7 @@ cmd_create() {
             FRONTEND_CHANGES="${FRONTEND_CHANGES:-0}"
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
-            trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+            trap '[ "${STATUS:-}" = "creating" ] && _create_failure_finalize' EXIT
 
             # Per-create perf log — see _init_perf_log docstring.
             _init_perf_log "$ISSUE_ID"
@@ -4481,7 +5160,7 @@ cmd_create() {
             write_metadata "$SWCTL_ACTIVE_META_FILE"
 
             # On any exit while STATUS=creating, mark as failed
-            trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
+            trap '[ "${STATUS:-}" = "creating" ] && _create_failure_finalize' EXIT
 
             local step_start create_start
             create_start=$SECONDS
@@ -4519,13 +5198,27 @@ cmd_create() {
                 local deps
                 deps="$(echo "$selected_deps" | tr ',' '\n')"
                 info "Plugin dependencies (--deps flag): $(echo "$deps" | tr '\n' ', ' | sed 's/,$//')"
+                # Accumulate failed deps so we can summarise loudly at the end.
+                # Silent dep failures used to produce a working create whose
+                # admin showed 0 plugins — the user had no way to spot the
+                # mismatch between what they asked for and what shipped
+                # (the #6345 incident, 2026-05-12).
+                local _failed_deps=""
                 while IFS= read -r dep_name; do
                     [ -n "$dep_name" ] || continue
                     if create_dep_plugin_worktree "$dep_name"; then
                         dep_plugins="${dep_plugins:+${dep_plugins},}${dep_name}"
                         dep_worktree_paths="${dep_worktree_paths:+${dep_worktree_paths},}${WORKTREE_PATH}/custom/plugins/${dep_name}"
+                    else
+                        _failed_deps="${_failed_deps:+${_failed_deps},}${dep_name}"
                     fi
                 done <<< "$deps"
+                if [ -n "$_failed_deps" ]; then
+                    err "DEPENDENCY LINKING FAILED: ${_failed_deps}"
+                    err "  These plugins were requested via --deps but could not be linked."
+                    err "  The instance will continue to provision WITHOUT them; check the err lines above."
+                    err "  Recover with: swctl clean ${ISSUE_ID} && swctl create --deps <fixed-deps> ..."
+                fi
             fi
 
             # Check dependency plugins for admin/storefront extensions
@@ -5374,6 +6067,462 @@ cmd_start() {
     ok "Started '$ISSUE_ID'."
 }
 
+# v0.6.21: probe a STATUS=failed instance for actual liveness before
+# letting cmd_refresh re-run the full ~10 min provisioning pipeline.
+#
+# Background: under heavy host load (load avg 20+), postflight checks
+# could flag a healthy instance as failed (a docker exec stalled
+# briefly, /admin took >8 s on a cold PHP-FPM, etc.).  v0.6.20 added
+# retry-with-backoff to the postflight checks themselves, which fixes
+# MOST first-time false alarms.  But once an instance is tagged
+# STATUS=failed, the next `swctl refresh` would re-run sync +
+# DB-provision + frontend-build + postflight (each of which can
+# false-alarm AGAIN), making "retry from UI" a 10-min dice roll under
+# load.  (#6072 incident 2026-05-17: instance running fine on HTTP
+# 200, retried 4× from the UI, each retry died at composer install
+# step against a RO-mounted vendor — see _composer_lock_drifted_from_trunk
+# for that companion fix.)
+#
+# Behaviour: only fires when STATUS=failed AND the compose container
+# is running.  Runs `_postflight_instance_ready` once.  If it passes
+# the instance is genuinely healthy — the STATUS=failed flag was
+# stale from a prior false-alarm cycle — so flip STATUS=complete and
+# return 0 to short-circuit cmd_refresh.  If it doesn't pass, return
+# 1 to fall through to the full resume path.  Never runs for
+# STATUS=creating / provisioning-deferred (those truly need the full
+# pipeline; the instance was never finished).
+#
+# Caller pre-condition: COMPOSE_PROJECT, APP_URL, ISSUE_ID,
+# SWCTL_ACTIVE_META_FILE are populated.
+#
+# Returns: 0 = healed and registry updated, 1 = fast-path did not
+# apply OR postflight failed (caller continues to full resume).
+_resume_fast_path_heal() {
+    [ "${STATUS:-complete}" = "failed" ] || return 1
+    container_running "${COMPOSE_PROJECT}-${SW_SERVICE_NAME:-web}-1" || return 1
+    info "Worktree '$ISSUE_ID' has STATUS=failed. Probing instance health before re-provisioning…"
+    if ! _postflight_instance_ready "$COMPOSE_PROJECT" "$APP_URL"; then
+        info "Postflight did not pass — falling through to full re-provisioning."
+        return 1
+    fi
+    ok "Instance is healthy — STATUS=failed was a stale flag from a previous postflight false alarm."
+    STATUS="complete"
+    FAILED_AT=""
+    write_metadata "$SWCTL_ACTIVE_META_FILE"
+    ok "Worktree '$ISSUE_ID' healed without re-provisioning."
+    info "URL: ${APP_URL}"
+    return 0
+}
+
+# Snapshot the per-instance database to a compressed dump under
+# $SWCTL_STATE_DIR/instances/<project>/<issue>/snapshots/<name>.sql.gz.
+#
+# Subcommands:
+#   swctl snapshot <issue>                  → create with auto-name `auto-<unix-ts>`
+#   swctl snapshot <issue> <name>           → create with given name
+#   swctl snapshot <issue> --list           → list snapshots
+#   swctl snapshot <issue> --delete <name>  → remove a snapshot
+#
+# Why dump (not docker-volume snapshot): swctl uses a SHARED mariadb
+# container (`swctl-mariadb`), not a per-instance DB container.  The
+# volume holds every instance's data — so a volume snapshot is wrong by
+# construction.  `mariadb-dump --single-transaction --quick` is the
+# logical-level equivalent that targets one database.  Cost: 5-20 s for
+# a typical Shopware install vs ~1 s for a volume swap, but correctness
+# matters more here.
+#
+# Restore-while-running is safe enough for typical dev use — the app
+# container will see the new schema after `cache:clear`.  We warn loudly
+# but don't stop the app container automatically.
+cmd_snapshot() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl snapshot <issue> [<name>|--list|--delete <name>]"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" \
+        || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+    [ -n "${DB_NAME:-}" ] || die "Instance '${ISSUE_ID:-$issue_input}' has no DB_NAME in metadata."
+
+    local snap_dir
+    snap_dir="$(_snapshot_dir)"
+    mkdir -p "$snap_dir"
+
+    case "${2:-}" in
+        --list|-l)
+            _snapshot_list "$snap_dir"
+            return
+            ;;
+        --delete|-d|--rm)
+            local name="${3:-}"
+            [ -n "$name" ] || die "Usage: swctl snapshot <issue> --delete <name>"
+            _snapshot_delete "$snap_dir" "$name"
+            return
+            ;;
+    esac
+
+    # Default action: create snapshot with given or auto name.
+    local name="${2:-auto-$(date +%s)}"
+    # Sanitize: only allow [A-Za-z0-9._-] in snapshot names so they're
+    # filesystem-safe across all platforms.
+    case "$name" in
+        *[!A-Za-z0-9._-]*) die "Snapshot name '${name}' contains invalid characters. Use only [A-Za-z0-9._-]." ;;
+    esac
+    _snapshot_create "$snap_dir" "$name"
+}
+
+# Restore a previously-taken snapshot.  Always prompts for confirmation
+# because this overwrites the live per-instance database.
+cmd_restore() {
+    local issue_input="${1:-}"
+    local name="${2:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl restore <issue> <name>"
+    [ -n "$name" ] || die "Usage: swctl restore <issue> <name>"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" \
+        || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+    [ -n "${DB_NAME:-}" ] || die "Instance '${ISSUE_ID:-$issue_input}' has no DB_NAME in metadata."
+
+    local snap_dir
+    snap_dir="$(_snapshot_dir)"
+    _snapshot_restore "$snap_dir" "$name"
+}
+
+# Resolve the snapshots directory for the currently-loaded instance.
+# Caller must have populated SW_PROJECT_SLUG and ISSUE_ID via
+# load_instance_metadata first.
+_snapshot_dir() {
+    printf '%s/instances/%s/%s/snapshots' "$SWCTL_STATE_DIR" "$SW_PROJECT_SLUG" "$ISSUE_ID"
+}
+
+_snapshot_create() {
+    local snap_dir="$1" name="$2"
+    local file="${snap_dir}/${name}.sql.gz"
+
+    if [ -e "$file" ]; then
+        die "Snapshot '${name}' already exists at ${file}. Delete it first or pick another name."
+    fi
+
+    require_cmd docker
+    require_cmd gzip
+
+    local db_container
+    db_container="$(resolve_db_container)"
+    container_running "$db_container" || die "Database container '${db_container}' is not running."
+
+    info "Snapshotting database '${DB_NAME}' → ${file}"
+    local t_start="$SECONDS"
+
+    # --single-transaction → consistent dump without table locks (InnoDB only).
+    # --quick → stream rows instead of buffering; safe for big tables.
+    # Pipe to gzip so the on-disk file is ~5-10× smaller.
+    if ! docker exec -i "$db_container" mariadb-dump \
+            -u "$SW_DB_ROOT_USER" "-p$SW_DB_ROOT_PASSWORD" \
+            --single-transaction --quick "$DB_NAME" 2>/dev/null \
+            | gzip -c > "$file"; then
+        rm -f "$file"
+        die "mariadb-dump failed for database '${DB_NAME}' on container '${db_container}'."
+    fi
+
+    local size elapsed
+    size="$(_snapshot_human_size "$file")"
+    elapsed=$((SECONDS - t_start))
+    ok "Snapshot '${name}' created (${size}, ${elapsed}s)."
+}
+
+_snapshot_restore() {
+    local snap_dir="$1" name="$2"
+    local file="${snap_dir}/${name}.sql.gz"
+
+    [ -f "$file" ] \
+        || die "Snapshot '${name}' not found at ${file}. Run 'swctl snapshot ${ISSUE_ID} --list' to see available snapshots."
+
+    require_cmd docker
+    require_cmd gzip
+
+    local db_container
+    db_container="$(resolve_db_container)"
+    container_running "$db_container" || die "Database container '${db_container}' is not running."
+
+    warn "Restoring snapshot '${name}' will OVERWRITE database '${DB_NAME}' on instance '${ISSUE_ID}'."
+    warn "All current data in that database will be replaced."
+    # SWCTL_AUTO_CONFIRM=1 lets the UI / scripted callers bypass the
+    # interactive prompt.  The UI shows its own modal before this point,
+    # so re-prompting on the CLI side would just hang the request.
+    if [ "${SWCTL_AUTO_CONFIRM:-0}" = "1" ]; then
+        info "SWCTL_AUTO_CONFIRM=1 → skipping interactive confirm."
+    else
+        local confirm
+        confirm="$(prompt_text "Type 'yes' to confirm")"
+        if [ "$confirm" != "yes" ]; then
+            info "Aborted."
+            return 1
+        fi
+    fi
+
+    info "Restoring '${name}' → '${DB_NAME}'..."
+    local t_start="$SECONDS"
+
+    # Drop + recreate so the dump's CREATE TABLE statements don't collide
+    # with existing tables that the snapshot doesn't cover (orphans from
+    # plugins installed after the snapshot was taken).
+    if ! docker exec -i "$db_container" mariadb \
+            -u "$SW_DB_ROOT_USER" "-p$SW_DB_ROOT_PASSWORD" \
+            -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`; CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
+        die "Failed to drop+recreate database '${DB_NAME}'."
+    fi
+
+    if ! gunzip -c "$file" | docker exec -i "$db_container" mariadb \
+            -u "$SW_DB_ROOT_USER" "-p$SW_DB_ROOT_PASSWORD" "$DB_NAME"; then
+        die "Restore failed during SQL import."
+    fi
+
+    local elapsed=$((SECONDS - t_start))
+    ok "Restored '${name}' in ${elapsed}s."
+    info "Run 'swctl exec ${ISSUE_ID} \"bin/console cache:clear\"' to drop stale Symfony cache."
+}
+
+_snapshot_list() {
+    local snap_dir="$1"
+
+    if [ ! -d "$snap_dir" ] || ! ls "$snap_dir"/*.sql.gz >/dev/null 2>&1; then
+        info "No snapshots for issue '${ISSUE_ID}'."
+        return 0
+    fi
+
+    printf '%-30s  %10s  %s\n' "NAME" "SIZE" "CREATED"
+    printf '%-30s  %10s  %s\n' "----" "----" "-------"
+    local f
+    for f in "$snap_dir"/*.sql.gz; do
+        [ -f "$f" ] || continue
+        local n s c
+        n="$(basename "$f" .sql.gz)"
+        s="$(_snapshot_human_size "$f")"
+        c="$(_snapshot_mtime_human "$f")"
+        printf '%-30s  %10s  %s\n' "$n" "$s" "$c"
+    done
+}
+
+_snapshot_delete() {
+    local snap_dir="$1" name="$2"
+    local file="${snap_dir}/${name}.sql.gz"
+    [ -f "$file" ] || die "Snapshot '${name}' not found at ${file}."
+    rm -f "$file"
+    ok "Deleted snapshot '${name}'."
+}
+
+# du -h is portable across macOS/Linux and gives "12K" / "4.0M" style output.
+_snapshot_human_size() {
+    du -h "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# macOS uses `stat -f`, GNU uses `stat -c`.  Try macOS first; if it
+# fails, fall back to GNU.  Both produce "YYYY-MM-DD HH:MM"-ish strings.
+_snapshot_mtime_human() {
+    stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$1" 2>/dev/null \
+        || stat -c '%y' "$1" 2>/dev/null | cut -d. -f1
+}
+
+# Start a public Cloudflare quick-tunnel to the instance's web container
+# so reviewers/PMs/QA can hit it without VPN.  Quick-tunnels require NO
+# Cloudflare account — they issue a random https://<name>.trycloudflare.com
+# URL that lives as long as the cloudflared process runs.
+#
+# Subcommands:
+#   swctl preview <issue>            → start tunnel, print URL
+#   swctl preview <issue> --stop     → tear down tunnel (instance keeps running)
+#   swctl preview <issue> --status   → show current tunnel URL / state
+#
+# Cleanup: `swctl clean` automatically stops the tunnel via _preview_stop.
+#
+# Implementation: cloudflared runs in a sidecar container named
+# `swctl-preview-<issue>` on the same compose network as the app, so it
+# can resolve the app's container DNS directly.  Atomic naming + pre-emptive
+# `docker rm -f` of any orphan (matches the v0.6.22 populate pattern).
+cmd_preview() {
+    local issue_input="${1:-}"
+    [ -n "$issue_input" ] || die "Usage: swctl preview <issue> [--stop|--status]"
+
+    maybe_load_project_config >/dev/null 2>&1 || true
+    local meta_file
+    meta_file="$(resolve_instance_file_by_issue "$issue_input")" \
+        || die "No tracked worktree found for issue '$issue_input'."
+    load_instance_metadata "$meta_file"
+    SWCTL_ACTIVE_META_FILE="$meta_file"
+
+    case "${2:-}" in
+        --stop|stop)
+            _preview_stop
+            return
+            ;;
+        --status|status)
+            _preview_status
+            return
+            ;;
+        "")
+            _preview_start
+            return
+            ;;
+        *)
+            die "Usage: swctl preview <issue> [--stop|--status]"
+            ;;
+    esac
+}
+
+# Deterministic container name → docker enforces uniqueness atomically.
+# Sanitize the issue id with the same slug rules as compose project names
+# so `docker run --name` never refuses our payload.
+_preview_container_name() {
+    printf 'swctl-preview-%s' "$(sanitize_slug "$ISSUE_ID")"
+}
+
+_preview_start() {
+    [ -n "${COMPOSE_PROJECT:-}" ] || die "Instance has no COMPOSE_PROJECT in metadata."
+    require_cmd docker
+
+    local container_name
+    container_name="$(_preview_container_name)"
+
+    # Already-running fast path.  Refresh the stored URL from the
+    # container's logs so a previous swctl run that died mid-write can
+    # still recover the URL (idempotent).
+    if container_running "$container_name"; then
+        local current_url
+        current_url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        if [ -n "$current_url" ]; then
+            PREVIEW_URL="$current_url"
+            PREVIEW_CONTAINER="$container_name"
+            write_metadata "$SWCTL_ACTIVE_META_FILE"
+            ok "Preview already running: ${PREVIEW_URL}"
+            return 0
+        fi
+        # Container is up but the URL line never appeared — kill it and
+        # try again cleanly.
+        warn "Existing tunnel container has no URL — restarting."
+        docker rm -f "$container_name" >/dev/null 2>&1 || true
+    fi
+
+    # Orphan cleanup (e.g. cloudflared exited but Docker hasn't removed
+    # the container yet because we passed --rm AND it never started).
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
+
+    # Locate the app container + its compose network.  Without the
+    # network attachment, cloudflared can't resolve the app hostname.
+    local app_id
+    app_id="$(app_container_id "$COMPOSE_PROJECT")"
+    [ -n "$app_id" ] \
+        || die "App container for '${COMPOSE_PROJECT}' is not running. Start with 'swctl start ${ISSUE_ID}' or 'swctl refresh ${ISSUE_ID}'."
+
+    local network
+    network="$(docker inspect "$app_id" \
+        --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null \
+        | grep -E "^${COMPOSE_PROJECT}" | head -1)"
+    if [ -z "$network" ]; then
+        # Fallback: any network on the app container — covers projects
+        # that name their network without the compose-project prefix.
+        network="$(docker inspect "$app_id" \
+            --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null \
+            | head -1)"
+    fi
+    [ -n "$network" ] || die "Could not determine docker network for '${COMPOSE_PROJECT}'."
+
+    # App's container name (without the leading slash docker inspect adds).
+    local app_hostname
+    app_hostname="$(docker inspect "$app_id" --format '{{.Name}}' | sed 's|^/||')"
+
+    # Caddy in the Shopware dev container listens on :8000 by default.
+    # SW_INTERNAL_PORT lets the user override for non-standard compose
+    # templates (e.g. nginx on :80 inside a different runtime image).
+    local target_port="${SW_INTERNAL_PORT:-8000}"
+    local target="http://${app_hostname}:${target_port}"
+
+    info "Starting Cloudflare quick-tunnel → ${target} (network '${network}')"
+
+    if ! docker run -d \
+            --name "$container_name" \
+            --network "$network" \
+            --label "swctl-preview=${ISSUE_ID}" \
+            --label "swctl-preview-project=${SW_PROJECT_SLUG}" \
+            cloudflare/cloudflared:latest \
+            tunnel --no-autoupdate --url "$target" \
+            >/dev/null 2>&1; then
+        die "Failed to start cloudflared container.  Image pull blocked?  Try 'docker pull cloudflare/cloudflared:latest'."
+    fi
+
+    # Tail logs until the trycloudflare URL appears or the budget expires.
+    # cloudflared usually prints the URL within 5-10 s; budget for 30.
+    info "Waiting for tunnel URL (up to 30s)…"
+    local url=""
+    local attempt
+    for attempt in 1 2 3 4 5 6; do
+        sleep 5
+        url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        [ -n "$url" ] && break
+        # If the container died, fail fast instead of waiting out the budget.
+        if ! container_running "$container_name"; then
+            warn "cloudflared container exited before publishing a URL.  Logs:"
+            docker logs "$container_name" 2>&1 | sed 's/^/  /' >&2
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            die "Tunnel startup failed."
+        fi
+    done
+
+    if [ -z "$url" ]; then
+        warn "Could not capture trycloudflare URL after 30s. Tunnel may still be establishing."
+        warn "Tail manually: docker logs -f ${container_name}"
+        return 1
+    fi
+
+    PREVIEW_URL="$url"
+    PREVIEW_CONTAINER="$container_name"
+    write_metadata "$SWCTL_ACTIVE_META_FILE"
+
+    ok "Preview tunnel live: ${PREVIEW_URL}"
+    info "  Internal target: ${target}"
+    info "  Stop with: swctl preview ${ISSUE_ID} --stop"
+}
+
+_preview_stop() {
+    local container_name
+    container_name="$(_preview_container_name)"
+
+    if container_running "$container_name"; then
+        info "Stopping preview tunnel '${container_name}'…"
+        docker rm -f "$container_name" >/dev/null 2>&1 \
+            || warn "Failed to remove preview container; check 'docker ps -a'."
+    else
+        info "No running preview tunnel for issue '${ISSUE_ID}'."
+    fi
+
+    PREVIEW_URL=""
+    PREVIEW_CONTAINER=""
+    [ -n "${SWCTL_ACTIVE_META_FILE:-}" ] && write_metadata "$SWCTL_ACTIVE_META_FILE"
+    ok "Preview tunnel cleared for '${ISSUE_ID}'."
+}
+
+_preview_status() {
+    local container_name
+    container_name="$(_preview_container_name)"
+
+    if container_running "$container_name"; then
+        local url
+        url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)"
+        ok "Preview running for '${ISSUE_ID}':"
+        info "  URL:       ${url:-${PREVIEW_URL:-(URL not yet emitted)}}"
+        info "  Container: ${container_name}"
+    elif [ -n "${PREVIEW_URL:-}" ]; then
+        warn "Metadata has PREVIEW_URL but container '${container_name}' is not running."
+        info "  Last URL: ${PREVIEW_URL}"
+        info "  Restart with: swctl preview ${ISSUE_ID}"
+    else
+        info "No preview tunnel for issue '${ISSUE_ID}'."
+    fi
+}
+
 cmd_refresh() {
     local issue_input="${1:-}"
     SWCTL_ACTIVE_META_FILE=""
@@ -5391,11 +6540,10 @@ cmd_refresh() {
     if [ "${STATUS:-complete}" = "failed" ] \
        || [ "${STATUS:-complete}" = "creating" ] \
        || [ "${STATUS:-complete}" = "provisioning-deferred" ]; then
-        info "Worktree '$ISSUE_ID' has status '${STATUS}'. Resuming provisioning..."
-        STATUS="creating"
-        ensure_infra_ready
 
-        # Recompute derived variables not stored in metadata
+        # Recompute derived variables not stored in metadata.  Done BEFORE
+        # the fast-path heal below so _postflight_instance_ready has
+        # COMPOSE_PROJECT + APP_URL ready.
         WORKTREE_ID="${WORKTREE_ID:-$ISSUE_ID}"
         if [ -z "${COMPOSE_PROJECT:-}" ]; then
             COMPOSE_PROJECT="$(sanitize_slug "${SW_PROJECT_SLUG}-${ISSUE_ID}")"
@@ -5413,6 +6561,19 @@ cmd_refresh() {
             fi
             APP_URL="http://${DOMAIN}"
         fi
+
+        # v0.6.21 fast-path heal — see `_resume_fast_path_heal` header
+        # for the full rationale.  TL;DR: when STATUS=failed but the
+        # instance is actually serving HTTP 200, flip metadata to
+        # complete in ~3-5 s instead of running the 10-min full
+        # re-provision pipeline that would just false-alarm again.
+        if _resume_fast_path_heal; then
+            return
+        fi
+
+        info "Worktree '$ISSUE_ID' has status '${STATUS}'. Resuming provisioning..."
+        STATUS="creating"
+        ensure_infra_ready
 
         # On any exit while STATUS=creating, mark as failed
         trap 'if [ "${STATUS:-}" = "creating" ]; then STATUS=failed; FAILED_AT="${SWCTL_LAST_ERROR:-unknown}"; write_metadata "$SWCTL_ACTIVE_META_FILE" 2>/dev/null; fi' EXIT
@@ -6061,7 +7222,30 @@ cmd_clean() {
         return 0
     }
 
+    # Idempotency guarantee: unlink the registry .env on ANY exit path
+    # (success, set -e bailout, mysql_exec failure, …).  The original
+    # body only did `rm -f "$meta_file"` at the bottom; if any step
+    # in between hit a fatal error (e.g. mariadb unreachable), the .env
+    # stayed on disk and the next `swctl create <same-issue>` failed
+    # with the misleading "worktree already exists" error.  Trap
+    # guarantees we always converge to a clean registry.
+    # shellcheck disable=SC2064  # intentional early-expansion of $meta_file
+    trap "rm -f '$meta_file' 2>/dev/null || true" EXIT
+
     load_instance_metadata "$meta_file"
+
+    # Stop the preview tunnel (if any) BEFORE we tear down the app
+    # container.  cloudflared loses its target seconds later anyway, but
+    # killing it explicitly avoids leaving an orphan container behind
+    # (the sidecar runs detached, not via compose, so `docker compose
+    # down` later won't sweep it).  No metadata write — we're about to
+    # rm the file anyway.
+    if [ -n "${PREVIEW_CONTAINER:-}" ]; then
+        docker rm -f "$PREVIEW_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    # Belt-and-braces: also try the deterministic name in case metadata
+    # was lost but the sidecar is still up.
+    docker rm -f "swctl-preview-$(sanitize_slug "$ISSUE_ID")" >/dev/null 2>&1 || true
 
     # Plugin-aware cleanup: remove nested plugin worktrees before trunk cleanup
     # In the new flow, plugin-external instances ARE trunk worktrees with a
@@ -7611,7 +8795,7 @@ swctl ${SWCTL_VERSION}
 
 Usage:
   swctl init
-  swctl create [--qa|--dev] <issue> [<branch>]
+  swctl create [--qa|--dev] [--enable-es|--no-enable-es] <issue> [<branch>]
   swctl batch create [--file <path>|--gitlab <id>|--github <owner/repo>] [--parallel [-j N]] [ISSUE BRANCH ...]
   swctl status
   swctl exec <issue> '<cmd>'
@@ -7622,6 +8806,9 @@ Usage:
   swctl code <issue> [--claude|--codex|--phpstorm|--code|--cursor]
   swctl switch <issue> --qa|--dev
   swctl clean <issue>
+  swctl snapshot <issue> [<name>|--list|--delete <name>]
+  swctl restore <issue> <name>
+  swctl preview <issue> [--stop|--status]
   swctl resolve [--select] [--jobs N] <issue...>
   swctl resolve resume <issue>
   swctl resolve status
@@ -7636,6 +8823,9 @@ Usage:
 Commands:
   init        Idempotent setup of Traefik, MariaDB, Redis, and the swctl Docker network.
   create      Create a worktree. --qa: auto-build everything needed (vendor from trunk). --dev: writable vendor (default).
+              --enable-es / --no-enable-es overrides the auto-detect: when the issue has a \`component/search\`,
+              \`component/elasticsearch\`, or \`domain/search\` label, swctl writes SHOPWARE_ES_* into .env.local
+              and runs es:index in post-provision.  Useful when the resolver wants ES live before testing.
   batch       Batch create worktrees from CLI pairs, a file, or GitLab/GitHub MRs.
   status      Show tracked worktrees, routed domains, container state, and DB mode.
   exec        Execute a command inside the worktree's app container.
@@ -7648,6 +8838,11 @@ Commands:
   code        Open worktree in an editor: --phpstorm (default), --claude, --codex, --code, --cursor.
   switch      Switch a worktree between QA and Dev mode (rebuilds only what's needed).
   clean       Stop the container, remove labeled volumes, drop dedicated DBs, and remove the worktree.
+  snapshot    Snapshot the per-instance database to a compressed dump under
+              ~/.local/state/swctl/instances/<project>/<issue>/snapshots/<name>.sql.gz.
+              No args → auto-name. --list → list snapshots. --delete <name> → remove one.
+  restore     Restore a previously-taken snapshot. Drops + recreates the per-instance DB
+              before importing. Always prompts to confirm.
   resolve     Dispatch issues to Claude Code for automated resolution and manage results.
               swctl resolve [--select] [--github <owner/repo>] [--jobs N] [--supervised] <issue...>
               swctl resolve resume <issue>          Resume a paused Claude session.
@@ -9720,6 +10915,21 @@ main() {
             ensure_state_dirs
             shift
             cmd_kill_exec "${1:-}"
+            ;;
+        snapshot|snap)
+            ensure_state_dirs
+            shift
+            cmd_snapshot "$@"
+            ;;
+        restore)
+            ensure_state_dirs
+            shift
+            cmd_restore "$@"
+            ;;
+        preview)
+            ensure_state_dirs
+            shift
+            cmd_preview "$@"
             ;;
         refresh)
             ensure_state_dirs

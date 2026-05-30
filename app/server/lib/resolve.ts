@@ -1209,6 +1209,83 @@ export function startResolveStream(
   // not known until the worktree create finishes.  See `buildResolvePrompt`
   // for the per-backend rationale.
 
+  // ───────────────────────────────────────────────────────────────────
+  // Auto-respawn guard (added 2026-05-11 after a real incident).
+  //
+  // Background: the browser EventSource API auto-reconnects on dropped
+  // SSE connections.  Without this guard, every reconnect re-enters
+  // startResolveStream, calls recordStart (writing a new 'running' entry
+  // with a fresh startedAt), and spawns a brand-new claude with a
+  // freshly-randomised --session-id — restarting the 8-step skill from
+  // step 1 each time.  In the incident, this looped 8+ times on a single
+  // resolve click and burned ~80M tokens before the user noticed.
+  //
+  // Two scenarios to block, both observed in the wild:
+  //
+  //   A) A run is still in flight (status: 'running').  Any reconnect
+  //      while the original claude is alive must be rejected — spawning
+  //      a second claude would race on git + DB state.
+  //
+  //   B) A run JUST finished (status: 'done' or 'failed') and the browser
+  //      reconnected within ~1 second.  Without a post-finish guard the
+  //      reconnect spawns a fresh full run.  This was the actual bite
+  //      after the initial fix: a 13:09 run completed step 8, exited at
+  //      13:37:04, then a brand-new run started at 13:37:05.  The
+  //      browser EventSource's auto-reconnect is the trigger.
+  //
+  // Windows:
+  //   - RUNNING_WINDOW_MS (30 min): in-flight cap.  Covers the longest
+  //     legitimate run we've seen (~24 min) with margin; stale entries
+  //     from crashed claude expire naturally so the user is never
+  //     permanently locked out.
+  //   - RECENT_FINISH_WINDOW_MS (90 s): post-finish reconnect window.
+  //     EventSource's exponential backoff caps around 30 s for most
+  //     browsers; 90 s gives 3x headroom.  Long enough to catch
+  //     reconnect loops, short enough that "I clicked Resolve again
+  //     intentionally after the previous run finished" still works.
+  // ───────────────────────────────────────────────────────────────────
+  const RUNNING_WINDOW_MS = 30 * 60 * 1000
+  const RECENT_FINISH_WINDOW_MS = 90 * 1000
+  const now = Date.now()
+  let guardReason: string | null = null
+  for (const r of listResolveRuns()) {
+    if (r.issue !== issue) continue
+    if (r.status === 'running') {
+      if (now - new Date(r.startedAt).getTime() < RUNNING_WINDOW_MS) {
+        guardReason = `resolve already running for ${issue} since ${r.startedAt}`
+        break
+      }
+      continue
+    }
+    // Post-finish reconnect window — catches EventSource auto-retry
+    // that fires within seconds of a terminal event.
+    const finishedAtStr = (r as { finishedAt?: string }).finishedAt
+    if (finishedAtStr) {
+      if (now - new Date(finishedAtStr).getTime() < RECENT_FINISH_WINDOW_MS) {
+        guardReason = `previous resolve for ${issue} only just finished at ${finishedAtStr} (status=${r.status}); ignoring immediate respawn`
+        break
+      }
+    }
+  }
+  if (guardReason) {
+    // Reject with a clean SSE response so the browser sees a finished
+    // stream (not a connection error → no further auto-reconnect).
+    return streamSSE(c, async (stream) => {
+      const send = (event: string, data: object) => {
+        try { return stream.writeSSE({ event, data: JSON.stringify(data) }) } catch {}
+      }
+      await send('log', {
+        line: `[swctl] ${guardReason} — refusing duplicate spawn (auto-respawn guard).`,
+        ts: Date.now(),
+      })
+      await send('log', {
+        line: `[swctl] to force a fresh run: kill the existing session, or wait > 90 s after the previous finish.`,
+        ts: Date.now(),
+      })
+      await send('done', { exitCode: 0, elapsed: 0 })
+    })
+  }
+
   recordStart({ issue, project, mode, backend })
 
   const streamId = `resolve:${issue}`

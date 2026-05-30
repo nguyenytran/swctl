@@ -19,7 +19,70 @@
 set -euo pipefail
 
 # --- QA mode: minimal setup (no composer install, no npm, just DB + cache) ---
+#
+# Exception (added 2026-05-12 after #15629/#16496 lock-drift incident):
+# when the branch's composer.json bumps package constraints that the
+# shared trunk-vendor doesn't satisfy (e.g. opensearch-php ^2.3.1 →
+# ^2.6.0), we MUST run bootstrap_dependencies so the v0.6.7 drift
+# parser in `_composer_update_missing` can run
+# `composer update <pkgs> --with-dependencies` and heal the dedicated
+# vendor volume.  Skipping this leaves the worktree with a vendor whose
+# autoload classmap doesn't include the new transitive deps —
+# manifesting at runtime as `ClassNotFoundError` (the
+# GuzzleHttpClientFactory + Psr17FactoryDiscovery cascades we hit).
+#
+# Heuristic: COMPOSER_CHANGES > 0 means composer.json/lock differs from
+# trunk, so the cloned vendor volume is stale w.r.t. the lockfile.
+# bootstrap_dependencies is idempotent + cheap when the lock matches
+# (composer install becomes a no-op).
 if [ "$SWCTL_MODE" = "qa" ]; then
+    # v0.6.10: bootstrap is ALWAYS called now, not gated on COMPOSER_CHANGES.
+    # v0.6.8 only ran bootstrap when the BRANCH bumped composer relative
+    # to trunk — but trunk itself can advance after `vendor-base-<project>`
+    # was first populated.  Other teammates reported the same
+    # ClassNotFoundError on FRESH creates on v0.6.9 because their cached
+    # vendor-base volume was populated months ago at an older trunk and
+    # never refreshed (COMPOSER_CHANGES=0, so v0.6.8 stayed silent).
+    #
+    # bootstrap_dependencies' new `_vendor_satisfies_lockfile` jq check
+    # is ~50 ms when the vendor is fresh (composer doesn't even boot).
+    # Let that be the real gate.
+    #
+    # v0.6.11: the bootstrap call is GUARDED with `|| warn` because under
+    # parallel load (batch creates of 4+ instances at once), an unrelated
+    # transient failure inside bootstrap (e.g., a docker exec timeout on a
+    # busy daemon) would propagate through `set -euo pipefail` and exit
+    # the script BEFORE _swctl_ensure_install_lock could fire.  Result:
+    # the worktree provisioned a fully-cloned DB but never touched
+    # `install.lock`, so the storefront kept redirecting to /installer.
+    # Recovery was one `touch install.lock + cache:clear` away — but the
+    # user saw STATUS=failed in the registry and assumed the whole create
+    # was unrecoverable.  Bootstrap errors are loud but non-fatal now;
+    # the install-lock + sales-channel-domain + cache:clear MUST always
+    # run, regardless of what bootstrap reports.
+    # v0.6.12: write install.lock FIRST.
+    #
+    # In QA mode the DB is cloned from a working installed Shopware, so the
+    # instance is "installed" by definition — install.lock is just a file
+    # marker that prevents Shopware's index controller from redirecting to
+    # /installer.  Writing it BEFORE any other step means: no matter what
+    # bootstrap / migrations / sales-channel-domain do, the storefront
+    # never gets stuck at /installer.
+    #
+    # The original ordering buried install.lock near the end, so a
+    # parallel-load docker-exec timeout in any earlier step propagated
+    # through `set -euo pipefail` and aborted before install.lock was
+    # touched (#15504/#6345 on 2026-05-15 morning, #5393/#6304 on the
+    # afternoon).
+    _swctl_ensure_install_lock "$COMPOSE_PROJECT" \
+        || warn "ensure_install_lock failed — manual fix: 'touch install.lock' inside the container."
+
+    # All subsequent QA-mode steps are STRICTLY BEST-EFFORT: each is
+    # guarded with `|| warn` so a single transient failure (e.g., the
+    # docker daemon serializing exec calls under heavy batch load)
+    # can't kill the rest of the hook.
+    _swctl_bootstrap_dependencies "$COMPOSE_PROJECT" \
+        || warn "bootstrap_dependencies returned non-zero — continuing."
     # Run migrations if the branch has schema changes
     if [ $((MIGRATION_CHANGES + ENTITY_CHANGES)) -gt 0 ]; then
         info "Schema changes detected in QA mode. Running migrations."
@@ -27,8 +90,8 @@ if [ "$SWCTL_MODE" = "qa" ]; then
             "$WORKFLOW_CONSOLE database:migrate --all && $WORKFLOW_CONSOLE database:migrate-destructive --all" \
             || warn "Migrations failed."
     fi
-    _swctl_update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL"
-    _swctl_ensure_install_lock "$COMPOSE_PROJECT"
+    _swctl_update_sales_channel_domain "$COMPOSE_PROJECT" "$APP_URL" \
+        || warn "update_sales_channel_domain failed — admin URL may need manual fix."
     # Always clear cache so DI container / routing / config changes take effect
     run_app_command "$COMPOSE_PROJECT" "$WORKFLOW_CONSOLE cache:clear" || warn "cache:clear failed."
     return 0 2>/dev/null || exit 0
@@ -36,8 +99,13 @@ fi
 
 # --- Dev mode ---
 
-# Bootstrap dependencies (composer install, npm install, JWT keys)
-_swctl_bootstrap_dependencies "$COMPOSE_PROJECT"
+# Bootstrap dependencies (composer install, npm install, JWT keys).
+# Guarded with `|| warn` for the same reason as the QA branch above:
+# a transient bootstrap failure must not prevent install.lock / sales
+# channel domain / cache:clear from running.  Recovery from a partial
+# bootstrap is cheap; recovery from an un-installed Shopware is messier.
+_swctl_bootstrap_dependencies "$COMPOSE_PROJECT" \
+    || warn "bootstrap_dependencies returned non-zero — continuing provision."
 
 if [ "$DB_STATE" = "fresh" ]; then
     # Fresh install

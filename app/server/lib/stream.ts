@@ -318,11 +318,14 @@ export function streamSpawn(
   })
 }
 
-export function spawnSwctl(args: string[]): Promise<{ ok: boolean; output: string }> {
+export function spawnSwctl(
+  args: string[],
+  extraEnv: Record<string, string> = {},
+): Promise<{ ok: boolean; output: string }> {
   return new Promise((resolve) => {
     const child = spawn('bash', [SWCTL_PATH, ...args], {
       cwd: PROJECT_ROOT,
-      env: { ...process.env, SWCTL_STATE_DIR: STATE_DIR, TERM: 'dumb' },
+      env: { ...process.env, SWCTL_STATE_DIR: STATE_DIR, TERM: 'dumb', ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let output = ''

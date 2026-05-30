@@ -3,6 +3,11 @@ import { ref, computed, watch, onUnmounted } from 'vue'
 import type { Instance, StreamEvent } from '@/types'
 import { useStream } from '@/composables/useStream'
 import { stopInstance, startInstance, restartInstance, buildStreamUrl, killExec, killWorktreeExec, fetchDiff, setupInstance } from '@/api'
+import {
+  listSnapshots, createSnapshot, deleteSnapshot, restoreSnapshot,
+  getPreviewStatus, startPreview, stopPreview,
+  type Snapshot,
+} from '@/api'
 import { usePlugins } from '@/composables/usePlugins'
 import { useFeatures } from '@/composables/useFeatures'
 import PluginSlot from './PluginSlot.vue'
@@ -14,7 +19,7 @@ const emit = defineEmits<{ close: []; refresh: [] }>()
 // the resolve skill.  Hidden unless SWCTL_RESOLVE_ENABLED=1 on the server.
 const { features } = useFeatures()
 
-type BuiltinTab = 'logs' | 'exec' | 'worktree' | 'diff' | 'info'
+type BuiltinTab = 'logs' | 'exec' | 'worktree' | 'diff' | 'info' | 'ops'
 type TabName = BuiltinTab | string  // plugin tabs use `plugin:<pluginId>:<tabId>`
 
 const pluginsApi = usePlugins()
@@ -30,6 +35,7 @@ const availableTabs = computed<UiTab[]>(() => {
   ]
   if (props.instance.worktreePath) tabs.push({ id: 'worktree', label: 'Worktree' })
   if (props.instance.worktreePath) tabs.push({ id: 'diff', label: 'Diff' })
+  tabs.push({ id: 'ops', label: 'Ops' })
   tabs.push({ id: 'info', label: 'Info' })
 
   // Append plugin-provided tabs (respecting each plugin's `condition`)
@@ -298,6 +304,133 @@ function startLogs() {
 }
 startLogs()
 
+// ---------------------------------------------------------------------------
+// Ops tab: preview + snapshots
+// ---------------------------------------------------------------------------
+const previewLoading = ref(false)
+const previewRunning = ref(false)
+const previewUrl = ref<string | null>(null)
+const previewMessage = ref('')
+
+const snapshots = ref<Snapshot[]>([])
+const snapshotsLoading = ref(false)
+const snapshotName = ref('')
+const snapshotBusy = ref<string | null>(null)  // name currently being acted on
+const snapshotMessage = ref('')
+
+async function loadOps() {
+  await Promise.all([loadPreview(), loadSnapshots()])
+}
+
+async function loadPreview() {
+  previewLoading.value = true
+  try {
+    const r = await getPreviewStatus(props.instance.issueId)
+    previewRunning.value = r.running
+    previewUrl.value = r.url
+  } finally {
+    previewLoading.value = false
+  }
+}
+
+async function togglePreview() {
+  previewLoading.value = true
+  previewMessage.value = ''
+  try {
+    if (previewRunning.value) {
+      const r = await stopPreview(props.instance.issueId)
+      previewMessage.value = r.ok ? 'Tunnel stopped.' : `Stop failed: ${r.output}`
+      previewRunning.value = false
+      previewUrl.value = null
+    } else {
+      const r = await startPreview(props.instance.issueId)
+      if (r.ok && r.url) {
+        previewRunning.value = true
+        previewUrl.value = r.url
+        previewMessage.value = 'Tunnel live.'
+      } else {
+        previewMessage.value = `Tunnel start failed: ${r.output}`
+      }
+    }
+  } finally {
+    previewLoading.value = false
+  }
+}
+
+async function copyPreviewUrl() {
+  if (!previewUrl.value) return
+  try {
+    await navigator.clipboard.writeText(previewUrl.value)
+    previewMessage.value = 'URL copied to clipboard.'
+  } catch {
+    previewMessage.value = 'Clipboard unavailable — copy the URL manually.'
+  }
+}
+
+async function loadSnapshots() {
+  snapshotsLoading.value = true
+  try {
+    const r = await listSnapshots(props.instance.issueId)
+    snapshots.value = r.snapshots ?? []
+  } finally {
+    snapshotsLoading.value = false
+  }
+}
+
+async function doCreateSnapshot() {
+  // Name is optional — empty falls back to swctl's auto-<timestamp>.
+  const name = snapshotName.value.trim()
+  if (name && !/^[A-Za-z0-9._-]+$/.test(name)) {
+    snapshotMessage.value = 'Name may only contain [A-Za-z0-9._-].'
+    return
+  }
+  snapshotsLoading.value = true
+  snapshotMessage.value = ''
+  try {
+    const r = await createSnapshot(props.instance.issueId, name || undefined)
+    snapshotMessage.value = r.ok
+      ? `Snapshot${name ? ` '${name}'` : ''} created.`
+      : `Create failed: ${r.error ?? r.output}`
+    snapshotName.value = ''
+    await loadSnapshots()
+  } finally {
+    snapshotsLoading.value = false
+  }
+}
+
+async function doDeleteSnapshot(name: string) {
+  if (!confirm(`Delete snapshot '${name}'? This cannot be undone.`)) return
+  snapshotBusy.value = name
+  try {
+    const r = await deleteSnapshot(props.instance.issueId, name)
+    snapshotMessage.value = r.ok ? `Deleted '${name}'.` : `Delete failed: ${r.output}`
+    await loadSnapshots()
+  } finally {
+    snapshotBusy.value = null
+  }
+}
+
+async function doRestoreSnapshot(name: string) {
+  if (!confirm(
+    `Restore snapshot '${name}'?\n\n` +
+    `This will OVERWRITE the current database for this instance. ` +
+    `All data added since the snapshot was taken will be lost. ` +
+    `Run 'cache:clear' afterwards if the app is currently running.`,
+  )) return
+  snapshotBusy.value = name
+  try {
+    const r = await restoreSnapshot(props.instance.issueId, name)
+    snapshotMessage.value = r.ok ? `Restored '${name}'.` : `Restore failed: ${r.output}`
+  } finally {
+    snapshotBusy.value = null
+  }
+}
+
+// Lazy-load when the Ops tab is first opened, then on subsequent activations.
+watch(activeTab, (tab) => {
+  if (tab === 'ops') loadOps()
+})
+
 function runCommand() {
   if (!cmdInput.value.trim() || execStream.running.value) return
   const cmd = cmdInput.value.trim()
@@ -390,19 +523,40 @@ function scrollWtTerminal() {
   })
 }
 
+// Single-instance pending action — visual feedback for the
+// Stop/Start/Restart buttons in the InstanceDetail header.  Null
+// when idle.  Restart counts as "stop" for the spinner since visually
+// the user is asking the container to go down briefly.
+const lifecycleAction = ref<'stop' | 'start' | 'restart' | null>(null)
+
 async function handleStop() {
-  await stopInstance(props.instance.issueId)
-  emit('refresh')
+  lifecycleAction.value = 'stop'
+  try {
+    await stopInstance(props.instance.issueId)
+  } finally {
+    lifecycleAction.value = null
+    emit('refresh')
+  }
 }
 
 async function handleStart() {
-  await startInstance(props.instance.issueId)
-  emit('refresh')
+  lifecycleAction.value = 'start'
+  try {
+    await startInstance(props.instance.issueId)
+  } finally {
+    lifecycleAction.value = null
+    emit('refresh')
+  }
 }
 
 async function handleRestart() {
-  await restartInstance(props.instance.issueId)
-  emit('refresh')
+  lifecycleAction.value = 'restart'
+  try {
+    await restartInstance(props.instance.issueId)
+  } finally {
+    lifecycleAction.value = null
+    emit('refresh')
+  }
 }
 
 function handleRefresh() {
@@ -543,19 +697,31 @@ function formatDate(iso: string) {
         >Open Admin</a>
         <button
           v-if="instance.containerStatus === 'running'"
-          class="px-3 py-1 text-xs bg-yellow-600/20 text-yellow-400 border border-yellow-600/30 rounded hover:bg-yellow-600/30 transition-colors"
+          class="px-3 py-1 text-xs bg-yellow-600/20 text-yellow-400 border border-yellow-600/30 rounded hover:bg-yellow-600/30 transition-colors disabled:opacity-60 disabled:cursor-wait inline-flex items-center gap-1"
+          :disabled="lifecycleAction !== null"
           @click="handleStop"
-        >Stop</button>
+        >
+          <span v-if="lifecycleAction === 'stop'" class="inline-block animate-spin">↻</span>
+          {{ lifecycleAction === 'stop' ? 'Stopping…' : 'Stop' }}
+        </button>
         <button
           v-if="instance.containerStatus === 'exited'"
-          class="px-3 py-1 text-xs bg-emerald-600/20 text-emerald-400 border border-emerald-600/30 rounded hover:bg-emerald-600/30 transition-colors"
+          class="px-3 py-1 text-xs bg-emerald-600/20 text-emerald-400 border border-emerald-600/30 rounded hover:bg-emerald-600/30 transition-colors disabled:opacity-60 disabled:cursor-wait inline-flex items-center gap-1"
+          :disabled="lifecycleAction !== null"
           @click="handleStart"
-        >Start</button>
+        >
+          <span v-if="lifecycleAction === 'start'" class="inline-block animate-spin">↻</span>
+          {{ lifecycleAction === 'start' ? 'Starting…' : 'Start' }}
+        </button>
         <button
           v-if="instance.containerStatus === 'running'"
-          class="px-3 py-1 text-xs bg-blue-600/20 text-blue-400 border border-blue-600/30 rounded hover:bg-blue-600/30 transition-colors"
+          class="px-3 py-1 text-xs bg-blue-600/20 text-blue-400 border border-blue-600/30 rounded hover:bg-blue-600/30 transition-colors disabled:opacity-60 disabled:cursor-wait inline-flex items-center gap-1"
+          :disabled="lifecycleAction !== null"
           @click="handleRestart"
-        >Restart</button>
+        >
+          <span v-if="lifecycleAction === 'restart'" class="inline-block animate-spin">↻</span>
+          {{ lifecycleAction === 'restart' ? 'Restarting…' : 'Restart' }}
+        </button>
         <button
           v-if="instance.containerStatus === 'running' && instance.status === 'complete'"
           class="px-3 py-1 text-xs bg-purple-600/20 text-purple-400 border border-purple-600/30 rounded hover:bg-purple-600/30 transition-colors disabled:opacity-50"
@@ -933,6 +1099,133 @@ function formatDate(iso: string) {
             </dd>
           </template>
         </dl>
+      </div>
+
+      <!-- Ops tab: Cloudflare quick-tunnel + DB snapshot/restore -->
+      <div v-if="activeTab === 'ops'" class="flex-1 overflow-y-auto p-4 space-y-6">
+
+        <!-- Preview / Cloudflare Tunnel -->
+        <section class="rounded border border-gray-700 bg-gray-800/50 p-4">
+          <header class="mb-3 flex items-center justify-between">
+            <h3 class="text-base font-semibold text-white">Public preview</h3>
+            <span
+              class="text-xs px-2 py-0.5 rounded"
+              :class="previewRunning ? 'bg-emerald-700/40 text-emerald-200' : 'bg-gray-700 text-gray-400'"
+            >
+              {{ previewRunning ? 'Live' : 'Stopped' }}
+            </span>
+          </header>
+
+          <p class="text-xs text-gray-400 mb-3">
+            Expose this instance via Cloudflare Tunnel (quick-tunnel, no account needed).
+            URL is ephemeral &mdash; expect it to change on every restart.
+            Anyone with the link can access the instance, so don't share for sensitive data.
+          </p>
+
+          <div v-if="previewUrl" class="flex items-center gap-2 mb-3">
+            <a
+              :href="previewUrl"
+              target="_blank"
+              rel="noopener"
+              class="flex-1 truncate font-mono text-sm text-sky-300 hover:underline"
+            >{{ previewUrl }}</a>
+            <button
+              class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+              @click="copyPreviewUrl"
+            >Copy</button>
+          </div>
+
+          <div class="flex items-center gap-3">
+            <button
+              :disabled="previewLoading"
+              class="px-3 py-1.5 text-sm rounded font-medium"
+              :class="previewRunning
+                ? 'bg-rose-700 hover:bg-rose-600 text-white'
+                : 'bg-emerald-700 hover:bg-emerald-600 text-white'"
+              @click="togglePreview"
+            >
+              {{ previewLoading
+                ? (previewRunning ? 'Stopping…' : 'Starting…')
+                : (previewRunning ? 'Stop tunnel' : 'Start tunnel') }}
+            </button>
+            <span v-if="previewMessage" class="text-xs text-gray-400">{{ previewMessage }}</span>
+          </div>
+        </section>
+
+        <!-- DB snapshots -->
+        <section class="rounded border border-gray-700 bg-gray-800/50 p-4">
+          <header class="mb-3 flex items-center justify-between">
+            <h3 class="text-base font-semibold text-white">Database snapshots</h3>
+            <button
+              class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+              :disabled="snapshotsLoading"
+              @click="loadSnapshots"
+            >Refresh</button>
+          </header>
+
+          <p class="text-xs text-gray-400 mb-3">
+            Snapshot the per-instance MariaDB database (compressed dump under
+            <code class="font-mono">~/.local/state/swctl/instances/&hellip;/snapshots/</code>).
+            Restore overwrites the live database — confirm before clicking.
+          </p>
+
+          <div class="flex items-center gap-2 mb-4">
+            <input
+              v-model="snapshotName"
+              type="text"
+              placeholder="snapshot name (optional, defaults to auto-<timestamp>)"
+              class="flex-1 px-3 py-1.5 text-sm rounded bg-gray-900 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:border-sky-500"
+              @keydown.enter.prevent="doCreateSnapshot"
+            />
+            <button
+              :disabled="snapshotsLoading"
+              class="px-3 py-1.5 text-sm rounded font-medium bg-sky-700 hover:bg-sky-600 text-white"
+              @click="doCreateSnapshot"
+            >Create snapshot</button>
+          </div>
+
+          <div v-if="snapshotsLoading && snapshots.length === 0" class="text-sm text-gray-400">
+            Loading snapshots…
+          </div>
+          <div v-else-if="snapshots.length === 0" class="text-sm text-gray-400 italic">
+            No snapshots yet.
+          </div>
+          <table v-else class="w-full text-sm">
+            <thead>
+              <tr class="text-left text-gray-400 border-b border-gray-700">
+                <th class="py-2 font-medium">Name</th>
+                <th class="py-2 font-medium">Size</th>
+                <th class="py-2 font-medium">Created</th>
+                <th class="py-2 font-medium text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="s in snapshots"
+                :key="s.name"
+                class="border-b border-gray-800/60 hover:bg-gray-800/40"
+              >
+                <td class="py-2 font-mono text-white">{{ s.name }}</td>
+                <td class="py-2 text-gray-300">{{ s.size }}</td>
+                <td class="py-2 text-gray-400">{{ s.created }}</td>
+                <td class="py-2 text-right space-x-2">
+                  <button
+                    :disabled="snapshotBusy === s.name"
+                    class="px-2 py-1 text-xs rounded bg-amber-700 hover:bg-amber-600 text-white disabled:opacity-50"
+                    @click="doRestoreSnapshot(s.name)"
+                  >{{ snapshotBusy === s.name ? 'Restoring…' : 'Restore' }}</button>
+                  <button
+                    :disabled="snapshotBusy === s.name"
+                    class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600 text-gray-100 disabled:opacity-50"
+                    @click="doDeleteSnapshot(s.name)"
+                  >Delete</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <p v-if="snapshotMessage" class="mt-3 text-xs text-gray-400">{{ snapshotMessage }}</p>
+        </section>
       </div>
 
       <!-- Plugin-provided tab -->

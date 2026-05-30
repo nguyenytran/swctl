@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, triggerRef } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useInstances } from '@/composables/useInstances'
 import { useProjects } from '@/composables/useProjects'
@@ -133,14 +133,34 @@ function handleRetry(issueId: string) {
   stream.start(buildStreamUrl('refresh', { issueId }))
 }
 
+// Per-instance pending-action map.  Drives the spinner on the
+// Stop/Start buttons in InstanceRow while the API call is in flight.
+// Keyed by issueId; value is the action name.  Using a reactive Map
+// so adding/removing a key triggers re-render of the matching row.
+const pendingAction = ref<Map<string, 'stop' | 'start'>>(new Map())
+
 async function handleStop(issueId: string) {
-  await stopInstance(issueId)
-  refresh()
+  pendingAction.value.set(issueId, 'stop')
+  triggerRef(pendingAction)
+  try {
+    await stopInstance(issueId)
+  } finally {
+    pendingAction.value.delete(issueId)
+    triggerRef(pendingAction)
+    refresh()
+  }
 }
 
 async function handleStart(issueId: string) {
-  await startInstance(issueId)
-  refresh()
+  pendingAction.value.set(issueId, 'start')
+  triggerRef(pendingAction)
+  try {
+    await startInstance(issueId)
+  } finally {
+    pendingAction.value.delete(issueId)
+    triggerRef(pendingAction)
+    refresh()
+  }
 }
 
 function handleManage(inst: Instance) {
@@ -337,6 +357,7 @@ watch(() => route.params.issueId, (id) => {
               :key="inst.issueId"
               :instance="inst"
               :selected="selected.has(inst.issueId)"
+              :loading-action="pendingAction.get(inst.issueId) || null"
               @toggle-select="toggleSelect(inst.issueId)"
               @delete="handleDelete(inst.issueId, inst.linkedPlugins.length > 0)"
               @retry="handleRetry(inst.issueId)"
