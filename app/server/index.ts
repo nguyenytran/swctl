@@ -1507,10 +1507,23 @@ app.delete('/api/cloudflared/login', (c) => {
 })
 
 // Create a new named tunnel + wildcard DNS, from the UI. Requires login.
+//
+// This is an ONBOARDING shortcut: it only makes sense when no tunnel is wired
+// yet. To avoid leaving orphaned, half-wired tunnels (created on Cloudflare but
+// never selected — which is exactly what stranded a stray "swctl-preview"), it:
+//   1. Refuses to create a duplicate when a configured tunnel already exists on
+//      the account (unless `force` — e.g. the user knowingly wants another).
+//   2. Treats create → persist-config → wildcard-DNS as one atomic unit, and
+//      ROLLS BACK (deletes the just-created tunnel + creds, restores prior
+//      config) if any later step fails. A created tunnel is therefore always
+//      either fully wired or gone — never a silent orphan.
+// Config is persisted SERVER-SIDE here (not left to a follow-up client call
+// that could silently fail), so `preview --named` immediately uses the tunnel.
 app.post('/api/cloudflared/create-tunnel', async (c) => {
   const body = await c.req.json().catch(() => ({}))
   const name = String(body.name ?? '').trim()
   const domain = String(body.domain ?? '').trim()
+  const force = body.force === true
   if (!/^[A-Za-z0-9_-]+$/.test(name)) return c.json({ ok: false, error: 'Invalid tunnel name (letters, digits, - _)' }, 400)
   if (domain && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(domain)) return c.json({ ok: false, error: 'Invalid domain' }, 400)
   const home = cfHome()
@@ -1522,6 +1535,28 @@ app.post('/api/cloudflared/create-tunnel', async (c) => {
     { stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 },
   ).toString()
 
+  // Guard: don't silently create a second tunnel when one is already configured
+  // AND still present on the account. Creating another would also repoint the
+  // *.<domain> wildcard away from the working tunnel.
+  const cfg = readProjectConfig()
+  const prevId = (cfg['SW_PREVIEW_TUNNEL_ID'] || '').trim()
+  const prevDomain = (cfg['SW_PREVIEW_DOMAIN'] || '').trim()
+  if (!force && prevId) {
+    try {
+      const list = JSON.parse(run(`tunnel list --output json`))
+      const match = (Array.isArray(list) ? list : []).find((t: any) => t.id === prevId)
+      if (match) {
+        return c.json({
+          ok: false,
+          alreadyConfigured: true,
+          existing: { id: prevId, name: match.name || '', domain: prevDomain },
+          error: `A tunnel is already configured: ${match.name || prevId}.`,
+        })
+      }
+    } catch { /* can't verify → fall through and allow creation */ }
+  }
+
+  // 1. Create the tunnel.
   let id = ''
   try {
     const out = run(`tunnel create ${name}`)
@@ -1532,20 +1567,40 @@ app.post('/api/cloudflared/create-tunnel', async (c) => {
   }
   if (!id) return c.json({ ok: false, error: 'Tunnel created but its id could not be parsed' }, 500)
 
-  // Wildcard DNS so any sw-<issue>.<domain> resolves. Single-quote the '*' so
-  // the container shell doesn't glob it. Best-effort: tolerate "already exists".
-  let dnsWarning: string | undefined
+  // Undo everything this request created, restoring prior config. Used when a
+  // later wiring step fails so we never leave a half-configured orphan.
+  const rollback = (why: string) => {
+    setProjectConfigKeys({ SW_PREVIEW_TUNNEL_ID: prevId, SW_PREVIEW_DOMAIN: prevDomain })
+    try { run(`tunnel delete -f ${id}`) } catch {}
+    try { fs.rmSync(`${home}/.cloudflared/${id}.json`, { force: true }) } catch {}
+    return c.json({ ok: false, rolledBack: true, error: why }, 500)
+  }
+
+  // 2. Persist config server-side (cheap + reliable) so the new tunnel is the
+  //    selected one. Done before DNS so a DNS failure cleanly reverts config.
+  const saved = setProjectConfigKeys({
+    SW_PREVIEW_TUNNEL_ID: id,
+    ...(domain ? { SW_PREVIEW_DOMAIN: domain } : {}),
+  })
+  if (!saved.ok) return rollback(`Tunnel created but saving config failed: ${saved.error}. Rolled back.`)
+
+  // 3. Wildcard DNS so any sw-<issue>.<domain> resolves. Last step: if it fails
+  //    the tunnel is useless, so roll the whole thing back. Single-quote '*' so
+  //    the container shell doesn't glob it.
   if (domain) {
     try { run(`tunnel route dns ${name} '*.${domain}'`) }
-    catch (e: any) { dnsWarning = (e?.stderr?.toString?.() || '').slice(0, 200) || undefined }
+    catch (e: any) {
+      return rollback(`Wildcard DNS for *.${domain} failed: ${(e?.stderr?.toString?.() || e?.message || '').slice(0, 200)}. Rolled back.`)
+    }
   }
+
   // Restore ownership of the freshly-written creds + cert to the dir's owner.
   try {
     const st = fs.statSync(`${home}/.cloudflared`)
     if (fs.existsSync(`${home}/.cloudflared/${id}.json`)) fs.chownSync(`${home}/.cloudflared/${id}.json`, st.uid, st.gid)
     fs.chownSync(`${home}/.cloudflared/cert.pem`, st.uid, st.gid)
   } catch {}
-  return c.json({ ok: true, id, name, dnsWarning })
+  return c.json({ ok: true, id, name, domain, configSaved: true, dnsConfigured: !!domain })
 })
 
 // Named-preview tunnel configuration (SW_PREVIEW_* in the project's .swctl.conf).

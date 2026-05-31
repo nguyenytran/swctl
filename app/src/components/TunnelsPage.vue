@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import QRCode from 'qrcode'
 import {
   getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig, reapTunnels,
@@ -115,22 +115,42 @@ const newTunnelName = ref('swctl-preview')
 const creating = ref(false)
 const createMsg = ref('')
 
-async function createTunnel() {
+// The currently-configured tunnel, if it still exists on the account.
+// When set, the "Create tunnel" action is redundant (and would create a
+// duplicate / repoint DNS), so the UI guides toward reusing it instead.
+const configuredTunnel = computed(() =>
+  cfgTunnelId.value ? cfTunnels.value.find(t => t.id === cfgTunnelId.value) || null : null)
+
+async function createTunnel(force = false) {
   if (!newTunnelName.value.trim()) return
   creating.value = true
   createMsg.value = ''
   try {
-    const r = await createCloudflaredTunnel(newTunnelName.value.trim(), cfgDomain.value.trim())
+    const r = await createCloudflaredTunnel(newTunnelName.value.trim(), cfgDomain.value.trim(), force)
     if (r.ok && r.id) {
-      await loadCfTunnels()
-      cfgTunnelId.value = r.id
-      await saveConfig()
-      createMsg.value = r.dnsWarning
-        ? `Created “${r.name}” and selected it. DNS note: ${r.dnsWarning}`
-        : `Created “${r.name}”, wildcard DNS added, and selected it.`
-    } else {
-      createMsg.value = `Failed: ${r.error || 'unknown error'}`
+      // Server already persisted the config + DNS atomically; just refresh state.
+      await Promise.all([loadCfTunnels(), loadConfig()])
+      createMsg.value = r.dnsConfigured
+        ? `Created “${r.name}”, wildcard DNS added, and selected it.`
+        : `Created “${r.name}” and selected it. Set a domain + Save to add wildcard DNS.`
+      return
     }
+    // A tunnel is already wired — confirm before creating a duplicate (which
+    // also repoints the *.<domain> wildcard away from the working tunnel).
+    if (r.alreadyConfigured) {
+      const ex = r.existing
+      confirmAction.value = {
+        title: 'A tunnel is already configured',
+        message: `“${ex?.name || ex?.id}” is already set up and serving your previews. ` +
+          `Creating “${newTunnelName.value.trim()}” will repoint *.${cfgDomain.value.trim() || 'your-domain'} ` +
+          `to the new tunnel. Create it anyway?`,
+        onConfirm: () => { confirmAction.value = null; void createTunnel(true) },
+      }
+      return
+    }
+    createMsg.value = r.rolledBack
+      ? `Failed (rolled back, nothing left behind): ${r.error || 'unknown error'}`
+      : `Failed: ${r.error || 'unknown error'}`
   } catch (e: any) {
     createMsg.value = `Failed: ${e?.message || String(e)}`
   } finally {
@@ -345,8 +365,22 @@ onUnmounted(() => { if (timer) clearInterval(timer); stopLoginPoll() })
           pick the <span class="font-mono">{{ cfgDomain || 'your' }}</span> zone, and this updates automatically.
         </p>
 
-        <!-- Create a new tunnel (+ wildcard DNS) from the UI. -->
-        <div v-if="account.loggedIn" class="flex items-end gap-2 flex-wrap">
+        <!-- Already configured: creating another is redundant and would repoint
+             DNS, so reassure + de-emphasise rather than offer an unguarded button. -->
+        <div
+          v-if="account.loggedIn && configuredTunnel"
+          class="flex items-center gap-2 text-xs rounded border border-emerald-700/40 bg-emerald-900/10 px-3 py-2"
+        >
+          <svg class="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>
+          <span class="text-emerald-300">Tunnel already configured:</span>
+          <span class="font-mono text-gray-200">{{ configuredTunnel.name }}</span>
+          <span class="text-gray-500">— previews use this. No need to create another.</span>
+        </div>
+
+        <!-- Create a new tunnel (+ wildcard DNS) from the UI — onboarding for
+             when none is wired yet. Hidden once one is configured (the server
+             also refuses duplicates unless explicitly forced via confirm). -->
+        <div v-if="account.loggedIn && !configuredTunnel" class="flex items-end gap-2 flex-wrap">
           <label class="block">
             <span class="text-xs text-gray-400">New tunnel name</span>
             <input
@@ -361,13 +395,14 @@ onUnmounted(() => { if (timer) clearInterval(timer); stopLoginPoll() })
             class="h-9 px-3 text-sm rounded font-medium bg-gray-700 hover:bg-gray-600 text-white disabled:opacity-60 inline-flex items-center gap-2"
             :disabled="creating || !newTunnelName.trim()"
             :title="cfgDomain ? `Creates the tunnel and adds *.${cfgDomain} DNS` : 'Set a domain above first for wildcard DNS'"
-            @click="createTunnel"
+            @click="createTunnel(false)"
           >
             <span v-if="creating" class="inline-block w-3 h-3 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
             {{ creating ? 'Creating…' : 'Create tunnel' }}
           </button>
           <span v-if="createMsg" class="text-xs text-gray-400">{{ createMsg }}</span>
         </div>
+        <p v-else-if="account.loggedIn && createMsg" class="text-xs text-gray-400">{{ createMsg }}</p>
 
         <details class="text-xs text-gray-500 bg-black/20 rounded border border-white/5">
           <summary class="cursor-pointer px-2 py-1.5 hover:text-gray-300">Or set it up from the terminal</summary>
