@@ -5,6 +5,7 @@ import { useActiveProject } from '@/composables/useActiveProject'
 import { useBatchCreate } from '@/composables/useBatchCreate'
 import { useInstances } from '@/composables/useInstances'
 import { fetchPlugins, fetchGitHubIssues, fetchGitHubStatus, githubLogout, requestDeviceCode, pollDeviceAuth, resolvePr } from '@/api'
+import { copyToClipboard } from '@/utils/clipboard'
 import type { GitHubItem, GitHubAuthStatus } from '@/types'
 
 const emit = defineEmits<{ close: []; refresh: [] }>()
@@ -201,7 +202,7 @@ function cancelDeviceFlow() {
 
 async function copyUserCode() {
   if (ghDeviceCode.value) {
-    await navigator.clipboard.writeText(ghDeviceCode.value.user_code)
+    await copyToClipboard(ghDeviceCode.value.user_code)
   }
 }
 

@@ -2,6 +2,7 @@
 import { ref, computed, watch, onUnmounted } from 'vue'
 import type { Instance, StreamEvent } from '@/types'
 import { useStream } from '@/composables/useStream'
+import { copyToClipboard } from '@/utils/clipboard'
 import { stopInstance, startInstance, restartInstance, buildStreamUrl, killExec, killWorktreeExec, fetchDiff, setupInstance } from '@/api'
 import {
   listSnapshots, createSnapshot, deleteSnapshot, restoreSnapshot,
@@ -366,8 +367,8 @@ async function toggleNamedPreview() {
 
 async function copyNamedUrl() {
   if (!namedUrl.value) return
-  try { await navigator.clipboard.writeText(namedUrl.value); namedMessage.value = 'URL copied to clipboard.' }
-  catch { namedMessage.value = 'Clipboard unavailable — copy manually.' }
+  namedMessage.value = (await copyToClipboard(namedUrl.value))
+    ? 'URL copied to clipboard.' : 'Clipboard unavailable — copy manually.'
 }
 
 // Reset DB to a clean base (destructive). Inline two-step confirm — no browser dialog.
@@ -425,12 +426,8 @@ async function togglePreview() {
 
 async function copyPreviewUrl() {
   if (!previewUrl.value) return
-  try {
-    await navigator.clipboard.writeText(previewUrl.value)
-    previewMessage.value = 'URL copied to clipboard.'
-  } catch {
-    previewMessage.value = 'Clipboard unavailable — copy the URL manually.'
-  }
+  previewMessage.value = (await copyToClipboard(previewUrl.value))
+    ? 'URL copied to clipboard.' : 'Clipboard unavailable — copy the URL manually.'
 }
 
 async function loadSnapshots() {

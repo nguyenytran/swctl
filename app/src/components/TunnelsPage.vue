@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import QRCode from 'qrcode'
+import { copyToClipboard } from '@/utils/clipboard'
 import {
   getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig, reapTunnels,
   listCloudflaredTunnels, startCloudflaredLogin, cloudflaredLoginStatus, cancelCloudflaredLogin, getCloudflaredAccount, createCloudflaredTunnel,
@@ -231,8 +232,7 @@ async function doStop(t: Tunnel, isNamed: boolean) {
 }
 
 async function copy(url: string) {
-  try { await navigator.clipboard.writeText(url); message.value = 'URL copied.' }
-  catch { message.value = 'Clipboard unavailable — copy manually.' }
+  message.value = (await copyToClipboard(url)) ? 'URL copied.' : 'Clipboard unavailable — copy manually.'
 }
 
 // Share: QR code (great for opening a preview on a phone).

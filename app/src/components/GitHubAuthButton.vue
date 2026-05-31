@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { fetchGitHubStatus, githubLogout, requestDeviceCode, pollDeviceAuth } from '@/api'
 import type { GitHubAuthStatus } from '@/types'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const auth = ref<GitHubAuthStatus | null>(null)
 const deviceCode = ref<{ device_code: string; user_code: string; verification_uri: string; interval: number } | null>(null)
@@ -77,7 +78,7 @@ function cancelFlow() {
 
 async function copyCode() {
   if (deviceCode.value) {
-    await navigator.clipboard.writeText(deviceCode.value.user_code)
+    await copyToClipboard(deviceCode.value.user_code)
     copied.value = true
     setTimeout(() => { copied.value = false }, 2000)
   }
