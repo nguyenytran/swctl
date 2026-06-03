@@ -1676,21 +1676,22 @@ function readInstanceNamedHostname(issueId: string): string {
 app.post('/api/instances/:issueId/named-preview', async (c) => {
   const issueId = c.req.param('issueId')
 
-  // v0.7.4 — create a SPECIFIC CNAME for this instance BEFORE the
+  // v0.7.5 — create a SPECIFIC CNAME for this instance BEFORE the
   // tunnel starts.  Pre-0.7.4, swctl relied on a wildcard
   // `*.<SW_PREVIEW_DOMAIN>` CNAME pointing at the cloudflared tunnel,
-  // which conflicted with Pages/Workers on the same root domain.  Now
-  // each named-preview Start picks a FRESH RANDOM hostname
-  // (`<random>.<domain>`) so:
-  //  - URLs are unguessable (~48 bits of entropy in 12 hex chars)
-  //  - Each Stop+Start rotates the URL (matches trycloudflare.com UX)
-  //  - The issue id isn't leaked in the public hostname
+  // which conflicted with Pages/Workers on the same root domain.
+  // v0.7.4 briefly used random hostnames; v0.7.5 reverts to the
+  // predictable `sw-<issue>` shape (the original convention) but
+  // keeps v0.7.4's per-instance DNS creation — so the zone-coexistence
+  // benefit survives while bookmarks stay stable across restarts.
   //
-  // The chosen hostname is persisted server-side via swctl's instance
-  // metadata (PREVIEW_NAMED_HOSTNAME), so the Stop handler can look
-  // it up and delete the right DNS record.  Fail-closed: if DNS
-  // create fails we don't spawn swctl — otherwise the user would see
-  // a "live" tunnel that doesn't resolve.
+  // Trade-off accepted: the public URL leaks the issue id.  For
+  // private/internal preview sharing on a domain the user owns
+  // that's fine; truly-anonymous URLs were the wrong default.
+  //
+  // Fail-closed: if DNS create fails we don't spawn swctl —
+  // otherwise the user would see a "live" tunnel that doesn't
+  // resolve.
   const cfg = readProjectConfig()
   const domain = (cfg['SW_PREVIEW_DOMAIN'] || '').trim()
   const tunnelId = (cfg['SW_PREVIEW_TUNNEL_ID'] || '').trim()
@@ -1700,11 +1701,9 @@ app.post('/api/instances/:issueId/named-preview', async (c) => {
       output: '[error] SW_PREVIEW_DOMAIN or SW_PREVIEW_TUNNEL_ID not set in .swctl.conf. Configure them on /#/tunnels first.',
     })
   }
-  // 12 hex chars = 48 bits — collision-resistant for any realistic
-  // fleet size.  Hex (not base64url) so the label only uses
-  // [a-z0-9], safest possible DNS label.
-  const randomLabel = randomBytes(6).toString('hex')
-  const hostname = `${randomLabel}.${domain}`
+  // v0.7.5: deterministic per-issue hostname.  Matches the legacy
+  // _named_domain_for shape in swctl bash for back-compat.
+  const hostname = `sw-${issueId}.${domain}`
   const dnsTarget = `${tunnelId}.cfargotunnel.com`
   const dns = await ensureCname(hostname, dnsTarget)
   if (!dns.ok) {
