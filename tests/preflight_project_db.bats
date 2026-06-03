@@ -71,6 +71,35 @@ case "\$1" in
     info)    exit 0 ;;
     image)   exit 0 ;;
     network) exit 0 ;;
+    compose) exit 0 ;;
+    inspect)
+        # v0.7.6: _preflight_project_db_repair queries
+        #   docker inspect <c> --format '{{.State.Status}}'
+        #   docker inspect <c> --format '{{len .NetworkSettings.Networks}}'
+        # Container name is the FIRST positional arg after the subcommand.
+        cn="\$2"
+        # Tests treat the "running" CSV list as authoritative — if the
+        # container is in it, report "running" with one network attached
+        # so the heal helper takes the healthy path.  Anything else
+        # (exited / missing) returns the appropriate value.
+        case "\$*" in
+            *"State.Status"*)
+                if echo "$running" | tr ',' '\n' | grep -qx "\$cn"; then
+                    echo running
+                elif echo "$all" | tr ',' '\n' | grep -qx "\$cn"; then
+                    echo exited
+                fi
+                exit 0 ;;
+            *"NetworkSettings.Networks"*)
+                if echo "$running" | tr ',' '\n' | grep -qx "\$cn"; then
+                    echo 1
+                else
+                    echo 0
+                fi
+                exit 0 ;;
+        esac
+        exit 0
+        ;;
     ps)
         # Find the --filter 'name=…' arg.
         all_flag=0
@@ -128,7 +157,11 @@ EOF
 
     run _run_preflight_checks
     [ "$status" -eq 0 ]
-    [[ "$output" == *"✓ project database running (trunk-database-1)"* ]]
+    # v0.7.6: success label gained "+ network-attached" suffix because
+    # the preflight now also verifies the DB's network attachment, not
+    # just its `docker ps` presence (catches the chronic detached-but-
+    # running state).
+    [[ "$output" == *"✓ project database running + network-attached (trunk-database-1)"* ]]
     # And the legacy line MUST NOT appear — we picked the project DB.
     [[ "$output" != *"shared mariadb running (swctl-mariadb)"* ]]
 }
@@ -139,19 +172,26 @@ EOF
 # not silently pass against swctl-mariadb.
 # ---------------------------------------------------------------------------
 
-@test "preflight db: project DB exists but exited → fails with compose-up remedy" {
+@test "preflight db: project DB exists but exited → AUTO-HEALS via compose up (v0.7.6)" {
     # docker ps -a sees both; docker ps (running) sees only swctl-mariadb.
+    # In v0.7.6 the preflight no longer FAILS on this case — it
+    # auto-heals via `docker compose up -d database` (the simple-start
+    # path of _preflight_project_db_repair, since the container exists
+    # but isn't running).  The stub's `compose) exit 0` makes the heal
+    # succeed silently; in production the heal might fail (then
+    # preflight DOES fail with status=1 + the remedy text), but the
+    # happy path is "stop showing the user this whenever it's
+    # auto-fixable".
     _stub_docker_dual "swctl-mariadb" \
                       "trunk-database-1,swctl-mariadb"
     PROJECT_SLUG="trunk"
     export PROJECT_SLUG
 
     run _run_preflight_checks
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"✗ project database running (trunk-database-1)"* ]]
-    # Remedy points at the project's compose, not swctl init.
-    [[ "$output" == *"docker compose up -d"* ]]
-    # And the legacy fallback didn't sneak in.
+    [ "$status" -eq 0 ]
+    # Healed → green tick, NOT red cross.
+    [[ "$output" == *"✓ project database running + network-attached (trunk-database-1)"* ]]
+    # Legacy fallback still doesn't appear — we picked + healed the project DB.
     [[ "$output" != *"shared mariadb running"* ]]
 }
 

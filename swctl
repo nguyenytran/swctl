@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.7.5"
+SWCTL_VERSION="0.7.6"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -4304,6 +4304,77 @@ _preflight_one() {
     fi
 }
 
+# v0.7.6 — heal a project database container that is RUNNING but has
+# zero attached networks.  This is the chronic failure mode behind
+# every "SQLSTATE[HY000] [2002] getaddrinfo for database failed" that
+# we've hit on 2026-05-17, 2026-05-18, and 2026-06-03.  Docker
+# doesn't consider "running but detached" a crash — `restart:
+# unless-stopped` doesn't fire — so the container stays up and broken
+# until someone (until now: a human) recreates it.
+#
+# Detection: `docker inspect` reports `NetworkSettings.Networks` as
+# an EMPTY map.  Compare with a healthy DB which shows e.g.
+# `{trunk_default:192.168.147.8 aliases=...,database}`.
+#
+# Heal: `docker compose up -d --force-recreate database` in the
+# project root.  The recreate re-applies the merged compose config
+# (which includes the `ports: !override []` from compose.override.yaml,
+# so the host-port-3306 conflict with swctl-mariadb doesn't bite),
+# and the new container gets a fresh network attachment with the
+# `database` alias restored.
+#
+# Args:
+#   $1 container_name (e.g. trunk-database-1)
+#   $2 project_root   (e.g. /Users/ytran/Shopware/trunk)
+#
+# Returns:
+#   0 — container was healthy, OR was detached and successfully healed
+#   1 — container was detached and heal FAILED
+#   2 — container doesn't exist (caller should fall through to the
+#       "no project DB" branch — this isn't a failure per se)
+_preflight_project_db_repair() {
+    local cn="$1" proj_root="$2"
+    [ -n "$cn" ] && [ -n "$proj_root" ] || return 1
+
+    # Status check.  If the container is missing or never started, we
+    # can't diagnose detachment — caller's outer logic handles "DB
+    # entirely absent" via the standard "not running" branch.
+    local status
+    status="$(docker inspect "$cn" --format '{{.State.Status}}' 2>/dev/null)"
+    [ -n "$status" ] || return 2
+
+    local net_count
+    net_count="$(docker inspect "$cn" --format '{{len .NetworkSettings.Networks}}' 2>/dev/null)"
+
+    # Healthy path: container is running and at least one network is attached.
+    if [ "$status" = "running" ] && [ "$net_count" != "0" ]; then
+        return 0
+    fi
+
+    # Diagnosed: running but Networks={}.  That's the recurring bug.
+    if [ "$status" = "running" ] && [ "$net_count" = "0" ]; then
+        warn "Detected '$cn' is running but detached from its network — auto-healing via docker compose up --force-recreate"
+        if (cd "$proj_root" && docker compose up -d --force-recreate database >/dev/null 2>&1); then
+            ok "Recreated '$cn' — network attachment restored."
+            return 0
+        fi
+        err "Heal failed: 'docker compose up -d --force-recreate database' in $proj_root returned non-zero."
+        err "Try manually: cd $proj_root && docker compose up -d --force-recreate database"
+        return 1
+    fi
+
+    # Container exists but not in 'running' state (e.g. exited / created /
+    # restarting).  Try a simple docker compose up — recreate isn't
+    # strictly necessary for these states.
+    info "Project DB '$cn' is in state '$status' — attempting to start via docker compose up -d"
+    if (cd "$proj_root" && docker compose up -d database >/dev/null 2>&1); then
+        ok "Started '$cn'."
+        return 0
+    fi
+    err "Could not start '$cn'.  Run: cd $proj_root && docker compose up -d database"
+    return 1
+}
+
 # Run the full preflight suite.  Caller has already populated
 # PROJECT_ROOT, SW_TRAEFIK_NETWORK, SW_WORKTREE_ROOT, ISSUE_ID, and
 # WORKTREE_PATH.  Returns 0 on full pass, 1 on any failure.
@@ -4425,9 +4496,20 @@ _run_preflight_checks() {
         _project_db="$(docker ps -a --filter "name=^${PROJECT_SLUG}-database-1$" --format '{{.Names}}' 2>/dev/null | head -1)"
     fi
     if [ -n "$_project_db" ]; then
-        _preflight_one "project database running ($_project_db)" \
-            "docker ps --filter 'name=^${_project_db}\$' --format '{{.Names}}' | grep -q ." \
-            "Run 'cd ${PROJECT_ROOT:-<project-root>} && docker compose up -d' — project's own database is down" || failed=1
+        # v0.7.6: detect + auto-heal the "running but detached from
+        # network" state.  Without this, the preflight would say the
+        # DB is "running" and we'd happily kick off `swctl create`,
+        # only for every per-instance container to fail with
+        # "SQLSTATE getaddrinfo for database failed" on first boot.
+        # _preflight_project_db_repair recreates the container in
+        # place when needed.
+        if _preflight_project_db_repair "$_project_db" "${PROJECT_ROOT}"; then
+            printf '[preflight] ✓ project database running + network-attached (%s)\n' "$_project_db"
+        else
+            printf '[preflight] ✗ project database broken (%s) — auto-heal failed\n' "$_project_db" >&2
+            printf "            └─ Manual fix: cd %s && docker compose up -d --force-recreate database\n" "${PROJECT_ROOT:-<project-root>}" >&2
+            failed=1
+        fi
     else
         local db_container="${SW_INFRA_DB_CONTAINER:-swctl-mariadb}"
         _preflight_one "shared mariadb running ($db_container)" \
@@ -8019,6 +8101,44 @@ cmd_nuke() {
 # Health probe: reports the state of every component swctl depends on
 # and attempts to auto-recover a wedged Docker daemon.  Designed to be
 # the first thing to run when the UI starts misbehaving.
+# v0.7.6 — one-shot heal of the chronic project-DB-detached-from-network
+# bug.  Three-times-this-week recurring symptom we now patch in code:
+#
+#   docker ps says trunk-database-1 is "Up" + "healthy".
+#   docker inspect says NetworkSettings.Networks={} (empty map).
+#   Every per-instance container fails with
+#     "SQLSTATE[HY000] [2002] getaddrinfo for database failed".
+#
+# `swctl heal` runs the same _preflight_project_db_repair logic that
+# the preflight uses, but standalone — for the case where the user
+# sees instances failing and wants to fix it without running
+# `swctl create` (which would trigger preflight as a side effect).
+#
+# Looks for ${PROJECT_SLUG}-database-1 (the convention shopware/
+# shopware compose uses).  Project must be loaded via .swctl.conf or
+# the helper bails with a clear message.
+cmd_heal() {
+    maybe_load_project_config >/dev/null 2>&1 || true
+    if [ -z "${SW_PROJECT_SLUG:-}" ] || [ -z "${PROJECT_ROOT:-}" ]; then
+        die "No project loaded — run 'swctl heal' from inside a project directory (one with .swctl.conf), or 'cd' to one first."
+    fi
+    require_cmd docker
+
+    local cn="${SW_PROJECT_SLUG}-database-1"
+    info "Checking '${cn}'…"
+
+    set +e
+    _preflight_project_db_repair "$cn" "$PROJECT_ROOT"
+    local rc=$?
+    set -e
+    case "$rc" in
+        0) ok "Project database is healthy." ;;
+        1) die "Heal failed — see messages above.  Try: cd $PROJECT_ROOT && docker compose up -d --force-recreate database" ;;
+        2) die "No project database container '${cn}' exists.  Bring it up first: cd $PROJECT_ROOT && docker compose up -d" ;;
+        *) die "Unexpected heal exit code $rc." ;;
+    esac
+}
+
 cmd_doctor() {
     local rc=0
 
@@ -11473,7 +11593,15 @@ main() {
             ;;
         doctor|health)
             ensure_state_dirs
-            cmd_doctor
+            cmd_doctor "$@"
+            ;;
+        heal)
+            # v0.7.6 — quick auto-heal for the chronic "project DB
+            # running but detached from network" state.  Equivalent to
+            # `doctor --heal` but doesn't print the full health report
+            # — just diagnoses + recreates the project DB if needed.
+            ensure_state_dirs
+            cmd_heal
             ;;
         perf)
             ensure_state_dirs
