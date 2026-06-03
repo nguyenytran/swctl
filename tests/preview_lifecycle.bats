@@ -59,7 +59,7 @@ case "$1" in
         # docker rm -f <name>
         for a in "$@"; do
             case "$a" in
-                swctl-preview-*) rm -f "$CONTAINERS_DIR/$a" ;;
+                swctl-preview-*|swctl-tunnel-auth-*) rm -f "$CONTAINERS_DIR/$a" ;;
             esac
         done
         exit 0
@@ -207,4 +207,108 @@ _arm_tunnel() {
     run _preview_status
     [ "$status" -eq 0 ]
     printf '%s\n' "$output" | grep -qi 'no preview'
+}
+
+# ---------------------------------------------------------------------------
+# v0.7.3 regression guard: _preview_start now requires
+# SWCTL_PREVIEW_PASSWORD.  The UI server always sets it; interactive
+# CLI users must set it themselves.  Without it we MUST die early —
+# starting cloudflared with no auth sidecar would leave the tunnel
+# world-readable, defeating the whole feature.
+# ---------------------------------------------------------------------------
+
+@test "_preview_start: dies when SWCTL_PREVIEW_PASSWORD is unset (v0.7.3)" {
+    unset SWCTL_PREVIEW_PASSWORD
+    run _preview_start
+    [ "$status" -ne 0 ]
+    # Should NOT have made any docker run calls — fail-closed.
+    ! grep -q 'docker run' "$DOCKER_CALLS_FILE"
+    ! grep -qE 'run -d.*cloudflared' "$DOCKER_CALLS_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# v0.7.3: with password set, _preview_start spawns the auth proxy
+# FIRST (hash-password, then caddy run), then cloudflared --url
+# pointing at the proxy (not the app directly).
+# ---------------------------------------------------------------------------
+
+@test "_preview_start: with password, cloudflared --url targets the auth proxy" {
+    # Extend the docker stub to handle caddy hash-password runs and
+    # arm cloudflared to emit a URL on first call.
+    cat > "$SW_TMP/docker" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DOCKER_CALLS_FILE"
+case "$*" in
+    *"caddy:2-alpine"*"hash-password"*)
+        echo '$2a$14$STUBhashSTUBhashSTUBhashSTUBhashSTUBhashSTUBhashSTUBhash'
+        exit 0
+        ;;
+    *"caddy:2-alpine"*"caddy run"*)
+        : > "$CONTAINERS_DIR/swctl-tunnel-auth-42"
+        exit 0
+        ;;
+    "run "*"cloudflare/cloudflared"*)
+        # Mark the cloudflared container as up + emit URL on next logs call.
+        : > "$CONTAINERS_DIR/swctl-preview-42"
+        printf 'https://emit-this.trycloudflare.com\n' > "$URL_FILE"
+        exit 0
+        ;;
+esac
+case "$1" in
+    logs)    cat "$URL_FILE"; exit 0 ;;
+    rm)
+        for a in "$@"; do
+            case "$a" in
+                swctl-preview-*|swctl-tunnel-auth-*) rm -f "$CONTAINERS_DIR/$a" ;;
+            esac
+        done
+        exit 0 ;;
+    ps)      printf 'fake-app-id\n'; exit 0 ;;
+    inspect)
+        case "$*" in
+            *NetworkSettings.Networks*) printf 'trunk-test_default\n'; exit 0 ;;
+            *.Name*)                    printf '/trunk-test-web-1\n';  exit 0 ;;
+        esac
+        exit 0 ;;
+esac
+exit 0
+SH
+
+    export SWCTL_STATE_DIR="$SW_TMP/state"
+    mkdir -p "$SWCTL_STATE_DIR"
+    SWCTL_PREVIEW_PASSWORD="test-pw-123"
+    export SWCTL_PREVIEW_PASSWORD
+
+    run _preview_start
+    [ "$status" -eq 0 ]
+
+    # The auth-proxy hash + run came BEFORE cloudflared.
+    awk '/caddy:2-alpine.*hash-password/ { hash_at=NR }
+         /cloudflare\/cloudflared/ { cf_at=NR }
+         END { exit !(hash_at && cf_at && hash_at < cf_at) }' "$DOCKER_CALLS_FILE"
+
+    # cloudflared --url points at the proxy container, NOT the app.
+    grep -qE 'cloudflare/cloudflared.*tunnel --no-autoupdate --url http://swctl-tunnel-auth-42:8080' "$DOCKER_CALLS_FILE"
+    ! grep -qE 'cloudflare/cloudflared.*--url http://trunk-test-web-1:8000' "$DOCKER_CALLS_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# v0.7.3: _preview_stop now also removes the auth-proxy sidecar.
+# Failing this test would leak a Caddy container per stopped tunnel.
+# ---------------------------------------------------------------------------
+
+@test "_preview_stop: also removes the auth-proxy sidecar" {
+    _arm_tunnel "swctl-preview-42" "https://cat.trycloudflare.com"
+    : > "$CONTAINERS_DIR/swctl-tunnel-auth-42"
+    export SWCTL_STATE_DIR="$SW_TMP/state"
+    mkdir -p "$SWCTL_STATE_DIR/auth-proxy/42"
+
+    run _preview_stop
+    [ "$status" -eq 0 ]
+
+    # Both containers gone.
+    [ ! -f "$CONTAINERS_DIR/swctl-preview-42" ]
+    [ ! -f "$CONTAINERS_DIR/swctl-tunnel-auth-42" ]
+    # Caddyfile dir cleaned up too.
+    [ ! -d "$SWCTL_STATE_DIR/auth-proxy/42" ]
 }

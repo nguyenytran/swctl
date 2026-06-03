@@ -142,7 +142,22 @@ export async function getPreviewStatus(issueId: string): Promise<PreviewStatus> 
   return res.json()
 }
 
-export async function startPreview(issueId: string): Promise<{ ok: boolean; url: string | null; output: string }> {
+/**
+ * Response of starting a tunnel — quick or named.  v0.7.3 added
+ * `username` + `password`, both present on success only.  The
+ * server generates a fresh password per Start and ships it once;
+ * we display it in the UI and never re-fetch it (Caddy holds the
+ * bcrypt hash, plaintext is gone after the response).
+ */
+export interface StartPreviewResult {
+  ok: boolean
+  url: string | null
+  username?: string | null
+  password?: string | null
+  output: string
+}
+
+export async function startPreview(issueId: string): Promise<StartPreviewResult> {
   const res = await fetch(`${BASE}/instances/${issueId}/preview`, { method: 'POST' })
   return res.json()
 }
@@ -244,7 +259,7 @@ export async function getNamedPreview(issueId: string): Promise<{ ok: boolean; r
   return res.json()
 }
 
-export async function startNamedPreview(issueId: string): Promise<{ ok: boolean; url: string | null; output: string }> {
+export async function startNamedPreview(issueId: string): Promise<StartPreviewResult> {
   const res = await fetch(`${BASE}/instances/${issueId}/named-preview`, { method: 'POST' })
   return res.json()
 }

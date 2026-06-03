@@ -514,6 +514,14 @@ cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}' 
             <span :class="t.status === 'running' ? 'text-green-400' : 'text-gray-500'">{{ t.status }}</span>
           </td>
           <td class="py-2 pr-3 max-w-[280px] truncate">
+            <!-- v0.7.3 — every tunnel is behind basic auth.  Lock icon
+                 is unconditional reassurance; if the user sees one
+                 without the lock, something's broken (no opt-out exists). -->
+            <span
+              v-if="t.status === 'running'"
+              class="inline-block mr-1 align-middle text-amber-400"
+              title="Protected by HTTP Basic Auth (Caddy sidecar)"
+            >🔒</span>
             <a v-if="t.url" :href="t.url" target="_blank" class="text-blue-400 hover:underline">{{ t.url }}</a>
             <span v-else class="text-gray-600">{{ t.type === 'named' ? '(named — see ~/.cloudflared)' : '—' }}</span>
           </td>

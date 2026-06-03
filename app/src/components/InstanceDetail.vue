@@ -313,12 +313,19 @@ const previewLoading = ref(false)
 const previewRunning = ref(false)
 const previewUrl = ref<string | null>(null)
 const previewMessage = ref('')
+// v0.7.3 — basic-auth credentials returned by start-preview.  Held in
+// memory only; the server doesn't persist plaintext and we never
+// re-fetch this on remount.  Once the user navigates away or the
+// drawer reopens, the credentials are gone — they must Stop + Start
+// to rotate and get a fresh pair.
+const previewCreds = ref<{ username: string; password: string } | null>(null)
 
 // Named preview — stable sw-<issue>.<domain> tunnel (shared per project).
 const namedLoading = ref(false)
 const namedRunning = ref(false)
 const namedUrl = ref<string | null>(null)
 const namedMessage = ref('')
+const namedCreds = ref<{ username: string; password: string } | null>(null)
 
 const snapshots = ref<Snapshot[]>([])
 const snapshotsLoading = ref(false)
@@ -350,11 +357,15 @@ async function toggleNamedPreview() {
       namedMessage.value = r.ok ? 'Named tunnel stopped.' : `Stop failed: ${r.output}`
       namedRunning.value = false
       namedUrl.value = null
+      namedCreds.value = null   // credentials are tied to the started instance — discard on stop
     } else {
       const r = await startNamedPreview(props.instance.issueId)
       if (r.ok && r.url) {
         namedRunning.value = true
         namedUrl.value = r.url
+        namedCreds.value = r.username && r.password
+          ? { username: r.username, password: r.password }
+          : null
         namedMessage.value = 'Named tunnel live.'
       } else {
         namedMessage.value = `Start failed: ${r.output}`
@@ -409,11 +420,15 @@ async function togglePreview() {
       previewMessage.value = r.ok ? 'Tunnel stopped.' : `Stop failed: ${r.output}`
       previewRunning.value = false
       previewUrl.value = null
+      previewCreds.value = null
     } else {
       const r = await startPreview(props.instance.issueId)
       if (r.ok && r.url) {
         previewRunning.value = true
         previewUrl.value = r.url
+        previewCreds.value = r.username && r.password
+          ? { username: r.username, password: r.password }
+          : null
         previewMessage.value = 'Tunnel live.'
       } else {
         previewMessage.value = `Tunnel start failed: ${r.output}`
@@ -1182,7 +1197,9 @@ function formatDate(iso: string) {
           <p class="text-xs text-gray-400 mb-3">
             Expose this instance via Cloudflare Tunnel (quick-tunnel, no account needed).
             URL is ephemeral &mdash; expect it to change on every restart.
-            Anyone with the link can access the instance, so don't share for sensitive data.
+            🔒 <strong>Protected by HTTP Basic Auth</strong> — visitors must enter the
+            auto-generated password (shown below once after Start, then gone — Stop +
+            Start to rotate).
           </p>
 
           <div v-if="previewUrl" class="flex items-center gap-2 mb-3">
@@ -1196,6 +1213,33 @@ function formatDate(iso: string) {
               class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
               @click="copyPreviewUrl"
             >Copy</button>
+          </div>
+
+          <!-- v0.7.3 — credentials card.  Only rendered when the most-recent
+               Start of THIS session returned a password (i.e. previewCreds is set).
+               On drawer reopen / page refresh the credentials are gone; the user
+               must Stop + Start to get a new password. -->
+          <div
+            v-if="previewCreds"
+            class="mb-3 rounded border border-amber-500/40 bg-amber-500/10 p-3 space-y-2"
+          >
+            <div class="flex items-center gap-2 text-xs font-semibold text-amber-200">
+              🔒 Credentials — won't be shown again
+            </div>
+            <div class="grid grid-cols-[80px_1fr_auto] gap-x-2 gap-y-1 text-xs items-center">
+              <span class="text-gray-400">Username</span>
+              <code class="font-mono text-gray-100">{{ previewCreds.username }}</code>
+              <button
+                class="px-2 py-0.5 text-[11px] rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+                @click="copyToClipboard(previewCreds.username)"
+              >Copy</button>
+              <span class="text-gray-400">Password</span>
+              <code class="font-mono text-gray-100">{{ previewCreds.password }}</code>
+              <button
+                class="px-2 py-0.5 text-[11px] rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+                @click="copyToClipboard(previewCreds.password)"
+              >Copy</button>
+            </div>
           </div>
 
           <div class="flex items-center gap-3">
@@ -1245,6 +1289,29 @@ function formatDate(iso: string) {
               class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
               @click="copyNamedUrl"
             >Copy</button>
+          </div>
+
+          <div
+            v-if="namedCreds"
+            class="mb-3 rounded border border-amber-500/40 bg-amber-500/10 p-3 space-y-2"
+          >
+            <div class="flex items-center gap-2 text-xs font-semibold text-amber-200">
+              🔒 Credentials — won't be shown again
+            </div>
+            <div class="grid grid-cols-[80px_1fr_auto] gap-x-2 gap-y-1 text-xs items-center">
+              <span class="text-gray-400">Username</span>
+              <code class="font-mono text-gray-100">{{ namedCreds.username }}</code>
+              <button
+                class="px-2 py-0.5 text-[11px] rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+                @click="copyToClipboard(namedCreds.username)"
+              >Copy</button>
+              <span class="text-gray-400">Password</span>
+              <code class="font-mono text-gray-100">{{ namedCreds.password }}</code>
+              <button
+                class="px-2 py-0.5 text-[11px] rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+                @click="copyToClipboard(namedCreds.password)"
+              >Copy</button>
+            </div>
           </div>
 
           <div class="flex items-center gap-3">

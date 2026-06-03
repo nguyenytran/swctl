@@ -5,6 +5,7 @@ import { compress } from 'hono/compress'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { streamSSE } from 'hono/streaming'
 import { execSync } from 'child_process'
+import { randomBytes } from 'node:crypto'
 import os from 'os'
 import fs from 'fs'
 import path from 'path'
@@ -1353,11 +1354,20 @@ app.get('/api/instances/:issueId/preview', async (c) => {
 
 app.post('/api/instances/:issueId/preview', async (c) => {
   const issueId = c.req.param('issueId')
-  const result = await spawnSwctl(['preview', issueId])
+  // v0.7.3 — auto-generate a 12-char URL-safe password.  9 random
+  // bytes → 12 base64url chars → ~72 bits of entropy.  The plaintext
+  // lives in the env we pass to swctl and in the JSON response;
+  // we never persist it on disk.  Each Start = fresh password.
+  const password = randomBytes(9).toString('base64url')
+  const result = await spawnSwctl(['preview', issueId], {
+    SWCTL_PREVIEW_PASSWORD: password,
+  })
   const match = result.output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/)
   return c.json({
     ok: result.ok,
     url: match ? match[0] : null,
+    username: result.ok ? 'preview' : null,
+    password: result.ok ? password : null,
     output: result.output,
   })
 })
@@ -1637,9 +1647,22 @@ app.get('/api/instances/:issueId/named-preview', async (c) => {
 
 app.post('/api/instances/:issueId/named-preview', async (c) => {
   const issueId = c.req.param('issueId')
-  const result = await spawnSwctl(['preview', issueId, '--named'])
+  // v0.7.3 — same password generation as the quick-tunnel path.
+  // The shared cloudflared container routes named hostnames through
+  // the per-instance auth-proxy sidecar via the ingress YAML the
+  // bash side rewrites.
+  const password = randomBytes(9).toString('base64url')
+  const result = await spawnSwctl(['preview', issueId, '--named'], {
+    SWCTL_PREVIEW_PASSWORD: password,
+  })
   const match = result.output.match(/https:\/\/[^\s]+/)
-  return c.json({ ok: result.ok, url: match ? match[0] : null, output: result.output })
+  return c.json({
+    ok: result.ok,
+    url: match ? match[0] : null,
+    username: result.ok ? 'preview' : null,
+    password: result.ok ? password : null,
+    output: result.output,
+  })
 })
 
 app.delete('/api/instances/:issueId/named-preview', async (c) => {

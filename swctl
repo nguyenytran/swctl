@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.7.2"
+SWCTL_VERSION="0.7.3"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -6512,31 +6512,146 @@ _preview_container_name() {
     printf 'swctl-preview-%s' "$(sanitize_slug "$ISSUE_ID")"
 }
 
+# === Per-tunnel HTTP Basic Auth sidecar (v0.7.3) ============================
+#
+# Every started tunnel sits behind an auth proxy so the public URL prompts
+# for credentials before any request reaches the app container.  Rationale:
+# the dev Shopware shop ships with admin/shopware baked in — leaving the
+# tunnel world-readable means anyone who guesses the URL can ransack the
+# admin panel.  We don't trust trycloudflare.com URLs to stay secret long
+# (Cloudflare's URL space is enumerable in practice).
+#
+# Architecture: caddy:2-alpine sidecar on the app's compose network.
+# cloudflared (or the shared named-tunnel container) points at the proxy
+# instead of the app — visitor → cloudflared → caddy(basic_auth) → app.
+#
+# Why a sidecar (vs editing the Shopware container's Caddyfile):
+#  - The dev image's Caddyfile is baked in and shared across instances.
+#  - A sidecar is per-instance, lives on the same network, cleans up
+#    independently when the tunnel stops.
+#  - caddy:2-alpine is ~50 MB and starts in ~200 ms.
+#
+# Password lifecycle: the caller (UI server or interactive CLI user)
+# passes SWCTL_PREVIEW_PASSWORD in env.  We hash it with bcrypt via a
+# throwaway `caddy hash-password` container, write a per-instance
+# Caddyfile, and start the sidecar.  Plaintext lives only in the env
+# var + the Caddyfile (chmod 600) — we never write it to instance
+# metadata so an `swctl status` dump or a teammate looking over your
+# shoulder can't reveal it.
+
+_auth_proxy_container_name() {
+    printf 'swctl-tunnel-auth-%s' "$(sanitize_slug "$ISSUE_ID")"
+}
+
+# Host-side dir holding the per-instance Caddyfile.  Lives under
+# ~/.local/state/swctl/auth-proxy/<issue>/ rather than /tmp so it
+# survives a tmp-cleanup reboot mid-tunnel.  Caller is responsible
+# for `_stop_auth_proxy` to clean it up.
+_auth_proxy_cfg_dir() {
+    printf '%s/auth-proxy/%s' \
+        "${SWCTL_STATE_DIR:-$HOME/.local/state/swctl}" \
+        "$(sanitize_slug "$ISSUE_ID")"
+}
+
+# Start the Caddy basic-auth sidecar.  Returns (via stdout) the proxy's
+# in-network target URL — caller substitutes it into cloudflared's
+# --url / ingress YAML.
+#
+# $1 plaintext password
+# $2 upstream target (e.g. http://trunk-12345-web-1:8000)
+# $3 docker network the app + proxy share
+#
+# Dies on: empty password, hash failure, docker run failure.  These
+# fail closed — we MUST NOT start an unprotected tunnel just because
+# the proxy didn't come up.
+_start_auth_proxy() {
+    local password="$1" target="$2" network="$3"
+    [ -n "$password" ] || die "_start_auth_proxy: empty password (refusing to start unprotected proxy)."
+    [ -n "$target"   ] || die "_start_auth_proxy: empty target URL."
+    [ -n "$network"  ] || die "_start_auth_proxy: empty docker network."
+    require_cmd docker
+
+    local name; name="$(_auth_proxy_container_name)"
+
+    # v0.6.22 pattern: idempotent pre-kill so an orphan (e.g. swctl
+    # was SIGKILL'd between proxy-start and cloudflared-start last
+    # run) doesn't block the new --name.
+    docker rm -f "$name" >/dev/null 2>&1 || true
+
+    # Hash password inside the same image we're about to run.  Avoids
+    # needing a host-side bcrypt utility AND ensures the hash format
+    # is the exact one Caddy expects (it changes its preferred hash
+    # parameters across versions).
+    local hash
+    hash="$(docker run --rm -i caddy:2-alpine \
+        caddy hash-password --algorithm bcrypt --plaintext "$password" 2>/dev/null)" \
+        || die "Failed to hash auth password via caddy:2-alpine.  Image pull blocked?  Try 'docker pull caddy:2-alpine'."
+    [ -n "$hash" ] || die "caddy hash-password returned empty hash."
+
+    local cfg_dir; cfg_dir="$(_auth_proxy_cfg_dir)"
+    mkdir -p "$cfg_dir"
+    # Caddyfile syntax: basic_auth's value is `<user> <bcrypt-hash>` per line.
+    # `auto_https off` + the `:8080` site key keep Caddy on plain HTTP — TLS
+    # is terminated by Cloudflare upstream; the in-network hop is always HTTP.
+    cat > "$cfg_dir/Caddyfile" <<EOF
+{
+    auto_https off
+    admin off
+}
+:8080 {
+    basic_auth {
+        preview ${hash}
+    }
+    reverse_proxy ${target} {
+        header_up Host {upstream_hostport}
+        header_up X-Forwarded-Proto https
+    }
+}
+EOF
+    chmod 600 "$cfg_dir/Caddyfile"
+
+    if ! docker run -d --rm \
+            --name "$name" \
+            --network "$network" \
+            --label "swctl-tunnel-auth=${ISSUE_ID}" \
+            --label "swctl-tunnel-auth-project=${SW_PROJECT_SLUG}" \
+            -v "$cfg_dir:/etc/caddy:ro" \
+            caddy:2-alpine \
+            caddy run --config /etc/caddy/Caddyfile --adapter caddyfile \
+            >/dev/null 2>&1; then
+        rm -rf "$cfg_dir"
+        die "Failed to start auth proxy container '${name}'."
+    fi
+
+    printf 'http://%s:8080' "$name"
+}
+
+_stop_auth_proxy() {
+    local name; name="$(_auth_proxy_container_name)"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    rm -rf "$(_auth_proxy_cfg_dir)"
+}
+
 _preview_start() {
     [ -n "${COMPOSE_PROJECT:-}" ] || die "Instance has no COMPOSE_PROJECT in metadata."
+    [ -n "${SWCTL_PREVIEW_PASSWORD:-}" ] \
+        || die "SWCTL_PREVIEW_PASSWORD env not set.  The UI server sets this on POST /api/instances/<id>/preview; for an interactive CLI invocation set it yourself before running:  SWCTL_PREVIEW_PASSWORD=\$(openssl rand -base64 12) swctl preview <id>"
     require_cmd docker
 
     local container_name
     container_name="$(_preview_container_name)"
 
-    # Already-running fast path.  Refresh the stored URL from the
-    # container's logs so a previous swctl run that died mid-write can
-    # still recover the URL (idempotent).
+    # v0.7.3: no "already-running fast path" anymore.  A previous run's
+    # password is unrecoverable (bcrypt hash in Caddyfile only), and
+    # re-using the old URL with a new password would be a security
+    # surprise.  Always tear down + restart cleanly when the user kicks
+    # `swctl preview <id>` a second time — they get a fresh password
+    # and a fresh URL.
     if container_running "$container_name"; then
-        local current_url
-        current_url="$(docker logs "$container_name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1 || true)"
-        if [ -n "$current_url" ]; then
-            PREVIEW_URL="$current_url"
-            PREVIEW_CONTAINER="$container_name"
-            write_metadata "$SWCTL_ACTIVE_META_FILE"
-            ok "Preview already running: ${PREVIEW_URL}"
-            return 0
-        fi
-        # Container is up but the URL line never appeared — kill it and
-        # try again cleanly.
-        warn "Existing tunnel container has no URL — restarting."
+        info "Existing tunnel for '${ISSUE_ID}' detected — restarting with a fresh password."
         docker rm -f "$container_name" >/dev/null 2>&1 || true
     fi
+    _stop_auth_proxy   # idempotent, removes any stale auth sidecar
 
     # Orphan cleanup (e.g. cloudflared exited but Docker hasn't removed
     # the container yet because we passed --rm AND it never started).
@@ -6570,7 +6685,16 @@ _preview_start() {
     # SW_INTERNAL_PORT lets the user override for non-standard compose
     # templates (e.g. nginx on :80 inside a different runtime image).
     local target_port="${SW_INTERNAL_PORT:-8000}"
-    local target="http://${app_hostname}:${target_port}"
+    local app_target="http://${app_hostname}:${target_port}"
+
+    # v0.7.3: insert the basic-auth sidecar between cloudflared and the
+    # app.  cloudflared now points at the sidecar (not the app
+    # directly).  If proxy start fails, _start_auth_proxy dies — we
+    # never reach the cloudflared run, so a failed proxy can't leave
+    # the tunnel publicly exposed.
+    info "Starting auth proxy for '${ISSUE_ID}' (basic_auth)…"
+    local target
+    target="$(_start_auth_proxy "$SWCTL_PREVIEW_PASSWORD" "$app_target" "$network")"
 
     info "Starting Cloudflare quick-tunnel → ${target} (network '${network}')"
 
@@ -6583,6 +6707,7 @@ _preview_start() {
             cloudflare/cloudflared:latest \
             tunnel --no-autoupdate --url "$target" \
             >/dev/null 2>&1; then
+        _stop_auth_proxy   # tear down the sidecar — never leave an orphan
         die "Failed to start cloudflared container.  Image pull blocked?  Try 'docker pull cloudflare/cloudflared:latest'."
     fi
 
@@ -6600,6 +6725,7 @@ _preview_start() {
             warn "cloudflared container exited before publishing a URL.  Logs:"
             docker logs "$container_name" 2>&1 | sed 's/^/  /' >&2
             docker rm -f "$container_name" >/dev/null 2>&1 || true
+            _stop_auth_proxy   # tunnel never came up — clean up the sidecar
             die "Tunnel startup failed."
         fi
     done
@@ -6615,8 +6741,10 @@ _preview_start() {
     write_metadata "$SWCTL_ACTIVE_META_FILE"
 
     ok "Preview tunnel live: ${PREVIEW_URL}"
-    info "  Internal target: ${target}"
-    info "  Stop with: swctl preview ${ISSUE_ID} --stop"
+    info "  Internal target: ${app_target} (via auth proxy ${target})"
+    info "  Username:        preview"
+    info "  Password:        ${SWCTL_PREVIEW_PASSWORD}   (won't be shown again — save it now)"
+    info "  Stop with:       swctl preview ${ISSUE_ID} --stop"
 }
 
 _preview_stop() {
@@ -6630,6 +6758,10 @@ _preview_stop() {
     else
         info "No running preview tunnel for issue '${ISSUE_ID}'."
     fi
+
+    # v0.7.3: also tear down the auth proxy sidecar.  Idempotent —
+    # silent when there's nothing to clean up.
+    _stop_auth_proxy
 
     PREVIEW_URL=""
     PREVIEW_CONTAINER=""
@@ -6861,19 +6993,38 @@ PHPEOF
 
 _named_start() {  # expects ISSUE_ID, COMPOSE_PROJECT, WORKTREE_PATH loaded
     _named_require_config
+    [ -n "${SWCTL_PREVIEW_PASSWORD:-}" ] \
+        || die "SWCTL_PREVIEW_PASSWORD env not set.  UI server sets this automatically; for CLI use:  SWCTL_PREVIEW_PASSWORD=\$(openssl rand -base64 12) swctl preview <id> --named"
     local host app_host port file
     host="$(_named_domain_for "$ISSUE_ID")"
     app_host="$(_named_app_hostname)"
     port="${SW_INTERNAL_PORT:-8000}"
     file="$(_named_ingress_dir)/${host}.yml"
     mkdir -p "$(_named_ingress_dir)"
-    printf '  - hostname: %s\n    service: http://%s:%s\n' "$host" "$app_host" "$port" > "$file"
-    info "Routing ${host} → ${app_host}:${port}"
-    _named_assemble_and_reload
+
+    # v0.7.3: route the named hostname through the auth proxy sidecar
+    # instead of the app container directly.  Shared cloudflared sees
+    # `http://swctl-tunnel-auth-<issue>:8080` as the ingress target;
+    # the sidecar enforces basic_auth and forwards to the app.
+    #
+    # Restart the proxy on every named start so the password rotates
+    # — same security stance as the quick-tunnel path.
+    _stop_auth_proxy
+    local proxy_target
+    proxy_target="$(_start_auth_proxy "$SWCTL_PREVIEW_PASSWORD" "http://${app_host}:${port}" "${SW_PROJECT_NETWORK:-trunk_default}")"
+    # proxy_target is `http://swctl-tunnel-auth-<issue>:8080`.
+    printf '  - hostname: %s\n    service: %s\n' "$host" "$proxy_target" > "$file"
+    info "Routing ${host} → ${proxy_target} → ${app_host}:${port}"
+    if ! _named_assemble_and_reload; then
+        _stop_auth_proxy   # don't leave the sidecar running with no tunnel
+        die "Failed to reload shared tunnel — aborted."
+    fi
     _named_ensure_trusted_proxies
     _named_domain_db add "https://${host}"
     run_app_command "$COMPOSE_PROJECT" "bin/console cache:pool:clear --all" >/dev/null 2>&1 || true
     ok "Named preview live: https://${host}"
+    info "  Username:  preview"
+    info "  Password:  ${SWCTL_PREVIEW_PASSWORD}   (won't be shown again — save it now)"
     info "  Stop with: swctl preview ${ISSUE_ID} --named --stop"
 }
 
@@ -6884,6 +7035,12 @@ _named_stop() {
     file="$(_named_ingress_dir)/${host}.yml"
     rm -f "$file"
     _named_assemble_and_reload
+    # v0.7.3: tear down the per-instance auth proxy after the shared
+    # tunnel's ingress no longer references it.  Order matters — if
+    # we removed the proxy first, a brief window would have cloudflared
+    # trying to route to a dead container, surfacing 502s in any
+    # in-flight request.
+    _stop_auth_proxy
     _named_domain_db remove "https://${host}"
     run_app_command "$COMPOSE_PROJECT" "bin/console cache:pool:clear --all" >/dev/null 2>&1 || true
     ok "Named preview stopped for ${ISSUE_ID} (${host})."
