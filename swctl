@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.7.3"
+SWCTL_VERSION="0.7.4"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -755,6 +755,13 @@ write_metadata() {
         # means no tunnel was ever started, OR the user ran --stop.
         printf 'PREVIEW_URL=%q\n' "${PREVIEW_URL:-}"
         printf 'PREVIEW_CONTAINER=%q\n' "${PREVIEW_CONTAINER:-}"
+        # v0.7.4 — random per-Start hostname for named tunnels.  The
+        # server picks a fresh `<random>.<SW_PREVIEW_DOMAIN>` on every
+        # named-preview Start (so URLs aren't predictable from the
+        # issue id, like trycloudflare's anonymous URLs).  Persisted
+        # here so Stop knows which DNS record + ingress yaml to remove.
+        # Empty means no named preview is currently running.
+        printf 'PREVIEW_NAMED_HOSTNAME=%q\n' "${PREVIEW_NAMED_HOSTNAME:-}"
     } >"$meta_file"
 }
 
@@ -6996,7 +7003,20 @@ _named_start() {  # expects ISSUE_ID, COMPOSE_PROJECT, WORKTREE_PATH loaded
     [ -n "${SWCTL_PREVIEW_PASSWORD:-}" ] \
         || die "SWCTL_PREVIEW_PASSWORD env not set.  UI server sets this automatically; for CLI use:  SWCTL_PREVIEW_PASSWORD=\$(openssl rand -base64 12) swctl preview <id> --named"
     local host app_host port file
-    host="$(_named_domain_for "$ISSUE_ID")"
+    # v0.7.4 — accept a server-supplied random hostname.  Previously
+    # the hostname was always `sw-<issue>.<domain>` (predictable, leaks
+    # the issue id).  Now the UI server generates `<random>.<domain>`
+    # per Start so the URL is unguessable and rotates on every restart
+    # — matches the trycloudflare.com privacy model.  Bash falls back
+    # to the legacy `sw-<id>` shape only when called WITHOUT the env
+    # var (CLI users who haven't been migrated yet); the UI server
+    # always sets it.
+    if [ -n "${SWCTL_NAMED_HOSTNAME:-}" ]; then
+        host="${SWCTL_NAMED_HOSTNAME}"
+    else
+        host="$(_named_domain_for "$ISSUE_ID")"
+    fi
+    PREVIEW_NAMED_HOSTNAME="$host"
     app_host="$(_named_app_hostname)"
     port="${SW_INTERNAL_PORT:-8000}"
     file="$(_named_ingress_dir)/${host}.yml"
@@ -7022,6 +7042,8 @@ _named_start() {  # expects ISSUE_ID, COMPOSE_PROJECT, WORKTREE_PATH loaded
     _named_ensure_trusted_proxies
     _named_domain_db add "https://${host}"
     run_app_command "$COMPOSE_PROJECT" "bin/console cache:pool:clear --all" >/dev/null 2>&1 || true
+    # v0.7.4: persist the random hostname so Stop can recover it.
+    [ -n "${SWCTL_ACTIVE_META_FILE:-}" ] && write_metadata "$SWCTL_ACTIVE_META_FILE"
     ok "Named preview live: https://${host}"
     info "  Username:  preview"
     info "  Password:  ${SWCTL_PREVIEW_PASSWORD}   (won't be shown again — save it now)"
@@ -7031,7 +7053,15 @@ _named_start() {  # expects ISSUE_ID, COMPOSE_PROJECT, WORKTREE_PATH loaded
 _named_stop() {
     _named_require_config
     local host file
-    host="$(_named_domain_for "$ISSUE_ID")"
+    # v0.7.4: read the persisted random hostname.  Fall back to the
+    # legacy sw-<id>.<domain> shape if metadata predates v0.7.4 (e.g.
+    # the instance was started under the wildcard model with no
+    # per-instance DNS).
+    if [ -n "${PREVIEW_NAMED_HOSTNAME:-}" ]; then
+        host="$PREVIEW_NAMED_HOSTNAME"
+    else
+        host="$(_named_domain_for "$ISSUE_ID")"
+    fi
     file="$(_named_ingress_dir)/${host}.yml"
     rm -f "$file"
     _named_assemble_and_reload
@@ -7043,6 +7073,11 @@ _named_stop() {
     _stop_auth_proxy
     _named_domain_db remove "https://${host}"
     run_app_command "$COMPOSE_PROJECT" "bin/console cache:pool:clear --all" >/dev/null 2>&1 || true
+    # v0.7.4: clear the persisted hostname so the next Start uses a
+    # fresh random one (and so a stale value doesn't trick Stop into
+    # cleaning up a record that's already been removed).
+    PREVIEW_NAMED_HOSTNAME=""
+    [ -n "${SWCTL_ACTIVE_META_FILE:-}" ] && write_metadata "$SWCTL_ACTIVE_META_FILE"
     ok "Named preview stopped for ${ISSUE_ID} (${host})."
 }
 

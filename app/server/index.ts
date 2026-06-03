@@ -15,6 +15,7 @@ import { getContainerStatuses } from './lib/docker.js'
 import { readProjects, readProjectConfig, setProjectConfigKeys, addProjectEntry, removeProjectEntry } from './lib/projects.js'
 import { listWorkflows } from './lib/workflows.js'
 import { streamSwctl, spawnSwctl, isStreamActive, cancelStream, streamCommand, listActiveOperations } from './lib/stream.js'
+import { ensureCname, deleteCname } from './lib/cloudflare-dns.js'
 import { subscribe } from './lib/events.js'
 import { cacheGet, installCacheInvalidators } from './lib/cache.js'
 import { listBranches, listGitWorktrees, discoverToolWorktrees, discoverPluginWorktrees } from './lib/git.js'
@@ -1645,20 +1646,93 @@ app.get('/api/instances/:issueId/named-preview', async (c) => {
   return c.json({ ok: result.ok, running: /running/i.test(result.output), url: match ? match[0] : null, output: result.output })
 })
 
+// v0.7.4 — read the active named-preview hostname an instance is
+// using (from the persisted PREVIEW_NAMED_HOSTNAME metadata field).
+// Returns '' if not set.  Used by the Stop handler so we delete the
+// EXACT DNS record this instance's last Start created — rotating
+// random hostnames means we can't just compute it from the issue id.
+function readInstanceNamedHostname(issueId: string): string {
+  const stateDir = process.env.SWCTL_STATE_DIR || path.join(process.env.HOME || '/root', '.local/state/swctl')
+  // Walk the registry — instance env files live under
+  // <state>/instances/<project>/<issueId>.env.  We don't know the
+  // project name here, so glob across projects.
+  const root = path.join(stateDir, 'instances')
+  let projects: string[] = []
+  try { projects = fs.readdirSync(root) } catch { return '' }
+  for (const proj of projects) {
+    const envFile = path.join(root, proj, `${issueId}.env`)
+    if (!fs.existsSync(envFile)) continue
+    try {
+      const raw = fs.readFileSync(envFile, 'utf-8')
+      const m = raw.match(/^PREVIEW_NAMED_HOSTNAME=(.+)$/m)
+      if (!m) return ''
+      // Bash %q-quoted output: strip surrounding single quotes if present.
+      return m[1].trim().replace(/^'(.*)'$/s, '$1')
+    } catch { return '' }
+  }
+  return ''
+}
+
 app.post('/api/instances/:issueId/named-preview', async (c) => {
   const issueId = c.req.param('issueId')
-  // v0.7.3 — same password generation as the quick-tunnel path.
-  // The shared cloudflared container routes named hostnames through
-  // the per-instance auth-proxy sidecar via the ingress YAML the
-  // bash side rewrites.
+
+  // v0.7.4 — create a SPECIFIC CNAME for this instance BEFORE the
+  // tunnel starts.  Pre-0.7.4, swctl relied on a wildcard
+  // `*.<SW_PREVIEW_DOMAIN>` CNAME pointing at the cloudflared tunnel,
+  // which conflicted with Pages/Workers on the same root domain.  Now
+  // each named-preview Start picks a FRESH RANDOM hostname
+  // (`<random>.<domain>`) so:
+  //  - URLs are unguessable (~48 bits of entropy in 12 hex chars)
+  //  - Each Stop+Start rotates the URL (matches trycloudflare.com UX)
+  //  - The issue id isn't leaked in the public hostname
+  //
+  // The chosen hostname is persisted server-side via swctl's instance
+  // metadata (PREVIEW_NAMED_HOSTNAME), so the Stop handler can look
+  // it up and delete the right DNS record.  Fail-closed: if DNS
+  // create fails we don't spawn swctl — otherwise the user would see
+  // a "live" tunnel that doesn't resolve.
+  const cfg = readProjectConfig()
+  const domain = (cfg['SW_PREVIEW_DOMAIN'] || '').trim()
+  const tunnelId = (cfg['SW_PREVIEW_TUNNEL_ID'] || '').trim()
+  if (!domain || !tunnelId) {
+    return c.json({
+      ok: false, url: null, username: null, password: null,
+      output: '[error] SW_PREVIEW_DOMAIN or SW_PREVIEW_TUNNEL_ID not set in .swctl.conf. Configure them on /#/tunnels first.',
+    })
+  }
+  // 12 hex chars = 48 bits — collision-resistant for any realistic
+  // fleet size.  Hex (not base64url) so the label only uses
+  // [a-z0-9], safest possible DNS label.
+  const randomLabel = randomBytes(6).toString('hex')
+  const hostname = `${randomLabel}.${domain}`
+  const dnsTarget = `${tunnelId}.cfargotunnel.com`
+  const dns = await ensureCname(hostname, dnsTarget)
+  if (!dns.ok) {
+    return c.json({
+      ok: false, url: null, username: null, password: null,
+      output: `[error] DNS create for ${hostname} failed: ${dns.error}\nTunnel was NOT started.`,
+    })
+  }
+
+  // v0.7.3 — auto-generate a 12-char URL-safe password for the
+  // auth-proxy sidecar.  Plaintext lives in this env var + the JSON
+  // response only; never persisted on disk.
   const password = randomBytes(9).toString('base64url')
   const result = await spawnSwctl(['preview', issueId, '--named'], {
     SWCTL_PREVIEW_PASSWORD: password,
+    SWCTL_NAMED_HOSTNAME: hostname,
   })
-  const match = result.output.match(/https:\/\/[^\s]+/)
+
+  // If swctl failed AFTER we created the DNS record, roll back the
+  // DNS so we don't leak it.  Stop path also deletes it idempotently —
+  // this is belt-and-suspenders.
+  if (!result.ok) {
+    await deleteCname(hostname).catch(() => undefined)
+  }
+
   return c.json({
     ok: result.ok,
-    url: match ? match[0] : null,
+    url: result.ok ? `https://${hostname}` : null,
     username: result.ok ? 'preview' : null,
     password: result.ok ? password : null,
     output: result.output,
@@ -1667,8 +1741,32 @@ app.post('/api/instances/:issueId/named-preview', async (c) => {
 
 app.delete('/api/instances/:issueId/named-preview', async (c) => {
   const issueId = c.req.param('issueId')
+
+  // v0.7.4: look up the hostname BEFORE stopping the tunnel — swctl
+  // clears PREVIEW_NAMED_HOSTNAME from metadata as part of the stop
+  // flow, so we'd lose the reference if we read after.
+  const hostnameBeforeStop = readInstanceNamedHostname(issueId)
+
+  // Stop the tunnel first — that yanks the ingress YAML and the
+  // auth-proxy sidecar.  Then delete the DNS record.  Order matters:
+  // if DNS were removed first, the tunnel would still appear "live"
+  // to its connector but visitors hit NXDOMAIN — a confusing
+  // intermediate state.  Letting the tunnel go dark first means
+  // any in-flight request fails fast with a clear cloudflared
+  // error instead.
   const result = await spawnSwctl(['preview', issueId, '--named', '--stop'])
-  return c.json({ ok: result.ok, output: result.output })
+
+  // v0.7.4 — delete the per-instance CNAME.  Idempotent: if the
+  // record doesn't exist (e.g. user manually deleted it or never
+  // existed because this is a pre-0.7.4 instance), we get
+  // ok=true/deleted=false and move on.
+  let dnsNote = ''
+  if (hostnameBeforeStop) {
+    const dns = await deleteCname(hostnameBeforeStop)
+    if (!dns.ok) dnsNote = `\n[warn] DNS delete failed for ${hostnameBeforeStop}: ${dns.error} (record may need manual cleanup)`
+    else if (dns.deleted) dnsNote = `\n[ok] DNS record ${hostnameBeforeStop} deleted.`
+  }
+  return c.json({ ok: result.ok, output: result.output + dnsNote })
 })
 
 // ---------------------------------------------------------------------------
