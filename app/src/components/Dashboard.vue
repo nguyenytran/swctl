@@ -15,6 +15,7 @@ import InstanceDetail from './InstanceDetail.vue'
 import PluginSlot from './PluginSlot.vue'
 import { usePlugins } from '@/composables/usePlugins'
 import { useFeatures } from '@/composables/useFeatures'
+import { useActiveOperations } from '@/composables/useActiveOperations'
 import { buildStreamUrl, buildCreateUrl, stopInstance, startInstance, setupInstance, linkExternalWorktree, buildRefreshExternalUrl, addProject, getTunnels, getInstanceObservability, getInstancePrs, type InstanceObservability, type PrInfo } from '@/api'
 import type { Instance, ExternalWorktree } from '@/types'
 
@@ -251,8 +252,18 @@ watch(lastEvent, (event) => {
 // latest instances without a manual page reload.
 // Per-instance preview URLs (feature-gated). Shown as a 🌐 badge on each row.
 const { features } = useFeatures()
+const { operations } = useActiveOperations()
+// v0.7.7 — gate background pollers on "no swctl streams are active
+// right now".  Spawning `swctl preview list --json` (the
+// /api/tunnels backend) or `docker stats` (/api/instances/observability)
+// at 10 s while a real `swctl create/refresh/clean` stream is mid-flight
+// makes them race for the docker daemon, measurably slowing the
+// create.  Pause both pollers when ANY stream is in flight; the
+// stream's own SSE keeps the UI live.
+const anyStreamActive = computed(() => operations.value.length > 0)
 const tunnelByIssue = ref<Record<string, string>>({})
 let tunnelTimer: ReturnType<typeof setInterval> | null = null
+let obsTimer: ReturnType<typeof setInterval> | null = null
 let prTimer: ReturnType<typeof setInterval> | null = null
 
 async function loadTunnels() {
@@ -299,17 +310,42 @@ function cleanMerged() {
   }
 }
 
+// v0.7.7 — SSE-driven refresh on user actions.  Whenever ANY instance
+// state changes (server emits `instance-changed` after create/clean/
+// refresh/start/stop), pull a fresh tunnels snapshot immediately so
+// the user sees the new state without waiting 30 s for the next poll.
+// `instance-changed` is already broadcast for every mutation today,
+// so this is purely additive — no new server work.  Reuses the
+// existing `lastEvent` from useEvents() declared at the top of this
+// file (one EventSource per app).
+watch(lastEvent, (ev) => {
+  if (ev?.type === 'instance-changed') loadTunnels()
+})
+
 onMounted(async () => {
   await refresh()
   loadTunnels()
   loadObs()
   loadPrs()   // after refresh so instance issue ids are available
-  tunnelTimer = setInterval(() => { loadTunnels(); loadObs() }, 10_000)
-  prTimer = setInterval(loadPrs, 30_000)
+
+  // v0.7.7 — cadence rationalization.  Pre-0.7.7 both ran at 10 s,
+  // burning ~360 docker daemon round-trips per hour per Dashboard
+  // tab while idle.  Tunnel state rarely changes outside user
+  // actions (covered by the SSE refresh above), and observability
+  // counts (CPU/RAM/health) don't usefully change second-to-second.
+  //   - Tunnels:       10 s → 30 s
+  //   - Observability: 10 s → 60 s
+  // Both pollers SKIP their tick when any swctl stream is active
+  // (anyStreamActive computed) — the stream's own SSE keeps the UI
+  // live and the docker daemon stops contending with itself.
+  tunnelTimer = setInterval(() => { if (!anyStreamActive.value) loadTunnels() }, 30_000)
+  obsTimer    = setInterval(() => { if (!anyStreamActive.value) loadObs()     }, 60_000)
+  prTimer     = setInterval(loadPrs, 30_000)
 })
 onUnmounted(() => {
   if (tunnelTimer) clearInterval(tunnelTimer)
-  if (prTimer) clearInterval(prTimer)
+  if (obsTimer)    clearInterval(obsTimer)
+  if (prTimer)     clearInterval(prTimer)
 })
 
 // If the user lands on /dashboard/instance/<id> for an instance we haven't

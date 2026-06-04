@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import QRCode from 'qrcode'
 import { copyToClipboard } from '@/utils/clipboard'
+import { useActiveOperations } from '@/composables/useActiveOperations'
+import { useEvents } from '@/composables/useEvents'
 import {
   getTunnels, stopTunnel, stopNamedPreview, getTunnelConfig, saveTunnelConfig, reapTunnels,
   listCloudflaredTunnels, startCloudflaredLogin, cloudflaredLoginStatus, cancelCloudflaredLogin, getCloudflaredAccount, createCloudflaredTunnel,
@@ -268,7 +270,23 @@ async function doReap() {
   }
 }
 
-onMounted(() => { load(); loadConfig(); timer = setInterval(() => load(true), 10_000) })
+// v0.7.7 — same polling rationalization as Dashboard:
+//  - 10 s → 30 s (spawning `swctl preview list --json` every 10 s
+//    while idle was overkill — tunnel state rarely changes outside
+//    explicit Start/Stop, both of which broadcast `instance-changed`)
+//  - Skip the tick when any swctl stream is in flight (avoids racing
+//    a real create/clean for the docker daemon)
+//  - Reload immediately on `instance-changed` SSE event so the
+//    table reflects user actions without waiting 30 s
+const { operations: ops } = useActiveOperations()
+const { lastEvent } = useEvents()
+const anyStreamActive = computed(() => ops.value.length > 0)
+watch(lastEvent, (ev) => { if (ev?.type === 'instance-changed') load(true) })
+
+onMounted(() => {
+  load(); loadConfig()
+  timer = setInterval(() => { if (!anyStreamActive.value) load(true) }, 30_000)
+})
 onUnmounted(() => { if (timer) clearInterval(timer); stopLoginPoll() })
 </script>
 
