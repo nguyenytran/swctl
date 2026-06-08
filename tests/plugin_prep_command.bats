@@ -24,32 +24,67 @@ load test_helper
 
 @test "_build_plugin_prep_command: joins commands with ' && ' so one failure aborts the chain" {
     result="$(_build_plugin_prep_command "X" "")"
-    [[ "$result" == *"&& bin/console plugin:install --activate X" ]]
-    # Exactly two commands separated by one &&
+    # v0.7.8: chain now ends with the destructive migrate for the primary.
+    [[ "$result" == *"&& bin/console database:migrate-destructive X --all" ]]
+    # v0.7.8: 4 commands for a single plugin =
+    #   plugin:refresh + plugin:install --activate + database:migrate + database:migrate-destructive
     count="$(printf '%s' "$result" | awk -F' && ' '{print NF}')"
-    [ "$count" -eq 2 ]
+    [ "$count" -eq 4 ]
 }
 
-@test "_build_plugin_prep_command: no deps → 2 commands" {
+@test "_build_plugin_prep_command: no deps → 4 commands (v0.7.8: +migrate +destructive)" {
     result="$(_build_plugin_prep_command "Primary" "")"
     count="$(printf '%s' "$result" | awk -F' && ' '{print NF}')"
-    [ "$count" -eq 2 ]
+    [ "$count" -eq 4 ]
 }
 
-@test "_build_plugin_prep_command: one dep → 3 commands" {
+@test "_build_plugin_prep_command: one dep → 7 commands (v0.7.8: 1 refresh + 2 plugins × 3)" {
+    # Per plugin: plugin:install --activate + database:migrate + database:migrate-destructive
+    # = 3 commands.  Plus 1 plugin:refresh at the start.
+    # primary + 1 dep = 1 + 2*3 = 7.
     result="$(_build_plugin_prep_command "Primary" "DepA")"
     count="$(printf '%s' "$result" | awk -F' && ' '{print NF}')"
-    [ "$count" -eq 3 ]
-    [[ "$result" == *"plugin:install --activate DepA" ]]
+    [ "$count" -eq 7 ]
+    [[ "$result" == *"plugin:install --activate DepA"* ]]
+    [[ "$result" == *"database:migrate DepA --all"* ]]
+    [[ "$result" == *"database:migrate-destructive DepA --all" ]]
 }
 
-@test "_build_plugin_prep_command: multiple deps → refresh + primary + one per dep" {
+@test "_build_plugin_prep_command: multiple deps → refresh + 3-cmd block per plugin" {
     result="$(_build_plugin_prep_command "Primary" "DepA,DepB,DepC")"
     count="$(printf '%s' "$result" | awk -F' && ' '{print NF}')"
-    [ "$count" -eq 5 ]
-    [[ "$result" == *"plugin:install --activate DepA"* ]]
-    [[ "$result" == *"plugin:install --activate DepB"* ]]
-    [[ "$result" == *"plugin:install --activate DepC" ]]
+    # 1 (refresh) + 4 plugins × 3 cmds each = 13.
+    [ "$count" -eq 13 ]
+    for p in Primary DepA DepB DepC; do
+        [[ "$result" == *"plugin:install --activate $p"* ]] \
+            || { echo "missing: plugin:install --activate $p"; false; }
+        [[ "$result" == *"database:migrate $p --all"* ]] \
+            || { echo "missing: database:migrate $p --all"; false; }
+        [[ "$result" == *"database:migrate-destructive $p --all"* ]] \
+            || { echo "missing: database:migrate-destructive $p --all"; false; }
+    done
+}
+
+# v0.7.8 — explicit regression guard for per-plugin database:migrate.
+# Background: `plugin:install --activate` runs Plugin::install() which
+# runs migrations ONLY when installed_at is NULL.  Cloned DBs already
+# have installed_at set, so any plugin migrations added AFTER the
+# clone get silently skipped.  We chain database:migrate <plugin> --all
+# unconditionally to catch this.  Idempotent — already-applied rows
+# in the migration table are no-ops.
+@test "_build_plugin_prep_command: v0.7.8 — primary gets database:migrate <plugin> --all" {
+    result="$(_build_plugin_prep_command "SwagCommercial" "")"
+    [[ "$result" == *"database:migrate SwagCommercial --all"* ]]
+    [[ "$result" == *"database:migrate-destructive SwagCommercial --all"* ]]
+}
+
+@test "_build_plugin_prep_command: v0.7.8 — migrate runs AFTER activate for the same plugin" {
+    result="$(_build_plugin_prep_command "X" "")"
+    activate_pos="$(awk -v s="$result" 'BEGIN{print index(s, "plugin:install --activate X")}')"
+    migrate_pos="$(awk -v s="$result" 'BEGIN{print index(s, "database:migrate X")}')"
+    [ "$activate_pos" -gt 0 ]
+    [ "$migrate_pos" -gt 0 ]
+    [ "$activate_pos" -lt "$migrate_pos" ]
 }
 
 @test "_build_plugin_prep_command: primary comes BEFORE deps" {
@@ -78,9 +113,10 @@ load test_helper
 
 @test "_build_plugin_prep_command: handles trailing commas in dep list" {
     result="$(_build_plugin_prep_command "Primary" "DepA,,DepB,")"
-    # Should skip empty entries, giving 4 commands (refresh + primary + 2 deps)
+    # Should skip empty entries.  v0.7.8: 1 refresh + 3 plugins × 3 cmds = 10.
     count="$(printf '%s' "$result" | awk -F' && ' '{print NF}')"
-    [ "$count" -eq 4 ]
+    [ "$count" -eq 10 ]
     [[ "$result" == *"--activate DepA"* ]]
-    [[ "$result" == *"--activate DepB" ]]
+    [[ "$result" == *"--activate DepB"* ]]
+    [[ "$result" == *"database:migrate-destructive DepB --all" ]]
 }

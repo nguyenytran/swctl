@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.7.7"
+SWCTL_VERSION="0.7.8"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -3683,10 +3683,17 @@ activate_plugin() {
     fi
 
     # Fallback: inline Shopware commands (chained under one docker exec).
+    # v0.7.8: chain `database:migrate <plugin> --all` + destructive so
+    # plugin migrations added since the cloned DB was created get
+    # applied (plugin:install is a no-op on already-installed plugins
+    # — see _build_plugin_prep_command header).
     info "Activating plugin: $plugin_name"
     run_app_command "$compose_project" \
-        "$WORKFLOW_CONSOLE plugin:refresh && $WORKFLOW_CONSOLE plugin:install --activate $plugin_name" \
-        || warn "Plugin refresh/activate failed for '$plugin_name'."
+        "$WORKFLOW_CONSOLE plugin:refresh \
+         && $WORKFLOW_CONSOLE plugin:install --activate $plugin_name \
+         && $WORKFLOW_CONSOLE database:migrate $plugin_name --all \
+         && $WORKFLOW_CONSOLE database:migrate-destructive $plugin_name --all" \
+        || warn "Plugin refresh/activate/migrate failed for '$plugin_name'."
 }
 
 # Build the chained bin/console command for plugin prep on plugin-external
@@ -3709,7 +3716,22 @@ _build_plugin_prep_command() {
 
     [ -n "$primary" ] || return 1
 
+    # v0.7.8: every plugin activation also runs `database:migrate
+    # <plugin> --all` + the destructive variant.  Background:
+    # `plugin:install --activate` triggers Plugin::install() which
+    # runs migrations as part of its lifecycle — BUT only when the
+    # plugin is being installed for the first time.  On a cloned DB
+    # the plugin row already has installed_at != NULL, so install()
+    # is a no-op and any NEW migrations added to the plugin code
+    # since the clone never run.  Symptom: plugin tables are out of
+    # date, runtime errors when the plugin queries a column added
+    # in a recent migration.
+    #
+    # Running database:migrate <plugin> --all is idempotent (already-
+    # applied migrations are skipped via the migration table), so
+    # running it unconditionally is safe + cheap.
     local cmd="$bin plugin:refresh && $bin plugin:install --activate $primary"
+    cmd="$cmd && $bin database:migrate $primary --all && $bin database:migrate-destructive $primary --all"
     if [ -n "$deps" ]; then
         local _old_ifs="$IFS"
         IFS=','
@@ -3717,6 +3739,7 @@ _build_plugin_prep_command() {
         for _dep in $deps; do
             [ -n "$_dep" ] || continue
             cmd="$cmd && $bin plugin:install --activate $_dep"
+            cmd="$cmd && $bin database:migrate $_dep --all && $bin database:migrate-destructive $_dep --all"
         done
         IFS="$_old_ifs"
     fi
