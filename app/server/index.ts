@@ -1651,11 +1651,13 @@ app.get('/api/instances/:issueId/named-preview', async (c) => {
 // Returns '' if not set.  Used by the Stop handler so we delete the
 // EXACT DNS record this instance's last Start created — rotating
 // random hostnames means we can't just compute it from the issue id.
-function readInstanceNamedHostname(issueId: string): string {
+// Read a single PREVIEW_NAMED_* field from the instance's metadata
+// file.  Used to recover the hostname / password for Stop+Display
+// flows where the value isn't otherwise available from docker state.
+// Returns '' if missing OR unreadable — caller decides whether that's
+// a soft skip or an error.
+function readInstanceMetaField(issueId: string, field: string): string {
   const stateDir = process.env.SWCTL_STATE_DIR || path.join(process.env.HOME || '/root', '.local/state/swctl')
-  // Walk the registry — instance env files live under
-  // <state>/instances/<project>/<issueId>.env.  We don't know the
-  // project name here, so glob across projects.
   const root = path.join(stateDir, 'instances')
   let projects: string[] = []
   try { projects = fs.readdirSync(root) } catch { return '' }
@@ -1664,13 +1666,21 @@ function readInstanceNamedHostname(issueId: string): string {
     if (!fs.existsSync(envFile)) continue
     try {
       const raw = fs.readFileSync(envFile, 'utf-8')
-      const m = raw.match(/^PREVIEW_NAMED_HOSTNAME=(.+)$/m)
+      // Build pattern for `FIELD=value`.  Escape regex metachars in field name
+      // even though our callers only pass [A-Z_].
+      const safeField = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const re = new RegExp(`^${safeField}=(.+)$`, 'm')
+      const m = raw.match(re)
       if (!m) return ''
       // Bash %q-quoted output: strip surrounding single quotes if present.
       return m[1].trim().replace(/^'(.*)'$/s, '$1')
     } catch { return '' }
   }
   return ''
+}
+
+function readInstanceNamedHostname(issueId: string): string {
+  return readInstanceMetaField(issueId, 'PREVIEW_NAMED_HOSTNAME')
 }
 
 app.post('/api/instances/:issueId/named-preview', async (c) => {
@@ -1776,13 +1786,37 @@ app.delete('/api/instances/:issueId/named-preview', async (c) => {
 // table never drifts from the terminal.
 app.get('/api/tunnels', async (c) => {
   const result = await spawnSwctl(['preview', 'list', '--json'])
-  let tunnels: Array<{ issue: string; type: string; container: string; status: string; url: string }> = []
+  type Tunnel = {
+    issue: string
+    type: string
+    container: string
+    status: string
+    url: string
+    // v0.7.9 — recovered from per-instance metadata file so the
+    // Tunnels UI can re-display credentials after a refresh
+    // (previously shown once on Start and lost).  Always 'preview'
+    // for username (set by the auth-proxy Caddyfile); password is
+    // the plaintext written by _named_start.  Empty/missing when
+    // the tunnel has no auth proxy (e.g. legacy quick-tunnel rows
+    // from pre-0.7.3, or named tunnels started from CLI without
+    // the env var).
+    credentials?: { username: string; password: string }
+  }
+  let tunnels: Tunnel[] = []
   // Be defensive: slice out the JSON array in case any stray log line leaks in.
   const out = result.output ?? ''
   const start = out.indexOf('[')
   const end = out.lastIndexOf(']')
   if (start >= 0 && end >= start) {
     try { tunnels = JSON.parse(out.slice(start, end + 1)) } catch { tunnels = [] }
+  }
+  // Enrich each tunnel with credentials from its instance metadata file.
+  // Read is local (no network), file is chmod 600 — same trust boundary
+  // as the rest of swctl's per-instance state.
+  for (const t of tunnels) {
+    if (!t.issue) continue
+    const password = readInstanceMetaField(t.issue, 'PREVIEW_NAMED_PASSWORD')
+    if (password) t.credentials = { username: 'preview', password }
   }
   return c.json({ ok: result.ok, tunnels })
 })

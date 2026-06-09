@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.7.8"
+SWCTL_VERSION="0.7.9"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -762,6 +762,16 @@ write_metadata() {
         # here so Stop knows which DNS record + ingress yaml to remove.
         # Empty means no named preview is currently running.
         printf 'PREVIEW_NAMED_HOSTNAME=%q\n' "${PREVIEW_NAMED_HOSTNAME:-}"
+        # v0.7.9 — plaintext password for the named-tunnel's Basic Auth.
+        # Previously the password was generated, displayed once, and
+        # discarded — meaning if the user closed the drawer they could
+        # never recover it without Stop+Start (which rotates).  Now we
+        # persist it so the Tunnels listing page can re-display it.
+        # Security model: the metadata file is chmod 600 (owner-only
+        # on a single-user dev box), same as ~/.cloudflared/cert.pem.
+        # Lifecycle = Start→Stop; cleared when the tunnel stops so
+        # stale passwords don't linger.
+        printf 'PREVIEW_NAMED_PASSWORD=%q\n' "${PREVIEW_NAMED_PASSWORD:-}"
     } >"$meta_file"
 }
 
@@ -7122,6 +7132,10 @@ _named_start() {  # expects ISSUE_ID, COMPOSE_PROJECT, WORKTREE_PATH loaded
         host="$(_named_domain_for "$ISSUE_ID")"
     fi
     PREVIEW_NAMED_HOSTNAME="$host"
+    # v0.7.9 — persist the plaintext password so the Tunnels UI can
+    # re-display it after a page refresh.  See write_metadata's
+    # PREVIEW_NAMED_PASSWORD header for the security rationale.
+    PREVIEW_NAMED_PASSWORD="$SWCTL_PREVIEW_PASSWORD"
     app_host="$(_named_app_hostname)"
     port="${SW_INTERNAL_PORT:-8000}"
     file="$(_named_ingress_dir)/${host}.yml"
@@ -7182,6 +7196,9 @@ _named_stop() {
     # fresh random one (and so a stale value doesn't trick Stop into
     # cleaning up a record that's already been removed).
     PREVIEW_NAMED_HOSTNAME=""
+    # v0.7.9: also clear the persisted password — stale credentials
+    # for a stopped tunnel are confusing AND a small leak surface.
+    PREVIEW_NAMED_PASSWORD=""
     [ -n "${SWCTL_ACTIVE_META_FILE:-}" ] && write_metadata "$SWCTL_ACTIVE_META_FILE"
     ok "Named preview stopped for ${ISSUE_ID} (${host})."
 }

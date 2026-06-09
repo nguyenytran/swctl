@@ -237,12 +237,20 @@ async function copy(url: string) {
   message.value = (await copyToClipboard(url)) ? 'URL copied.' : 'Clipboard unavailable — copy manually.'
 }
 
-// Share: QR code (great for opening a preview on a phone).
-const share = ref<{ url: string; dataUrl: string } | null>(null)
-async function openShare(url: string) {
+// Share: QR code + credentials (v0.7.9).  Pre-0.7.9 the modal only
+// showed the URL — but every tunnel since v0.7.3 is behind Basic Auth,
+// and the password was only displayed once at Start time.  Share now
+// surfaces the credentials too so anyone with the link gets the
+// matching password to actually open it.
+const share = ref<{
+  url: string
+  dataUrl: string
+  credentials?: { username: string; password: string }
+} | null>(null)
+async function openShare(t: Tunnel) {
   try {
-    const dataUrl = await QRCode.toDataURL(url, { margin: 1, width: 220 })
-    share.value = { url, dataUrl }
+    const dataUrl = await QRCode.toDataURL(t.url, { margin: 1, width: 220 })
+    share.value = { url: t.url, dataUrl, credentials: t.credentials }
   } catch { message.value = 'Could not generate QR.' }
 }
 
@@ -554,7 +562,7 @@ cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}' 
               v-if="t.url"
               class="px-2 py-0.5 text-xs rounded text-gray-400 hover:text-white disabled:opacity-50"
               :disabled="busy[t.container]"
-              @click="openShare(t.url)"
+              @click="openShare(t)"
             >Share</button>
             <button
               class="px-2 py-0.5 text-xs rounded text-red-400 hover:text-red-300 disabled:opacity-50 inline-flex items-center gap-1"
@@ -571,13 +579,42 @@ cloudflared tunnel route dns swctl-preview '*.{{ cfgDomain || 'your-domain' }}' 
 
     <ConfirmDialog v-if="confirmAction" v-bind="confirmAction" @cancel="confirmAction = null" />
 
-    <!-- Share: QR code for opening the preview on a phone -->
+    <!-- Share: QR code + credentials (v0.7.9 added the credentials block) -->
     <Teleport to="body">
       <div v-if="share" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50" @click.self="share = null">
-        <div class="bg-surface border border-border rounded-lg p-6 shadow-2xl text-center">
+        <div class="bg-surface border border-border rounded-lg p-6 shadow-2xl text-center max-w-md">
           <h3 class="text-sm font-bold text-white mb-3">Scan to open the preview</h3>
           <img :src="share.dataUrl" alt="QR code" class="mx-auto rounded bg-white p-2" width="220" height="220" />
-          <p class="mt-3 text-xs text-gray-400 font-mono break-all max-w-[240px]">{{ share.url }}</p>
+          <p class="mt-3 text-xs text-gray-400 font-mono break-all max-w-[240px] mx-auto">{{ share.url }}</p>
+
+          <!-- v0.7.9 — credentials block, present only when the tunnel
+               is auth-proxied (v0.7.3+ Caddy sidecar).  Visitors who
+               receive the URL also need this to get past the Basic Auth
+               prompt; before this change the password was lost after
+               the first Start. -->
+          <div
+            v-if="share.credentials"
+            class="mt-4 rounded border border-amber-500/40 bg-amber-500/10 p-3 text-left"
+          >
+            <div class="text-[11px] font-semibold text-amber-200 mb-2 flex items-center gap-1">
+              🔒 Basic Auth credentials
+            </div>
+            <div class="grid grid-cols-[80px_1fr_auto] gap-x-2 gap-y-1 text-xs items-center">
+              <span class="text-gray-400">Username</span>
+              <code class="font-mono text-gray-100">{{ share.credentials.username }}</code>
+              <button
+                class="px-2 py-0.5 text-[11px] rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+                @click="copy(share.credentials.username)"
+              >Copy</button>
+              <span class="text-gray-400">Password</span>
+              <code class="font-mono text-gray-100 break-all">{{ share.credentials.password }}</code>
+              <button
+                class="px-2 py-0.5 text-[11px] rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+                @click="copy(share.credentials.password)"
+              >Copy</button>
+            </div>
+          </div>
+
           <div class="mt-4 flex justify-center gap-3">
             <button class="px-3 py-1.5 text-sm rounded bg-surface-dark text-gray-300 hover:text-white border border-border" @click="copy(share.url)">Copy URL</button>
             <button class="px-3 py-1.5 text-sm rounded bg-surface-dark text-gray-300 hover:text-white border border-border" @click="share = null">Close</button>

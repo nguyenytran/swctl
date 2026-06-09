@@ -282,6 +282,16 @@ export interface Tunnel {
   container: string
   status: string
   url: string
+  /**
+   * Basic-auth credentials for this tunnel, recovered from the
+   * per-instance metadata file.  Present iff the tunnel was started
+   * via the v0.7.3+ auth-proxy flow AND its metadata file still has
+   * PREVIEW_NAMED_PASSWORD.  Absent for quick-tunnels started before
+   * v0.7.3 or named tunnels started from the CLI without the env var.
+   * Username is always 'preview' (set by the auth-proxy Caddyfile).
+   * (Added v0.7.9.)
+   */
+  credentials?: { username: string; password: string }
 }
 
 export async function getTunnels(): Promise<{ ok: boolean; tunnels: Tunnel[] }> {
