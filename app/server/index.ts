@@ -31,6 +31,7 @@ import {
 import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
 import { startResolveStream, startResolveResumeStream, listResolveRuns, listResolveCostSummary, buildBenchmarkReport, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate, fetchIssueInfo } from './lib/resolve.js'
 import { generateReproBrief, seedTagsFromLabels } from './lib/repro-brief.js'
+import { recordReproBrief, listReproBriefs, deleteReproBrief } from './lib/repro-store.js'
 import { parseTranscript, hasTranscript, getResolveBackend } from './lib/transcript.js'
 import {
   readUserConfig,
@@ -2292,12 +2293,37 @@ app.get('/api/repro/analyze/stream', (c) => {
     }
     try {
       const result = await generateReproBrief({ issue, tags, backend, emit })
-      if (result.ok) await send('brief', result)
-      else await send('error', { message: result.error || 'analysis failed', rawOutput: result.rawOutput })
+      if (result.ok && result.brief && result.issue) {
+        // Persist to the history listing so it's reviewable later.
+        await recordReproBrief({
+          issue: result.issue.number,
+          title: result.issue.title,
+          htmlUrl: result.issue.htmlUrl,
+          labels: result.issue.labels,
+          tags,
+          backend: backend || 'claude',
+          analyzedAt: new Date().toISOString(),
+          brief: result.brief,
+        }).catch(() => undefined)
+        await send('brief', result)
+      } else {
+        await send('error', { message: result.error || 'analysis failed', rawOutput: result.rawOutput })
+      }
     } catch (e: any) {
       await send('error', { message: e?.message || String(e) })
     }
   })
+})
+
+// History listing — past analyses, most-recent first.  Powers the
+// /repro sidebar so analyzed issues are reviewable without re-running.
+app.get('/api/repro/briefs', (c) => {
+  return c.json({ ok: true, briefs: listReproBriefs() })
+})
+
+app.delete('/api/repro/briefs/:issue', (c) => {
+  const issue = c.req.param('issue')
+  return c.json({ ok: deleteReproBrief(issue) })
 })
 
 // Tag suggestions for an issue — labels mapped to repro focus tags.

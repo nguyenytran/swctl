@@ -623,3 +623,30 @@ export async function reproSeedTags(
   const res = await fetch(`${BASE}/repro/seed-tags?issue=${encodeURIComponent(issue)}`)
   return res.json()
 }
+
+/** Persisted history record — mirrors server/lib/repro-store.ts. */
+export interface ReproBriefRecord {
+  issue: string
+  title: string
+  htmlUrl: string
+  labels: string[]
+  tags: string[]
+  backend: string
+  analyzedAt: string
+  category: string
+  feasibility: string
+  project: string | null
+  enableEs: boolean
+  brief: ReproBrief
+}
+
+/** Past analyses, most-recent first. */
+export async function reproBriefs(): Promise<{ ok: boolean; briefs: ReproBriefRecord[] }> {
+  const res = await fetch(`${BASE}/repro/briefs`)
+  return res.json()
+}
+
+export async function deleteReproBriefRecord(issue: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`${BASE}/repro/briefs/${encodeURIComponent(issue)}`, { method: 'DELETE' })
+  return res.json()
+}
