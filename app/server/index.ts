@@ -29,7 +29,8 @@ import {
   resolveUsername,
 } from './lib/github.js'
 import { listPlugins, resolvePluginFile, mimeForFile } from './lib/plugins.js'
-import { startResolveStream, startResolveResumeStream, listResolveRuns, listResolveCostSummary, buildBenchmarkReport, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate } from './lib/resolve.js'
+import { startResolveStream, startResolveResumeStream, listResolveRuns, listResolveCostSummary, buildBenchmarkReport, finishResolveRun, askResolveStream, getPrForIssue, getPrsForIssues, prAction, previewPrCreate, fetchIssueInfo } from './lib/resolve.js'
+import { generateReproBrief, seedTagsFromLabels } from './lib/repro-brief.js'
 import { parseTranscript, hasTranscript, getResolveBackend } from './lib/transcript.js'
 import {
   readUserConfig,
@@ -2239,6 +2240,44 @@ app.use('/api/skill/resolve/*', async (c, next) => {
     return c.json({ error: 'resolve feature is disabled' }, 404)
   }
   await next()
+})
+
+// --- repro brief: AI reads the issue, drafts the reproduction plan ---
+//
+// Front door of the /repro flow (feat/repro-scenarios).  Shares the
+// resolve feature flag: both depend on a configured AI backend, and
+// users who flipped resolveEnabled have already opted into AI spawns.
+// One-shot call (no tools), 15-40 s typical, 90 s hard timeout.
+app.post('/api/repro/analyze', async (c) => {
+  if (!isResolveEnabled()) {
+    return c.json({ ok: false, error: 'AI features are disabled — enable features.resolveEnabled on /#/config first.' }, 404)
+  }
+  let body: { issue?: string; tags?: string[]; backend?: string }
+  try { body = await c.req.json() } catch { return c.json({ ok: false, error: 'Invalid JSON body' }, 400) }
+  if (!body.issue || typeof body.issue !== 'string') {
+    return c.json({ ok: false, error: 'Missing "issue"' }, 400)
+  }
+  const result = await generateReproBrief({
+    issue: body.issue,
+    tags: Array.isArray(body.tags) ? body.tags.filter((t): t is string => typeof t === 'string') : [],
+    backend: typeof body.backend === 'string' ? body.backend : undefined,
+  })
+  return c.json(result, result.ok ? 200 : 422)
+})
+
+// Tag suggestions for an issue — labels mapped to repro focus tags.
+// Cheap (one GitHub fetch, no AI); the UI calls this when an issue is
+// picked so the tag chips start pre-seeded.
+app.get('/api/repro/seed-tags', async (c) => {
+  const issue = c.req.query('issue') || ''
+  if (!issue) return c.json({ ok: false, error: 'Missing issue parameter' }, 400)
+  const info = await fetchIssueInfo(issue)
+  if (!info) return c.json({ ok: false, error: 'Could not fetch issue' }, 404)
+  return c.json({
+    ok: true,
+    issue: { number: info.number, title: info.title, htmlUrl: info.htmlUrl, labels: info.labels },
+    tags: seedTagsFromLabels(info.labels),
+  })
 })
 
 app.get('/api/skill/resolve/stream', (c) => {
