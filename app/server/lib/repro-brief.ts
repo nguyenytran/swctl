@@ -293,7 +293,14 @@ function validateBrief(v: unknown): ReproBrief | null {
 // Spawn
 // ---------------------------------------------------------------------------
 
-const BRIEF_TIMEOUT_MS = 90_000   // generous; typical one-shot is 15-40 s
+// Typical one-shot is 15-40 s, but a large issue body + the dual-backend
+// instructions can push a complex analysis past 90 s, especially when
+// the Claude/Codex CLI is contended (a resolve running at the same
+// time).  Default 180 s; override via SWCTL_REPRO_ANALYZE_TIMEOUT_MS.
+const BRIEF_TIMEOUT_MS = (() => {
+  const env = Number(process.env.SWCTL_REPRO_ANALYZE_TIMEOUT_MS)
+  return Number.isFinite(env) && env >= 30_000 ? env : 180_000
+})()
 
 /** One-shot argv per backend — no tools, no editing permissions. */
 function briefSpawnPlan(backend: ResolveBackend, prompt: string): { bin: string; args: string[] } {
@@ -411,12 +418,25 @@ export async function generateReproBrief(input: {
   log(`  model finished in ${Math.round((Date.now() - startedAt) / 1000)}s (${stdout.length} chars)`)
 
   const issueEcho = { number: info.number, title: info.title, htmlUrl: info.htmlUrl, labels: info.labels }
-  if (error) { log(`✗ ${error}`); return { ok: false, issue: issueEcho, error, rawOutput: stdout.slice(0, 2000) } }
 
+  // Salvage-on-error: even when the spawn errored (timeout / non-zero
+  // exit), the model may have already emitted a complete brief JSON
+  // before the process lingered or was killed.  Try to parse what we
+  // have FIRST — a late-but-complete brief is a success, not a failure.
   progress(4, 'Parsing brief')
   log(`[4/${BRIEF_PHASES}] Parsing + validating brief…`)
   const brief = parseBriefOutput(stdout)
+
   if (!brief) {
+    // No salvageable brief.  Now the spawn error (if any) is the real
+    // story; otherwise it's a parse failure.
+    if (error) {
+      log(`✗ ${error}`)
+      const hint = stdout.length === 0
+        ? ' (no output received — the backend may be unauthenticated or hung; check /#/config)'
+        : ` (received ${stdout.length} chars but no complete brief — likely cut off mid-generation; retry or raise SWCTL_REPRO_ANALYZE_TIMEOUT_MS)`
+      return { ok: false, issue: issueEcho, error: error + hint, rawOutput: stdout.slice(0, 2000) }
+    }
     log('✗ Model output did not contain a valid brief JSON.')
     return {
       ok: false,
@@ -425,6 +445,7 @@ export async function generateReproBrief(input: {
       rawOutput: stdout.slice(0, 2000),
     }
   }
+  if (error) log(`  (recovered a complete brief despite: ${error})`)
   // Label-derived plugin scope wins over the model's guess.  The
   // extension/* label is maintainer-curated and matched against the
   // actual registered plugin list, so it's the source of truth for
