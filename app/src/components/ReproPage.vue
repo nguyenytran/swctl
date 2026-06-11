@@ -202,6 +202,18 @@ function finishAnalyze() {
 }
 onUnmounted(() => { if (analyzeSource) analyzeSource.close() })
 
+// Hand-off to the Resolve page.  The skip-Step-1 behaviour is entirely
+// server-side (resolve looks up this issue's persisted brief), so this
+// just navigates.  We also stash the issue so a future resolve-page
+// tweak can pre-fill its input; today the user re-picks the issue there
+// and the server still injects the repro context automatically.
+function resolveThisIssue() {
+  if (!issue.value) return
+  try { localStorage.setItem('swctl.resolve.prefillIssue', issue.value.number) } catch { /* ignore */ }
+  // /resolve is a plugin-registered route; hash navigation reaches it.
+  window.location.assign(`${window.location.pathname}${window.location.search}#/resolve`)
+}
+
 const message = ref('')
 async function copyText(s: string) {
   message.value = (await copyToClipboard(s)) ? 'Copied.' : 'Clipboard unavailable.'
@@ -435,10 +447,20 @@ function feasLabel(f: string) {
 
           <div v-if="brief.notes" class="text-xs text-gray-500 border-l-2 border-gray-600 pl-3">{{ brief.notes }}</div>
 
-          <button class="px-4 py-1.5 text-sm rounded font-medium bg-gray-700 text-gray-400 cursor-not-allowed" disabled
-                  title="Coming next: create the instance with these requirements + run the scenario">
-            Create instance + run repro (soon)
-          </button>
+          <div class="flex items-center gap-3 pt-1">
+            <button class="px-4 py-1.5 text-sm rounded font-medium bg-gray-700 text-gray-400 cursor-not-allowed" disabled
+                    title="Coming next: create the instance with these requirements + run the scenario">
+              Create instance + run repro (soon)
+            </button>
+            <!-- Hand-off to resolve: skips Step 1 (the server detects this
+                 issue's persisted brief and injects "reproduction done,
+                 start at root cause" into the resolve prompt). -->
+            <button class="px-4 py-1.5 text-sm rounded font-medium bg-blue-600 hover:bg-blue-500 text-white"
+                    title="Open the Resolve page for this issue. Resolve will skip its own reproduction step (Step 1) and re-use this scenario to verify the fix."
+                    @click="resolveThisIssue">
+              Resolve this issue →
+            </button>
+          </div>
         </div>
       </div>
     </div>

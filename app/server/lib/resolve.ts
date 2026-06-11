@@ -10,6 +10,7 @@ import { readAllInstances } from './metadata.js'
 import { readProjects } from './projects.js'
 import { emit } from './events.js'
 import { isResolveEnabled, getResolveTokenBudget } from './config.js'
+import { getReproBrief } from './repro-store.js'
 import { detectScopeWithAI, type AiScopeDecision } from './ai-scope.js'
 import { matchFailurePatterns } from './failure-patterns.js'
 
@@ -780,9 +781,54 @@ export interface ResolvePromptInput {
   issueId: string
   /** Absolute path to the git worktree the agent should operate in. */
   worktreePath: string
+  /**
+   * Pre-rendered "reproduction already done" preamble (feat/repro-scenarios).
+   * Present when a repro brief exists for this issue — instructs the
+   * agent to SKIP Step 1 (Verify) and re-use the repro scenario to
+   * verify the fix.  Empty/undefined → normal full-workflow run.
+   */
+  reproPreamble?: string
+}
+
+/**
+ * Build the "reproduction already complete" preamble injected into the
+ * resolve prompt when the issue was analyzed via /repro.  Tells the
+ * agent to skip Step 1 and re-run the scenario after fixing as the
+ * verification gate.  Pure — exported for tests.
+ */
+export function buildReproPreamble(brief: {
+  category: string
+  feasibility: string
+  summary: string
+  scenarioYaml?: string
+  playwrightSpec?: string
+  issueId: string
+}): string {
+  const hasScenario = !!(brief.scenarioYaml?.trim() || brief.playwrightSpec?.trim())
+  const verifyLine = hasScenario
+    ? `- VERIFY YOUR FIX by re-running \`swctl repro ${brief.issueId}\` (the scenario `
+      + `is already at .swctl/repro.yml${brief.playwrightSpec?.trim() ? ' / .swctl/repro.spec.ts' : ''}). `
+      + `A NOT_REPRODUCED verdict confirms the fix; REPRODUCED means it's not fixed yet.`
+    : `- This issue's reproduction is a manual checklist (no automatable scenario) — `
+      + `verify your fix against the checks in the brief.`
+  return [
+    `## Reproduction already completed (via swctl repro)`,
+    ``,
+    `Do NOT redo Step 1 (Verify) — the issue was already analyzed + reproduced.`,
+    `Start at Step 2 (Root cause analysis).`,
+    `  Category:    ${brief.category}`,
+    `  Feasibility: ${brief.feasibility}`,
+    `  Summary:     ${brief.summary}`,
+    verifyLine,
+    ``,
+  ].join('\n')
 }
 
 export function buildResolvePrompt(input: ResolvePromptInput): string {
+  // feat/repro-scenarios: when the issue was analyzed via /repro, the
+  // preamble tells the agent to skip Step 1 + re-verify with the
+  // scenario.  Prepended to both backend forms.
+  const pre = input.reproPreamble ? `${input.reproPreamble}\n` : ''
   if (input.backend === 'codex') {
     // Codex has NO slash-command (`/foo`) or at-mention (`@foo`) skill
     // registry — neither token resolves to anything special.  AGENTS.md
@@ -795,7 +841,7 @@ export function buildResolvePrompt(input: ResolvePromptInput): string {
     // which produced the "No commits on fix/<id> vs trunk" empty
     // result the user hit on issue #6689.  Telling it to commit per
     // step is what turns a chatty no-op into a reviewable diff.
-    return [
+    return pre + [
       `# Resolve Shopware issue ${input.issue}`,
       ``,
       `Apply the 8-step Shopware-issue-resolution workflow described in`,
@@ -832,7 +878,9 @@ export function buildResolvePrompt(input: ResolvePromptInput): string {
 
   // Claude — slash-command form.  The skill's SKILL.md carries every
   // ground rule + per-step artifact requirement; this is just the trigger.
-  return `/shopware-resolve ${input.issue}\n\n(issue id for Step 5 swctl refresh: ${input.issueId})`
+  // The repro preamble (when present) rides ABOVE the slash command so
+  // the agent reads "skip Step 1" before invoking the skill.
+  return `${pre}/shopware-resolve ${input.issue}\n\n(issue id for Step 5 swctl refresh: ${input.issueId})`
 }
 
 export function buildSpawnArgs(input: SpawnArgsInput): SpawnArgsResult {
@@ -1533,7 +1581,24 @@ export function startResolveStream(
     // tells it to commit per step — without that, `codex exec --full-auto`
     // chats but doesn't write, and the diff tab shows "No commits on
     // fix/<id> vs trunk".  See buildResolvePrompt for the full rationale.
-    const prompt = buildResolvePrompt({ backend, issue, issueId, worktreePath })
+    // feat/repro-scenarios: if this issue was already analyzed via
+    // /repro, inject the "skip Step 1 + verify with the scenario"
+    // preamble so resolve goes straight to root cause instead of
+    // re-reproducing.  Plugin-independent: works for any resolve
+    // trigger (the brief is looked up by issue number from the
+    // persisted store).
+    const reproRec = getReproBrief(issue)
+    const reproPreamble = reproRec
+      ? buildReproPreamble({
+          category: reproRec.category,
+          feasibility: reproRec.feasibility,
+          summary: reproRec.brief.summary,
+          scenarioYaml: reproRec.brief.scenarioYaml,
+          playwrightSpec: reproRec.brief.playwrightSpec,
+          issueId,
+        })
+      : undefined
+    const prompt = buildResolvePrompt({ backend, issue, issueId, worktreePath, reproPreamble })
 
     // Resolve the actual (bin, args) pair for the SELECTED backend.  Before
     // v0.5.10 this block hard-coded `backendBinary('claude')` with a

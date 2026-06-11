@@ -97,6 +97,18 @@ export function listReproBriefs(): ReproBriefRecord[] {
   return read()
 }
 
+/**
+ * Look up the persisted brief for one issue (by bare number).  Used by
+ * the resolve flow to detect "this issue was already reproduced" and
+ * skip Step 1.  Accepts a URL/#ref and normalises to the trailing
+ * number so resolve can pass its raw issue ref.
+ */
+export function getReproBrief(issueRef: string): ReproBriefRecord | null {
+  const m = String(issueRef).match(/(\d+)\s*$/)
+  const num = m ? m[1] : String(issueRef).trim()
+  return read().find((r) => r.issue === num) || null
+}
+
 export function deleteReproBrief(issue: string): boolean {
   const records = read()
   const kept = records.filter((r) => r.issue !== issue)
