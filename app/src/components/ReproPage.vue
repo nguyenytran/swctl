@@ -58,11 +58,14 @@ async function refreshGh() {
         : result.error
       ghItems.value = []
     } else {
-      // Repro (unlike resolve) does NOT hide PR-linked issues — verifying
-      // a fix by reproducing its issue is a primary use case.  Show
-      // assigned + review-requested.
+      // Issues only — NOT pull requests.  The `review-requested`
+      // category is PRs awaiting your review (titles like "fix: …"),
+      // and even `assigned` can contain PRs; both are useless for
+      // reproduction.  Filter to assigned items that are real issues.
+      // (Unlike resolve we DON'T hide PR-linked issues — reproducing
+      // an issue to verify its fix is a primary use case.)
       ghItems.value = (result.items || []).filter(
-        (it) => it.category === 'assigned' || it.category === 'review-requested',
+        (it) => it.category === 'assigned' && !it.isPR,
       )
     }
   } catch (err: any) {
@@ -221,11 +224,7 @@ const feasibilityColor = computed(() => {
               :title="item.title"
               @click="pickGhItem(item)"
             >
-              <div class="flex items-center gap-2">
-                <span class="text-blue-400 font-mono text-[11px]">#{{ item.number }}</span>
-                <span v-if="item.category === 'review-requested'"
-                      class="text-[9px] px-1 rounded bg-violet-500/20 text-violet-300">review</span>
-              </div>
+              <div class="text-blue-400 font-mono text-[11px]">#{{ item.number }}</div>
               <div class="text-gray-300 truncate">{{ item.title }}</div>
               <div v-if="item.labels.length" class="mt-0.5 flex flex-wrap gap-1">
                 <span v-for="l in item.labels.slice(0, 4)" :key="l.name"
