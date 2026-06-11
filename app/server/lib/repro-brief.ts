@@ -24,7 +24,7 @@
  */
 
 import { spawn } from 'child_process'
-import { fetchIssueInfo, backendBinary, coerceBackend, type ResolveBackend } from './resolve.js'
+import { fetchIssueInfo, backendBinary, coerceBackend, detectPluginScopeFromLabels, type ResolveBackend } from './resolve.js'
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -156,6 +156,8 @@ export function buildBriefPrompt(input: {
   body: string
   labels: string[]
   tags: string[]
+  /** Deterministically derived from extension/* labels (resolve's mapper). */
+  pluginHint?: string | null
 }): string {
   const body = (input.body || '').slice(0, 6000)  // keep the one-shot cheap
   return [
@@ -199,6 +201,12 @@ export function buildBriefPrompt(input: {
       ? `User focus tags (weigh these heavily when categorising): ${input.tags.join(', ')}`
       : `User focus tags: (none)`,
     `GitHub labels: ${input.labels.length ? input.labels.join(', ') : '(none)'}`,
+    // The plugin scope is derived deterministically from extension/*
+    // labels against the registered plugin list — it's authoritative,
+    // so tell the model to use it verbatim rather than re-guessing.
+    input.pluginHint
+      ? `Resolved plugin scope (from extension/* label — USE THIS for instanceNeeds.project): ${input.pluginHint}`
+      : `Resolved plugin scope: none (platform/trunk unless the body clearly says otherwise)`,
     ``,
     `Issue title: ${input.title}`,
     `Issue body:`,
@@ -318,11 +326,17 @@ export async function generateReproBrief(input: {
     return { ok: false, error: `Could not fetch issue "${input.issue}" — check the reference and the GitHub token (swctl auth login).` }
   }
 
+  // Authoritative plugin scope from the issue's extension/* labels —
+  // maintainer-curated, so we trust it over the model's inference.
+  // null when no extension label matches a registered plugin.
+  const pluginHint = detectPluginScopeFromLabels(info.labels)
+
   const prompt = buildBriefPrompt({
     title: info.title,
     body: info.body,
     labels: info.labels,
     tags: (input.tags || []).filter(Boolean),
+    pluginHint,
   })
   const backend = coerceBackend(input.backend)
   const plan = briefSpawnPlan(backend, prompt)
@@ -368,23 +382,52 @@ export async function generateReproBrief(input: {
       rawOutput: stdout.slice(0, 2000),
     }
   }
+  // Label-derived plugin scope wins over the model's guess.  The
+  // extension/* label is maintainer-curated and matched against the
+  // actual registered plugin list, so it's the source of truth for
+  // which project the reproduction instance must be created in.
+  if (pluginHint && brief.instanceNeeds.project !== pluginHint) {
+    brief.instanceNeeds.project = pluginHint
+    brief.instanceNeeds.notes = brief.instanceNeeds.notes
+      ? `${brief.instanceNeeds.notes} (project set from extension label)`
+      : 'project set from extension label'
+  }
   return { ok: true, issue: issueEcho, brief }
 }
 
 /**
- * Tags auto-seeded from GitHub labels — shown pre-ticked in the UI.
- * Pure + exported for tests.
+ * Tags auto-seeded from GitHub labels — shown pre-ticked in the UI as
+ * focus hints for the analyzer.  Reads the real Shopware label
+ * taxonomy: namespaced labels (`domain/<x>`, `component/<x>`,
+ * `area/<x>`) surface their sub-value as a tag, plus a few semantic
+ * normalisations (search/ES, admin, checkout).  `extension/<Name>`
+ * adds a generic "plugin" tag — the SPECIFIC plugin is resolved
+ * separately + authoritatively via detectPluginScopeFromLabels, so we
+ * don't duplicate that here.  Pure + exported for tests.
  */
 export function seedTagsFromLabels(labels: string[]): string[] {
   const tags = new Set<string>()
-  for (const l of labels) {
-    const lower = l.toLowerCase()
-    if (/(component|domain)\/(search|elasticsearch)/.test(lower) || lower === 'elasticsearch') tags.add('search')
-    if (/extension\//.test(lower)) tags.add('plugin')
+  // Noise namespaces that aren't useful repro focus signals.
+  const SKIP_PREFIX = /^(priority|milestone|backport|qi|status|type)\//
+  for (const raw of labels) {
+    const lower = raw.toLowerCase().trim()
+    if (!lower) continue
+
+    // Semantic normalisations first (these win regardless of namespace).
+    if (/(search|elasticsearch|opensearch)/.test(lower)) tags.add('search')
     if (/storefront/.test(lower)) tags.add('storefront')
     if (/admin(istration)?/.test(lower)) tags.add('admin-ui')
-    if (/checkout|cart/.test(lower)) tags.add('checkout')
-    if (/performance/.test(lower)) tags.add('performance')
+    if (/checkout|cart|order/.test(lower)) tags.add('checkout')
+    if (/performance|perf\b/.test(lower)) tags.add('performance')
+    if (/extension\//.test(lower)) tags.add('plugin')
+
+    // Namespaced labels: surface the sub-value as a tag
+    // (domain/inventory → "inventory", component/cart → "cart").
+    const ns = lower.match(/^(domain|component|area)\/(.+)$/)
+    if (ns && !SKIP_PREFIX.test(lower)) {
+      const sub = ns[2].replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+      if (sub && sub.length >= 3) tags.add(sub)
+    }
   }
   return [...tags]
 }
