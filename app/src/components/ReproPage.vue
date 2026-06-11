@@ -241,20 +241,85 @@ function feasLabel(f: string) {
 </script>
 
 <template>
-  <div class="flex gap-4 h-[calc(100vh-120px)]">
-    <!-- Left sidebar: history + analyze controls -->
-    <div class="w-72 flex-shrink-0 border border-border rounded-lg bg-surface overflow-hidden flex flex-col">
+  <div class="flex flex-col gap-4 h-[calc(100vh-110px)]">
+    <!-- Top bar: GitHub picker + paste + backend (full width) -->
+    <div class="flex-shrink-0 border border-border rounded-lg bg-surface p-3">
+      <div class="flex items-center gap-3 flex-wrap">
+        <span class="text-sm font-semibold text-white">Pick an issue</span>
+        <!-- Paste + Load -->
+        <div class="flex gap-1">
+          <input v-model="issueInput" placeholder="Issue URL or #number"
+                 class="w-56 bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
+                 @keydown.enter="loadIssue" />
+          <button class="px-2 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-500 disabled:opacity-50"
+                  :disabled="loadingIssue || !issueInput.trim()" @click="loadIssue">
+            {{ loadingIssue ? '…' : 'Load' }}
+          </button>
+        </div>
+        <!-- Backend radio -->
+        <div class="flex items-center gap-2 text-[11px] text-gray-500">
+          <span>AI:</span>
+          <label class="flex items-center gap-1 cursor-pointer select-none">
+            <input v-model="selectedBackend" type="radio" value="claude" class="accent-blue-500" />
+            <span :class="selectedBackend === 'claude' ? 'text-gray-200' : ''">Claude</span>
+          </label>
+          <label class="flex items-center gap-1 cursor-pointer select-none">
+            <input v-model="selectedBackend" type="radio" value="codex" class="accent-blue-500" />
+            <span :class="selectedBackend === 'codex' ? 'text-gray-200' : ''">Codex</span>
+          </label>
+          <span v-if="selectedBackend === 'codex'" class="text-amber-500/80"
+                title="Codex one-shot analyze; experimental.">experimental</span>
+        </div>
+        <button class="ml-auto text-xs text-gray-400 hover:text-white"
+                @click="toggleGhPicker">
+          {{ ghShow ? '▾ Hide GitHub issues' : '▸ Browse GitHub issues' }}
+          <span v-if="ghShow && ghItems.length > 0" class="text-gray-600">({{ ghItems.length }})</span>
+        </button>
+      </div>
+
+      <!-- GitHub issue list (wide, expanded) -->
+      <div v-if="ghShow" class="mt-3">
+        <div v-if="ghDefaultLabels.length > 0" class="flex items-center flex-wrap gap-1 mb-2">
+          <span v-for="label in ghSelectedLabels" :key="label"
+                class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-blue-600/20 text-blue-300 border border-blue-600/40">
+            {{ label }}
+            <button class="text-blue-300/70 hover:text-white text-[11px] leading-none" @click="removeGhLabel(label)">×</button>
+          </span>
+          <button v-if="ghSelectedLabels.length < ghDefaultLabels.length"
+                  class="text-[10px] px-1.5 py-0.5 rounded-full border border-border text-gray-500 hover:text-gray-300"
+                  @click="resetGhLabels">Reset</button>
+        </div>
+        <div v-if="ghLoading" class="text-xs text-gray-500 italic px-1 py-2">Loading…</div>
+        <div v-else-if="ghError" class="text-xs text-red-400 px-1 py-2">{{ ghError }}</div>
+        <div v-else-if="ghItems.length === 0" class="text-xs text-gray-600 italic px-1 py-2">No issues match.</div>
+        <!-- Wide multi-column grid of issues -->
+        <div v-else class="max-h-56 overflow-y-auto grid grid-cols-2 lg:grid-cols-3 gap-1">
+          <button v-for="item in ghItems" :key="`${item.repo}#${item.number}`"
+                  class="text-left px-2 py-1.5 text-xs rounded border border-border/50 hover:bg-surface-dark hover:border-gray-500 transition-colors"
+                  :title="item.title" @click="pickGhItem(item)">
+            <div class="text-blue-400 font-mono text-[11px]">#{{ item.number }}</div>
+            <div class="text-gray-300 truncate">{{ item.title }}</div>
+            <div v-if="item.labels.length" class="mt-0.5 flex flex-wrap gap-1">
+              <span v-for="l in item.labels.slice(0, 3)" :key="l.name"
+                    class="text-[9px] px-1 rounded bg-gray-700 text-gray-400">{{ l.name }}</span>
+            </div>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Below: two columns — history (left) + brief/analysis (right) -->
+    <div class="flex gap-4 flex-1 min-h-0">
+    <!-- Left sidebar: analyzed-issue history -->
+    <div class="w-64 flex-shrink-0 border border-border rounded-lg bg-surface overflow-hidden flex flex-col">
       <div class="px-3 py-2 border-b border-border flex items-center justify-between">
         <span class="text-sm font-semibold text-white">Analyzed issues</span>
         <span class="text-xs text-gray-500">{{ history.length }}</span>
       </div>
-
-      <!-- History listing (persisted, reviewable later) -->
       <div class="overflow-y-auto flex-1">
         <div v-if="history.length === 0" class="px-3 py-4 text-xs text-gray-500 leading-relaxed">
           <p class="text-gray-400 mb-2">No analyses yet.</p>
-          <p>Pick an issue from <button class="text-blue-400 hover:text-blue-300"
-             @click="ghShow ? null : toggleGhPicker()">Browse GitHub</button> below, then Analyze.</p>
+          <p>Pick an issue from the top bar, then Analyze.</p>
         </div>
         <div
           v-for="rec in history"
@@ -278,65 +343,6 @@ function feasLabel(f: string) {
           <div class="text-[10px] text-gray-600 mt-0.5">
             {{ rec.project || 'platform' }}<span v-if="rec.enableEs"> · ES</span> · {{ rec.backend }}
           </div>
-        </div>
-      </div>
-
-      <!-- Browse GitHub (issues only) -->
-      <div class="border-t border-border">
-        <button class="w-full px-3 py-1.5 text-xs text-left text-gray-400 hover:text-white flex items-center justify-between"
-                @click="toggleGhPicker">
-          <span>{{ ghShow ? '▾' : '▸' }} Browse GitHub</span>
-          <span v-if="ghShow && ghItems.length > 0" class="text-[10px] text-gray-600">{{ ghItems.length }}</span>
-        </button>
-        <div v-if="ghShow" class="px-2 pb-2">
-          <div v-if="ghDefaultLabels.length > 0" class="flex items-center flex-wrap gap-1 mb-2">
-            <span v-for="label in ghSelectedLabels" :key="label"
-                  class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-blue-600/20 text-blue-300 border border-blue-600/40">
-              {{ label }}
-              <button class="text-blue-300/70 hover:text-white text-[11px] leading-none"
-                      @click="removeGhLabel(label)">×</button>
-            </span>
-            <button v-if="ghSelectedLabels.length < ghDefaultLabels.length"
-                    class="text-[10px] px-1.5 py-0.5 rounded-full border border-border text-gray-500 hover:text-gray-300"
-                    @click="resetGhLabels">Reset</button>
-          </div>
-          <div v-if="ghLoading" class="text-xs text-gray-500 italic px-1 py-2">Loading…</div>
-          <div v-else-if="ghError" class="text-xs text-red-400 px-1 py-2">{{ ghError }}</div>
-          <div v-else-if="ghItems.length === 0" class="text-xs text-gray-600 italic px-1 py-2">No issues match.</div>
-          <div v-else class="max-h-44 overflow-y-auto border border-border rounded bg-surface-dark">
-            <button v-for="item in ghItems" :key="`${item.repo}#${item.number}`"
-                    class="w-full text-left px-2 py-1.5 text-xs border-b border-border/50 last:border-b-0 hover:bg-surface"
-                    :title="item.title" @click="pickGhItem(item)">
-              <div class="text-blue-400 font-mono text-[11px]">#{{ item.number }}</div>
-              <div class="text-gray-300 truncate">{{ item.title }}</div>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <!-- Paste + backend + analyze -->
-      <div class="p-2 border-t border-border">
-        <div class="flex gap-1">
-          <input v-model="issueInput" placeholder="Issue URL or #number"
-                 class="flex-1 bg-surface-dark border border-border rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
-                 @keydown.enter="loadIssue" />
-          <button class="px-2 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-500 disabled:opacity-50"
-                  :disabled="loadingIssue || !issueInput.trim()" @click="loadIssue">
-            {{ loadingIssue ? '…' : 'Load' }}
-          </button>
-        </div>
-        <div class="flex items-center gap-2 mt-1.5 text-[11px] text-gray-500">
-          <span>AI:</span>
-          <label class="flex items-center gap-1 cursor-pointer select-none">
-            <input v-model="selectedBackend" type="radio" value="claude" class="accent-blue-500" />
-            <span :class="selectedBackend === 'claude' ? 'text-gray-200' : ''">Claude</span>
-          </label>
-          <label class="flex items-center gap-1 cursor-pointer select-none">
-            <input v-model="selectedBackend" type="radio" value="codex" class="accent-blue-500" />
-            <span :class="selectedBackend === 'codex' ? 'text-gray-200' : ''">Codex</span>
-          </label>
-          <span v-if="selectedBackend === 'codex'" class="ml-auto text-amber-500/80"
-                title="Codex one-shot analyze; experimental.">experimental</span>
         </div>
       </div>
     </div>
@@ -463,6 +469,7 @@ function feasLabel(f: string) {
           </div>
         </div>
       </div>
+    </div>
     </div>
   </div>
 </template>
