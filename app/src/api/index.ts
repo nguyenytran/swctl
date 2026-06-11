@@ -566,3 +566,58 @@ export async function fetchSystemInfo(): Promise<{
   return res.json()
 }
 
+
+// ---------------------------------------------------------------------------
+// Repro flow (feat/repro-scenarios) — AI brief + scenario running
+// ---------------------------------------------------------------------------
+
+/** Mirrors server/lib/repro-brief.ts ReproBrief — keep in sync. */
+export interface ReproBrief {
+  category: 'api' | 'search' | 'storefront-html' | 'console' | 'admin-ui' | 'other'
+  feasibility: 'auto' | 'partial' | 'manual'
+  summary: string
+  instanceNeeds: { enableEs: boolean; project: string | null; notes: string }
+  preconditions: string[]
+  setup: string[]
+  execute: string[]
+  checks: string[]
+  scenarioYaml: string
+  notes: string
+}
+
+export interface ReproIssueEcho {
+  number: string
+  title: string
+  htmlUrl: string
+  labels: string[]
+}
+
+export interface ReproBriefResult {
+  ok: boolean
+  brief?: ReproBrief
+  issue?: ReproIssueEcho
+  error?: string
+  rawOutput?: string
+}
+
+/** One-shot AI analysis: 15-40 s typical (90 s server-side timeout). */
+export async function reproAnalyze(
+  issue: string,
+  tags: string[],
+  backend?: string,
+): Promise<ReproBriefResult> {
+  const res = await fetch(`${BASE}/repro/analyze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ issue, tags, ...(backend ? { backend } : {}) }),
+  })
+  return res.json()
+}
+
+/** Fast (no AI): fetch issue meta + label-derived starter tags. */
+export async function reproSeedTags(
+  issue: string,
+): Promise<{ ok: boolean; issue?: ReproIssueEcho; tags?: string[]; error?: string }> {
+  const res = await fetch(`${BASE}/repro/seed-tags?issue=${encodeURIComponent(issue)}`)
+  return res.json()
+}

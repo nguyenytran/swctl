@@ -28,6 +28,19 @@ const router = createRouter({
       },
     },
 
+    // Repro — AI-first issue reproduction (gated on resolveEnabled: the
+    // analyze step spawns the same AI backends as resolve)
+    {
+      path: '/repro',
+      name: 'repro',
+      component: () => import('@/components/ReproPage.vue'),
+      beforeEnter: async () => {
+        const { features, loadFeatures } = useFeatures()
+        await loadFeatures()
+        return features.value.resolveEnabled ? true : { path: '/dashboard' }
+      },
+    },
+
     // Config (~/.swctl/config.json) — AI backend, feature flags, CLI paths
     { path: '/config', name: 'config', component: () => import('@/components/ConfigPage.vue') },
   ],
