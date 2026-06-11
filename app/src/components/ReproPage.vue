@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { reproAnalyze, reproSeedTags, type ReproBrief, type ReproIssueEcho } from '@/api'
+import { reproAnalyze, reproSeedTags, fetchGitHubIssues, fetchDefaultIssueLabels, type ReproBrief, type ReproIssueEcho } from '@/api'
+import type { GitHubItem } from '@/types'
 import { copyToClipboard } from '@/utils/clipboard'
 
 /**
@@ -26,6 +27,64 @@ const issueInput = ref('')
 const issue = ref<ReproIssueEcho | null>(null)
 const tags = ref<string[]>([])
 const newTag = ref('')
+
+// --- Browse-GitHub picker (mirrors ResolvePage / batch-create) ---
+const ghShow = ref(false)
+const ghItems = ref<GitHubItem[]>([])
+const ghLoading = ref(false)
+const ghError = ref('')
+const ghDefaultLabels = ref<string[]>([])
+const ghSelectedLabels = ref<string[]>([])
+let ghDefaultsLoaded = false
+
+async function toggleGhPicker() {
+  ghShow.value = !ghShow.value
+  if (ghShow.value && ghItems.value.length === 0 && !ghLoading.value) await refreshGh()
+}
+
+async function refreshGh() {
+  ghLoading.value = true
+  ghError.value = ''
+  try {
+    if (!ghDefaultsLoaded) {
+      ghDefaultLabels.value = await fetchDefaultIssueLabels()
+      ghSelectedLabels.value = [...ghDefaultLabels.value]
+      ghDefaultsLoaded = true
+    }
+    const result = await fetchGitHubIssues(undefined, ghSelectedLabels.value)
+    if (result.error) {
+      ghError.value = result.error === 'auth_required'
+        ? 'GitHub authentication required (Dashboard → GitHub).'
+        : result.error
+      ghItems.value = []
+    } else {
+      // Repro (unlike resolve) does NOT hide PR-linked issues — verifying
+      // a fix by reproducing its issue is a primary use case.  Show
+      // assigned + review-requested.
+      ghItems.value = (result.items || []).filter(
+        (it) => it.category === 'assigned' || it.category === 'review-requested',
+      )
+    }
+  } catch (err: any) {
+    ghError.value = err?.message || 'Failed to fetch'
+  } finally {
+    ghLoading.value = false
+  }
+}
+
+function removeGhLabel(label: string) {
+  ghSelectedLabels.value = ghSelectedLabels.value.filter((l) => l !== label)
+  refreshGh()
+}
+function resetGhLabels() {
+  ghSelectedLabels.value = [...ghDefaultLabels.value]
+  refreshGh()
+}
+function pickGhItem(item: GitHubItem) {
+  issueInput.value = String(item.number)
+  ghShow.value = false
+  loadIssue()
+}
 
 const loadingIssue = ref(false)
 const analyzing = ref(false)
@@ -124,12 +183,66 @@ const feasibilityColor = computed(() => {
     <!-- 1. Issue picker -->
     <section class="border border-border rounded-lg bg-surface p-4 space-y-3">
       <div class="text-xs font-medium text-gray-300">Issue</div>
+
+      <!-- Browse GitHub (assigned + review-requested, label-filtered) -->
+      <div class="rounded border border-border bg-surface-dark">
+        <button
+          class="w-full px-3 py-2 text-xs text-left text-gray-400 hover:text-white transition-colors flex items-center justify-between"
+          @click="toggleGhPicker"
+        >
+          <span>{{ ghShow ? '▾' : '▸' }} Browse GitHub issues</span>
+          <span v-if="ghShow && ghItems.length > 0" class="text-[10px] text-gray-600">{{ ghItems.length }}</span>
+        </button>
+        <div v-if="ghShow" class="px-2 pb-2">
+          <div v-if="ghDefaultLabels.length > 0" class="flex items-center flex-wrap gap-1 mb-2">
+            <span
+              v-for="label in ghSelectedLabels"
+              :key="label"
+              class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-blue-600/20 text-blue-300 border border-blue-600/40"
+            >
+              {{ label }}
+              <button class="text-blue-300/70 hover:text-white text-[11px] leading-none"
+                      :title="`Remove ${label} — re-fetch`" @click="removeGhLabel(label)">×</button>
+            </span>
+            <button
+              v-if="ghSelectedLabels.length < ghDefaultLabels.length"
+              class="text-[10px] px-1.5 py-0.5 rounded-full border border-border text-gray-500 hover:text-gray-300 hover:border-gray-500"
+              title="Restore default labels" @click="resetGhLabels"
+            >Reset</button>
+          </div>
+          <div v-if="ghLoading" class="text-xs text-gray-500 italic px-1 py-2">Loading…</div>
+          <div v-else-if="ghError" class="text-xs text-red-400 px-1 py-2">{{ ghError }}</div>
+          <div v-else-if="ghItems.length === 0" class="text-xs text-gray-600 italic px-1 py-2">No issues match.</div>
+          <div v-else class="max-h-56 overflow-y-auto border border-border rounded bg-surface">
+            <button
+              v-for="item in ghItems"
+              :key="`${item.repo}#${item.number}`"
+              class="w-full text-left px-2 py-1.5 text-xs border-b border-border/50 last:border-b-0 hover:bg-surface-dark transition-colors"
+              :title="item.title"
+              @click="pickGhItem(item)"
+            >
+              <div class="flex items-center gap-2">
+                <span class="text-blue-400 font-mono text-[11px]">#{{ item.number }}</span>
+                <span v-if="item.category === 'review-requested'"
+                      class="text-[9px] px-1 rounded bg-violet-500/20 text-violet-300">review</span>
+              </div>
+              <div class="text-gray-300 truncate">{{ item.title }}</div>
+              <div v-if="item.labels.length" class="mt-0.5 flex flex-wrap gap-1">
+                <span v-for="l in item.labels.slice(0, 4)" :key="l.name"
+                      class="text-[9px] px-1 rounded bg-gray-700 text-gray-400">{{ l.name }}</span>
+              </div>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Manual entry fallback (any URL / #number, e.g. another repo) -->
       <div class="flex gap-2">
         <input
           v-model="issueInput"
           type="text"
           spellcheck="false"
-          placeholder="issue number or GitHub URL — e.g. 10833"
+          placeholder="…or paste an issue number / GitHub URL — e.g. 10833"
           class="flex-1 px-3 py-1.5 text-sm font-mono rounded bg-surface-dark border border-border text-white placeholder-gray-600 focus:outline-none focus:border-sky-500"
           @keydown.enter.prevent="loadIssue"
         />
