@@ -316,44 +316,83 @@ function briefSpawnPlan(backend: ResolveBackend, prompt: string): { bin: string;
   }
 }
 
+/**
+ * Optional progress sink.  When provided (by the SSE route), the brief
+ * generator narrates each phase + emits a progress bar position.  The
+ * analyze flow has 4 phases; phase 3 (the AI call) is the long
+ * indeterminate one, so we tick elapsed time + bytes received while it
+ * runs rather than fake a percentage.
+ */
+export interface BriefEmitter {
+  log: (line: string) => void
+  progress: (phase: number, total: number, label: string) => void
+}
+const BRIEF_PHASES = 4
+
 export async function generateReproBrief(input: {
   issue: string
   tags?: string[]
   backend?: string
+  emit?: BriefEmitter
 }): Promise<BriefResult> {
+  const log = (l: string) => input.emit?.log(l)
+  const progress = (p: number, label: string) => input.emit?.progress(p, BRIEF_PHASES, label)
+
+  progress(1, 'Fetching issue')
+  log(`[1/${BRIEF_PHASES}] Fetching issue "${input.issue}" from GitHub…`)
   const info = await fetchIssueInfo(input.issue)
   if (!info) {
+    log('✗ Could not fetch issue.')
     return { ok: false, error: `Could not fetch issue "${input.issue}" — check the reference and the GitHub token (swctl auth login).` }
   }
+  log(`✓ #${info.number} — ${info.title}`)
+  log(`  labels: ${info.labels.length ? info.labels.join(', ') : '(none)'}`)
 
   // Authoritative plugin scope from the issue's extension/* labels —
   // maintainer-curated, so we trust it over the model's inference.
   // null when no extension label matches a registered plugin.
+  progress(2, 'Reading labels')
   const pluginHint = detectPluginScopeFromLabels(info.labels)
+  log(`[2/${BRIEF_PHASES}] Plugin scope from labels: ${pluginHint ?? 'none (platform/trunk)'}`)
+  const focusTags = (input.tags || []).filter(Boolean)
+  if (focusTags.length) log(`  focus tags: ${focusTags.join(', ')}`)
 
   const prompt = buildBriefPrompt({
     title: info.title,
     body: info.body,
     labels: info.labels,
-    tags: (input.tags || []).filter(Boolean),
+    tags: focusTags,
     pluginHint,
   })
   const backend = coerceBackend(input.backend)
   const plan = briefSpawnPlan(backend, prompt)
+  progress(3, `Analyzing with ${backend}`)
+  log(`[3/${BRIEF_PHASES}] Spawning ${backend} (one-shot analysis, up to ${BRIEF_TIMEOUT_MS / 1000}s)…`)
 
+  const startedAt = Date.now()
   const { stdout, error } = await new Promise<{ stdout: string; error?: string }>((resolve) => {
     const child = spawn(plan.bin, plan.args, { stdio: ['ignore', 'pipe', 'pipe'] })
     let out = ''
     let err = ''
+    let settled = false
+    const done = (r: { stdout: string; error?: string }) => { if (!settled) { settled = true; resolve(r) } }
+    // Heartbeat: the AI call is indeterminate, so narrate elapsed time +
+    // bytes received every 3 s so the log panel shows life + the user
+    // knows it isn't hung.
+    const tick = setInterval(() => {
+      const s = Math.round((Date.now() - startedAt) / 1000)
+      log(`  …analyzing (${s}s, ${out.length} chars received)`)
+    }, 3000)
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL') } catch { /* already gone */ }
-      resolve({ stdout: out, error: `analysis timed out after ${BRIEF_TIMEOUT_MS / 1000}s` })
+      clearInterval(tick)
+      done({ stdout: out, error: `analysis timed out after ${BRIEF_TIMEOUT_MS / 1000}s` })
     }, BRIEF_TIMEOUT_MS)
     child.stdout.on('data', (d: Buffer) => { out += d })
     child.stderr.on('data', (d: Buffer) => { err += d })
     child.on('error', (e: NodeJS.ErrnoException) => {
-      clearTimeout(timer)
-      resolve({
+      clearTimeout(timer); clearInterval(tick)
+      done({
         stdout: out,
         error: e.code === 'ENOENT'
           ? `backend binary not found: ${plan.bin} — check /#/config`
@@ -361,20 +400,24 @@ export async function generateReproBrief(input: {
       })
     })
     child.on('close', (code) => {
-      clearTimeout(timer)
+      clearTimeout(timer); clearInterval(tick)
       if (code !== 0 && !out.trim()) {
-        resolve({ stdout: out, error: `${plan.bin} exited ${code}: ${err.slice(0, 300)}` })
+        done({ stdout: out, error: `${plan.bin} exited ${code}: ${err.slice(0, 300)}` })
       } else {
-        resolve({ stdout: out })
+        done({ stdout: out })
       }
     })
   })
+  log(`  model finished in ${Math.round((Date.now() - startedAt) / 1000)}s (${stdout.length} chars)`)
 
   const issueEcho = { number: info.number, title: info.title, htmlUrl: info.htmlUrl, labels: info.labels }
-  if (error) return { ok: false, issue: issueEcho, error, rawOutput: stdout.slice(0, 2000) }
+  if (error) { log(`✗ ${error}`); return { ok: false, issue: issueEcho, error, rawOutput: stdout.slice(0, 2000) } }
 
+  progress(4, 'Parsing brief')
+  log(`[4/${BRIEF_PHASES}] Parsing + validating brief…`)
   const brief = parseBriefOutput(stdout)
   if (!brief) {
+    log('✗ Model output did not contain a valid brief JSON.')
     return {
       ok: false,
       issue: issueEcho,
@@ -392,6 +435,9 @@ export async function generateReproBrief(input: {
       ? `${brief.instanceNeeds.notes} (project set from extension label)`
       : 'project set from extension label'
   }
+  log(`✓ Brief ready: category=${brief.category}, feasibility=${brief.feasibility}`
+    + (brief.instanceNeeds.project ? `, project=${brief.instanceNeeds.project}` : '')
+    + (brief.instanceNeeds.enableEs ? ', ES required' : ''))
   return { ok: true, issue: issueEcho, brief }
 }
 

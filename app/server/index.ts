@@ -2265,6 +2265,41 @@ app.post('/api/repro/analyze', async (c) => {
   return c.json(result, result.ok ? 200 : 422)
 })
 
+// Streaming analyze (SSE) — same work as POST /api/repro/analyze, but
+// narrates phases + progress so the UI shows a live log panel + a
+// progress bar instead of a 40 s blank spinner.  EventSource uses GET,
+// so params come via query string.  Events:
+//   log      { line, ts }          — phase narration + heartbeat ticks
+//   progress { phase, total, label }
+//   brief    BriefResult           — terminal success
+//   error    { message }           — terminal failure
+app.get('/api/repro/analyze/stream', (c) => {
+  if (!isResolveEnabled()) {
+    return c.json({ ok: false, error: 'AI features are disabled — enable features.resolveEnabled on /#/config first.' }, 404)
+  }
+  const issue = c.req.query('issue') || ''
+  if (!issue) return c.json({ ok: false, error: 'Missing issue parameter' }, 400)
+  const tags = (c.req.query('tags') || '').split(',').map((t) => t.trim()).filter(Boolean)
+  const backend = c.req.query('backend') || undefined
+
+  return streamSSE(c, async (stream) => {
+    const send = async (event: string, data: object) => {
+      try { await stream.writeSSE({ event, data: JSON.stringify(data) }) } catch { /* client gone */ }
+    }
+    const emit = {
+      log: (line: string) => { void send('log', { line, ts: Date.now() }) },
+      progress: (phase: number, total: number, label: string) => { void send('progress', { phase, total, label }) },
+    }
+    try {
+      const result = await generateReproBrief({ issue, tags, backend, emit })
+      if (result.ok) await send('brief', result)
+      else await send('error', { message: result.error || 'analysis failed', rawOutput: result.rawOutput })
+    } catch (e: any) {
+      await send('error', { message: e?.message || String(e) })
+    }
+  })
+})
+
 // Tag suggestions for an issue — labels mapped to repro focus tags.
 // Cheap (one GitHub fetch, no AI); the UI calls this when an issue is
 // picked so the tag chips start pre-seeded.

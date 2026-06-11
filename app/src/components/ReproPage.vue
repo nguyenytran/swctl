@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
-import { reproAnalyze, reproSeedTags, fetchGitHubIssues, fetchDefaultIssueLabels, type ReproBrief, type ReproIssueEcho } from '@/api'
+import { ref, computed, nextTick, onUnmounted } from 'vue'
+import { reproSeedTags, fetchGitHubIssues, fetchDefaultIssueLabels, type ReproBrief, type ReproIssueEcho } from '@/api'
 import type { GitHubItem } from '@/types'
 import { copyToClipboard } from '@/utils/clipboard'
 
@@ -95,6 +95,15 @@ const error = ref('')
 const rawOutput = ref('')
 const brief = ref<ReproBrief | null>(null)
 
+// Streaming analyze state (SSE): live log lines + progress bar.
+const logLines = ref<string[]>([])
+const progress = ref<{ phase: number; total: number; label: string } | null>(null)
+const logPanel = ref<HTMLElement | null>(null)
+let analyzeSource: EventSource | null = null
+const progressPct = computed(() =>
+  progress.value ? Math.round((progress.value.phase / progress.value.total) * 100) : 0,
+)
+
 async function loadIssue() {
   const ref_ = issueInput.value.trim()
   if (!ref_) return
@@ -126,26 +135,61 @@ function removeTag(t: string) {
   tags.value = tags.value.filter((x) => x !== t)
 }
 
-async function analyze() {
-  if (!issue.value) return
+async function pushLog(line: string) {
+  logLines.value.push(line)
+  await nextTick()
+  if (logPanel.value) logPanel.value.scrollTop = logPanel.value.scrollHeight
+}
+
+function analyze() {
+  if (!issue.value || analyzing.value) return
   analyzing.value = true
   error.value = ''
   rawOutput.value = ''
   brief.value = null
-  try {
-    const r = await reproAnalyze(issue.value.number, tags.value)
-    if (!r.ok || !r.brief) {
-      error.value = r.error || 'Analysis failed.'
-      rawOutput.value = r.rawOutput || ''
-      return
+  logLines.value = []
+  progress.value = { phase: 0, total: 4, label: 'Starting…' }
+
+  // EventSource (GET) streams phase logs + progress while the AI runs,
+  // instead of a blank 40 s spinner.  Params go in the query string.
+  const params = new URLSearchParams({ issue: issue.value.number })
+  if (tags.value.length) params.set('tags', tags.value.join(','))
+  analyzeSource = new EventSource(`/api/repro/analyze/stream?${params}`)
+
+  analyzeSource.addEventListener('log', (e) => {
+    try { void pushLog(JSON.parse((e as MessageEvent).data).line) } catch { /* ignore */ }
+  })
+  analyzeSource.addEventListener('progress', (e) => {
+    try { progress.value = JSON.parse((e as MessageEvent).data) } catch { /* ignore */ }
+  })
+  analyzeSource.addEventListener('brief', (e) => {
+    try {
+      const r = JSON.parse((e as MessageEvent).data)
+      brief.value = r.brief
+      progress.value = { phase: 4, total: 4, label: 'Done' }
+    } catch { error.value = 'Failed to parse brief.' }
+    finishAnalyze()
+  })
+  analyzeSource.addEventListener('error', (e) => {
+    // Two cases: our server 'error' event (has data) vs EventSource
+    // transport error (no data, e.g. connection dropped).
+    const data = (e as MessageEvent).data
+    if (data) {
+      try { const r = JSON.parse(data); error.value = r.message || 'Analysis failed.'; rawOutput.value = r.rawOutput || '' }
+      catch { error.value = 'Analysis failed.' }
+    } else if (analyzing.value && !brief.value) {
+      error.value = 'Connection lost during analysis.'
     }
-    brief.value = r.brief
-  } catch (e: any) {
-    error.value = e?.message || 'Request failed.'
-  } finally {
-    analyzing.value = false
-  }
+    finishAnalyze()
+  })
 }
+
+function finishAnalyze() {
+  if (analyzeSource) { analyzeSource.close(); analyzeSource = null }
+  analyzing.value = false
+}
+
+onUnmounted(() => { if (analyzeSource) analyzeSource.close() })
 
 const message = ref('')
 async function copyText(s: string) {
@@ -299,6 +343,33 @@ const feasibilityColor = computed(() => {
           {{ analyzing ? 'Analyzing… (15–40 s)' : 'Analyze with AI' }}
         </button>
         <span v-if="message" class="text-xs text-gray-400">{{ message }}</span>
+      </div>
+    </section>
+
+    <!-- Live analysis: progress bar + log panel -->
+    <section v-if="analyzing || logLines.length" class="border border-border rounded-lg bg-surface p-4 space-y-3">
+      <div class="flex items-center justify-between text-xs">
+        <span class="font-medium text-gray-300">
+          {{ progress?.label || 'Analyzing' }}
+          <span v-if="progress" class="text-gray-500">· step {{ progress.phase }}/{{ progress.total }}</span>
+        </span>
+        <span v-if="analyzing" class="inline-block w-3 h-3 border-2 border-sky-400 border-t-transparent rounded-full animate-spin" />
+        <span v-else-if="brief" class="text-emerald-400">✓ done</span>
+      </div>
+      <!-- Progress bar -->
+      <div class="h-1.5 rounded-full bg-surface-dark overflow-hidden">
+        <div
+          class="h-full rounded-full transition-all duration-500"
+          :class="brief ? 'bg-emerald-500' : 'bg-sky-500'"
+          :style="{ width: progressPct + '%' }"
+        />
+      </div>
+      <!-- Log panel -->
+      <div
+        ref="logPanel"
+        class="max-h-48 overflow-y-auto rounded bg-surface-dark border border-border p-2 font-mono text-[11px] leading-5 text-gray-400"
+      >
+        <div v-for="(line, i) in logLines" :key="i" class="whitespace-pre-wrap">{{ line }}</div>
       </div>
     </section>
 
