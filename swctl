@@ -6,7 +6,7 @@ set -euo pipefail
 # Running 4+ creates in parallel can exhaust the default soft limit (256 on macOS).
 ulimit -n 65536 2>/dev/null || ulimit -n 10240 2>/dev/null || true
 
-SWCTL_VERSION="0.7.9"
+SWCTL_VERSION="0.7.10"
 
 _swctl_resolve_script() {
     local src="${BASH_SOURCE[0]}"
@@ -4570,6 +4570,36 @@ _run_preflight_checks() {
     _preflight_one "alpine image cached" \
         'docker image inspect alpine:latest || docker image inspect alpine' \
         'docker pull alpine:latest failed — check network / Docker daemon and retry' || failed=1
+
+    # 5b. v0.7.10: when the tunnels feature is enabled, pre-pull
+    #     `caddy:2-alpine` (Basic Auth sidecar) and
+    #     `cloudflare/cloudflared:latest` (named-tunnel connector)
+    #     proactively.  Background: OrbStack restart (or daemon
+    #     prune under low-disk) wipes pulled images, but the user
+    #     only finds out the next time they click Start tunnel —
+    #     by which point they're committed and have to wait through
+    #     a cold pull mid-action.  Pre-pulling here surfaces the
+    #     "network broken" failure mode in the preflight where the
+    #     remedy is obvious + the user hasn't started anything yet.
+    #     Gated on tunnelsEnabled so users who never use tunnels
+    #     don't pay the ~50 MB total pull cost.
+    if [ "$(_user_config_read '.features.tunnelsEnabled' 2>/dev/null)" = "true" ]; then
+        if ! docker image inspect caddy:2-alpine >/dev/null 2>&1; then
+            info "caddy:2-alpine not cached — pulling (auth-proxy sidecar)…"
+            docker pull caddy:2-alpine >/dev/null 2>&1 || true
+        fi
+        _preflight_one "caddy:2-alpine cached (auth proxy)" \
+            'docker image inspect caddy:2-alpine' \
+            'docker pull caddy:2-alpine failed — Start tunnel will retry; check network' || failed=1
+
+        if ! docker image inspect cloudflare/cloudflared:latest >/dev/null 2>&1; then
+            info "cloudflare/cloudflared:latest not cached — pulling (named-tunnel connector)…"
+            docker pull cloudflare/cloudflared:latest >/dev/null 2>&1 || true
+        fi
+        _preflight_one "cloudflared cached (named tunnel)" \
+            'docker image inspect cloudflare/cloudflared:latest' \
+            'docker pull cloudflare/cloudflared:latest failed — Start tunnel will retry; check network' || failed=1
+    fi
 
     # 6. Worktree path doesn't already collide.  We don't try to
     #    distinguish "ours" from "stale" — flagging the collision and
