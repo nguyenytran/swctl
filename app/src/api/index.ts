@@ -582,6 +582,8 @@ export interface ReproBrief {
   execute: string[]
   checks: string[]
   scenarioYaml: string
+  /** Browser spec for UI/visual issues (empty for headless ones). */
+  playwrightSpec: string
   notes: string
 }
 

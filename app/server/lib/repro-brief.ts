@@ -64,10 +64,22 @@ export interface ReproBrief {
   /** What to compare — expected vs actual. */
   checks: string[]
   /**
-   * Draft .swctl/repro.yml using the runner's verb vocabulary.
-   * Present when feasibility is auto/partial; empty for manual.
+   * Draft .swctl/repro.yml using the curl/exec runner's verb
+   * vocabulary.  Present for api/search/console/storefront-html
+   * issues that the headless backend can verify; empty otherwise.
    */
   scenarioYaml: string
+  /**
+   * Draft Playwright spec (.swctl/repro.spec.ts) for issues that
+   * need a real browser — admin-ui interactions, or storefront bugs
+   * where "is it visually/behaviourally wrong" is the real question.
+   * Uses Shopware's own acceptance-test-suite fixtures so it runs
+   * inside the worktree's tests/acceptance/.  Captures a screenshot
+   * at the assertion point — that screenshot is the repro artifact.
+   * Empty when the curl/exec scenario suffices or nothing can be
+   * automated.
+   */
+  playwrightSpec: string
   /** Anything that can't be automated or needs human judgment. */
   notes: string
 }
@@ -109,6 +121,35 @@ assert verbs (list items under "assert:"):
   - stderr_contains: "<string>"
 `.trim()
 
+/**
+ * Compact Playwright contract embedded in the prompt for browser-
+ * needing issues.  Mirrors Shopware's tests/acceptance/ conventions
+ * (@fixtures/AcceptanceTest, injected page-object fixtures,
+ * test.step, ShopCustomer.* / Admin* page objects, TestDataService).
+ * The spec MUST capture a screenshot at the failure point — that's
+ * the artifact the repro UI surfaces.
+ */
+const PLAYWRIGHT_VOCABULARY = `
+Generate a Playwright spec that runs inside Shopware's tests/acceptance/.
+Import: import { test } from '@fixtures/AcceptanceTest';
+Inject only the fixtures you use via destructuring, e.g.:
+  ShopCustomer, TestDataService, DefaultSalesChannel,
+  StorefrontHome, StorefrontProductDetail,
+  AdminProductDetail, AdminCategories, (admin page objects as needed)
+Patterns:
+  - Structure with test.step('...', async () => { ... }).
+  - Seed data via TestDataService.createProduct/createCustomer/setSystemConfig.
+  - Navigate: await ShopCustomer.goesTo(StorefrontProductDetail.url(product)).
+  - Assert: await ShopCustomer.expects(LOCATOR).toBeVisible() / .toHaveText(...).
+  - MANDATORY: near the assertion that proves the bug, capture a screenshot:
+      await page.screenshot({ path: process.env.SWCTL_REPRO_SCREENSHOT ?? 'repro.png', fullPage: true });
+    (the 'page' object is available on any page-object fixture as e.g.
+     StorefrontHome.page — use whichever fixture you injected.)
+  - The test should ASSERT THE CORRECT (fixed) behaviour so a failing
+    run == bug reproduced, matching the headless runner's verdict
+    semantics.  Add a @swctl-repro tag.
+`.trim()
+
 /** Pure prompt builder — unit-testable without spawning anything. */
 export function buildBriefPrompt(input: {
   title: string
@@ -130,17 +171,29 @@ export function buildBriefPrompt(input: {
     `  "setup": string[],                  // concrete steps to create that state`,
     `  "execute": string[],                // the action(s) that trigger the bug`,
     `  "checks": string[],                 // each: "expected X, bug shows Y"`,
-    `  "scenarioYaml": string,             // draft scenario (see vocabulary) or "" when manual`,
+    `  "scenarioYaml": string,             // headless curl/exec scenario (see vocab) or ""`,
+    `  "playwrightSpec": string,           // browser spec (see vocab) or ""`,
     `  "notes": string                     // what can't be automated; "" if nothing`,
     `}`,
     ``,
     `Rules:`,
     `- "search" category implies instanceNeeds.enableEs=true.`,
     `- "project" MUST be a plugin name only when an extension/* label or the body clearly indicates a plugin (e.g. extension/Commercial → "SwagCommercial"); otherwise null.`,
-    `- "admin-ui" issues (need real browser interaction/JS) → feasibility "manual", scenarioYaml "".`,
-    `- feasibility "auto" only when EVERY setup/execute/check step maps onto the scenario vocabulary below; "partial" when some do.`,
+    `- Choose the execution backend by what the bug actually needs to be SEEN:`,
+    `    • api / search / console / storefront-html where the wrong value is`,
+    `      in the response body → fill scenarioYaml (headless), leave playwrightSpec "".`,
+    `    • admin-ui, or any bug where the symptom is visual/interactive in a`,
+    `      browser → fill playwrightSpec (with a screenshot at the assertion),`,
+    `      leave scenarioYaml "".  Category stays "admin-ui" but feasibility`,
+    `      becomes "auto" because the browser spec CAN automate it.`,
+    `- feasibility "auto" when EVERY step maps onto the chosen backend's vocabulary;`,
+    `  "partial" when some steps need manual help; "manual" only when neither`,
+    `  backend can express the reproduction (then BOTH draft fields are "").`,
     `- scenarioYaml must use ONLY this vocabulary:`,
     SCENARIO_VOCABULARY,
+    ``,
+    `- playwrightSpec must follow this contract:`,
+    PLAYWRIGHT_VOCABULARY,
     ``,
     input.tags.length
       ? `User focus tags (weigh these heavily when categorising): ${input.tags.join(', ')}`
@@ -195,9 +248,21 @@ function validateBrief(v: unknown): ReproBrief | null {
   const needsRaw = (o.instanceNeeds && typeof o.instanceNeeds === 'object')
     ? o.instanceNeeds as Record<string, unknown> : {}
 
+  const scenarioYaml = typeof o.scenarioYaml === 'string' ? o.scenarioYaml : ''
+  const playwrightSpec = typeof o.playwrightSpec === 'string' ? o.playwrightSpec : ''
+
+  // Feasibility correction: if the model said "manual" but actually
+  // produced a runnable artifact (either backend), the reproduction
+  // IS automatable — trust the artifact over the self-assessment.
+  // Conversely, "auto" with neither artifact is incoherent → manual.
+  let effectiveFeasibility = feasibility
+  const hasArtifact = !!scenarioYaml.trim() || !!playwrightSpec.trim()
+  if (feasibility === 'manual' && hasArtifact) effectiveFeasibility = 'auto'
+  if (feasibility === 'auto' && !hasArtifact) effectiveFeasibility = 'manual'
+
   return {
     category,
-    feasibility,
+    feasibility: effectiveFeasibility,
     summary: o.summary.trim(),
     instanceNeeds: {
       // search implies ES even if the model forgot the rule.
@@ -210,7 +275,8 @@ function validateBrief(v: unknown): ReproBrief | null {
     setup: strArr(o.setup),
     execute: strArr(o.execute),
     checks: strArr(o.checks),
-    scenarioYaml: typeof o.scenarioYaml === 'string' ? o.scenarioYaml : '',
+    scenarioYaml,
+    playwrightSpec,
     notes: typeof o.notes === 'string' ? o.notes : '',
   }
 }

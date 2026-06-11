@@ -237,14 +237,35 @@ const feasibilityColor = computed(() => {
         </div>
       </div>
 
-      <!-- Scenario draft -->
+      <!-- Headless scenario draft (api/search/console/storefront-html) -->
       <div v-if="brief.scenarioYaml" class="rounded border border-border bg-surface-dark p-3">
         <div class="flex items-center justify-between mb-2">
-          <div class="text-xs font-medium text-gray-300">Draft scenario — <code>.swctl/repro.yml</code></div>
+          <div class="text-xs font-medium text-gray-300">
+            Draft scenario — <code>.swctl/repro.yml</code>
+            <span class="text-gray-500 font-normal">(headless: curl + bin/console)</span>
+          </div>
           <button class="px-2 py-0.5 text-[11px] rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
                   @click="copyText(brief.scenarioYaml)">Copy</button>
         </div>
         <pre class="text-[11px] text-gray-300 whitespace-pre-wrap max-h-80 overflow-y-auto font-mono">{{ brief.scenarioYaml }}</pre>
+      </div>
+
+      <!-- Browser spec draft (admin-ui / visual) -->
+      <div v-if="brief.playwrightSpec" class="rounded border border-rose-500/30 bg-rose-500/5 p-3">
+        <div class="flex items-center justify-between mb-2">
+          <div class="text-xs font-medium text-gray-300">
+            📸 Draft e2e spec — <code>.swctl/repro.spec.ts</code>
+            <span class="text-gray-500 font-normal">(Playwright; screenshots the error)</span>
+          </div>
+          <button class="px-2 py-0.5 text-[11px] rounded bg-gray-700 hover:bg-gray-600 text-gray-100"
+                  @click="copyText(brief.playwrightSpec)">Copy</button>
+        </div>
+        <pre class="text-[11px] text-gray-300 whitespace-pre-wrap max-h-80 overflow-y-auto font-mono">{{ brief.playwrightSpec }}</pre>
+        <p class="text-[10px] text-gray-500 mt-2">
+          Runs inside the worktree's <code>tests/acceptance/</code> against the instance URL,
+          using Shopware's acceptance-test-suite fixtures.  The screenshot captured at the
+          assertion point becomes the repro evidence.
+        </p>
       </div>
 
       <div v-if="brief.notes" class="text-xs text-gray-500 border-l-2 border-gray-600 pl-3">
